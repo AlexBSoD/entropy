@@ -198,10 +198,15 @@ pub struct HidDevice {
 #[derive(Clone)]
 pub(crate) struct TestHidRecorder {
     requests: std::sync::Arc<std::sync::Mutex<Vec<[u8; MSG_LEN]>>>,
+    responses: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<[u8; MSG_LEN]>>>,
 }
 
 #[cfg(test)]
 impl TestHidRecorder {
+    pub(crate) fn respond_with(&self, responses: impl IntoIterator<Item = [u8; MSG_LEN]>) {
+        self.responses.lock().unwrap().extend(responses);
+    }
+
     pub(crate) fn requests(&self) -> Vec<[u8; MSG_LEN]> {
         self.requests
             .lock()
@@ -222,7 +227,7 @@ pub(crate) enum TestHidFault {
 #[cfg(not(target_arch = "wasm32"))]
 enum HidBackend {
     Local {
-        device: hidapi::HidDevice,
+        device: std::sync::Arc<std::sync::Mutex<hidapi::HidDevice>>,
         transport: HidTransport,
         write_framing: HidWriteFraming,
         path: Option<PathBuf>,
@@ -243,7 +248,7 @@ enum HidBackend {
 
 #[cfg(target_os = "linux")]
 pub(crate) struct LinuxBluetoothHidWriter {
-    device: hidapi::HidDevice,
+    device: std::sync::Arc<std::sync::Mutex<hidapi::HidDevice>>,
     write_framing: HidWriteFraming,
     path: Option<PathBuf>,
 }
@@ -275,7 +280,15 @@ impl LinuxBluetoothHidWriter {
 
     pub(crate) fn write_output_report(&self, data: &[u8]) -> Result<()> {
         ensure_output_report_len(data)?;
-        write_output_report_local(&self.device, self.write_framing, self.path.as_deref(), data)
+        write_output_report_local(
+            &self
+                .device
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+            self.write_framing,
+            self.path.as_deref(),
+            data,
+        )
     }
 }
 
@@ -353,6 +366,11 @@ pub(crate) struct SharedHidOutput {
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone)]
 enum SharedHidOutputBackend {
+    Local {
+        device: std::sync::Weak<std::sync::Mutex<hidapi::HidDevice>>,
+        write_framing: HidWriteFraming,
+        path: Option<PathBuf>,
+    },
     #[cfg(target_os = "windows")]
     Proxy(std::sync::Weak<HidProxy>),
     #[cfg(test)]
@@ -364,10 +382,22 @@ enum SharedHidOutputBackend {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl SharedHidOutput {
+    #[cfg(test)]
+    pub(crate) fn test_expired_local_owner() -> Self {
+        Self {
+            backend: SharedHidOutputBackend::Local {
+                device: std::sync::Weak::new(),
+                write_framing: HidWriteFraming::ReportIdPrefixed(0),
+                path: None,
+            },
+        }
+    }
+
     pub(crate) fn is_available(&self) -> bool {
         match &self.backend {
             #[cfg(target_os = "windows")]
             SharedHidOutputBackend::Proxy(proxy) => proxy.strong_count() > 0,
+            SharedHidOutputBackend::Local { device, .. } => device.strong_count() > 0,
             #[cfg(test)]
             SharedHidOutputBackend::Test(_) => true,
             #[cfg(not(any(target_os = "windows", test)))]
@@ -378,6 +408,17 @@ impl SharedHidOutput {
     pub(crate) fn write_output_report(&self, data: &[u8]) -> Result<()> {
         ensure_output_report_len(data)?;
         match &self.backend {
+            SharedHidOutputBackend::Local {
+                device,
+                write_framing,
+                path,
+            } => {
+                let device = device
+                    .upgrade()
+                    .context("Shared HID output owner is no longer available")?;
+                let device = device.lock().unwrap_or_else(|error| error.into_inner());
+                write_output_report_local(&device, *write_framing, path.as_deref(), data)
+            }
             #[cfg(target_os = "windows")]
             SharedHidOutputBackend::Proxy(proxy) => proxy
                 .upgrade()
@@ -504,6 +545,7 @@ impl HidDevice {
     ) -> (Self, TestHidRecorder) {
         let recorder = TestHidRecorder {
             requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            responses: Default::default(),
         };
         let device = Self {
             backend: HidBackend::Test {
@@ -525,7 +567,7 @@ impl HidDevice {
             .context("Failed to open HID device")?;
         Ok(Self {
             backend: HidBackend::Local {
-                device,
+                device: std::sync::Arc::new(std::sync::Mutex::new(device)),
                 transport: HidTransport::Usb,
                 write_framing: HidWriteFraming::ReportIdPrefixed(0),
                 path: Some(PathBuf::from(path)),
@@ -572,6 +614,18 @@ impl HidDevice {
 
     pub(crate) fn shared_output(&self) -> Option<SharedHidOutput> {
         match &self.backend {
+            HidBackend::Local {
+                device,
+                write_framing,
+                path,
+                ..
+            } => Some(SharedHidOutput {
+                backend: SharedHidOutputBackend::Local {
+                    device: std::sync::Arc::downgrade(device),
+                    write_framing: *write_framing,
+                    path: path.clone(),
+                },
+            }),
             #[cfg(target_os = "windows")]
             HidBackend::Proxy(proxy) => Some(SharedHidOutput {
                 backend: SharedHidOutputBackend::Proxy(std::sync::Arc::downgrade(proxy)),
@@ -682,7 +736,7 @@ impl HidDevice {
                         let write_framing = detect_hid_write_framing(&hid_device, transport)?;
                         return Ok(Self {
                             backend: HidBackend::Local {
-                                device: hid_device,
+                                device: std::sync::Arc::new(std::sync::Mutex::new(hid_device)),
                                 transport,
                                 write_framing,
                                 path: local_hid_path(device),
@@ -720,7 +774,7 @@ impl HidDevice {
             let write_framing = detect_hid_write_framing(&hid_device, transport)?;
             return Ok(Self {
                 backend: HidBackend::Local {
-                    device: hid_device,
+                    device: std::sync::Arc::new(std::sync::Mutex::new(hid_device)),
                     transport,
                     write_framing,
                     path: Some(path),
@@ -748,7 +802,7 @@ impl HidDevice {
             let write_framing = detect_hid_write_framing(&hid_device, transport)?;
             return Ok(Self {
                 backend: HidBackend::Local {
-                    device: hid_device,
+                    device: std::sync::Arc::new(std::sync::Mutex::new(hid_device)),
                     transport,
                     write_framing,
                     path: Some(path),
@@ -773,7 +827,12 @@ impl HidDevice {
                 write_framing,
                 path,
                 ..
-            } => write_output_report_local(device, *write_framing, path.as_deref(), data),
+            } => write_output_report_local(
+                &device.lock().unwrap_or_else(|error| error.into_inner()),
+                *write_framing,
+                path.as_deref(),
+                data,
+            ),
             #[cfg(target_os = "windows")]
             HidBackend::Proxy(proxy) => proxy.write_output_report(data),
             #[cfg(target_os = "linux")]
@@ -796,7 +855,7 @@ impl HidDevice {
                 path,
                 input_report_polling,
             } => usb_send_local(
-                device,
+                &device.lock().unwrap_or_else(|error| error.into_inner()),
                 *transport,
                 *write_framing,
                 path.as_deref(),
@@ -854,6 +913,9 @@ impl HidDevice {
                     }
                 }
 
+                if let Some(response) = recorder.responses.lock().unwrap().pop_front() {
+                    return Ok(response);
+                }
                 let mut response = [0; MSG_LEN];
                 match (request[0], request[1], request[2]) {
                     (CMD_VIA_MACRO_GET_BUFFER_SIZE, _, _) => {

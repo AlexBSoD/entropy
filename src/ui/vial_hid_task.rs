@@ -67,7 +67,9 @@ pub(super) enum VialHidOperation {
         fallback: [u8; 3],
     },
     StartupImageClear,
-    PictogramLoad,
+    PictogramLoad {
+        preserve_editor: bool,
+    },
     PictogramUpload {
         library: crate::app::PictogramLibrary,
     },
@@ -222,7 +224,7 @@ fn run_vial_hid_operation_with_progress(
             hid.clear_startup_image()?;
             Ok(VialHidOutcome::StartupImageCleared)
         }
-        VialHidOperation::PictogramLoad => hid
+        VialHidOperation::PictogramLoad { .. } => hid
             .load_pictograms(progress)
             .map(VialHidOutcome::PictogramsLoaded),
         VialHidOperation::PictogramUpload { library } => hid
@@ -735,7 +737,14 @@ impl EntropyApp {
                 self.display_settings.pictograms.loaded = true;
                 self.display_settings.pictograms.loading = false;
                 self.display_settings.pictograms.library = library;
-                self.restore_pictogram_editor_from_device();
+                if !matches!(
+                    result.operation,
+                    VialHidOperation::PictogramLoad {
+                        preserve_editor: true
+                    }
+                ) {
+                    self.restore_pictogram_editor_from_device();
+                }
                 self.status_msg = crate::i18n::tr_catalog(
                     self.app_settings.language,
                     "display_settings.pictograms_loaded",
@@ -763,16 +772,6 @@ impl EntropyApp {
                 self.finish_deferred_device_load(payload);
             }
             Err(error) => {
-                if matches!(result.operation, VialHidOperation::PictogramLoad) {
-                    self.display_settings.pictograms.supported = Some(false);
-                    self.display_settings.pictograms.loading = false;
-                } else if matches!(
-                    result.operation,
-                    VialHidOperation::PictogramUpload { .. }
-                        | VialHidOperation::PictogramSlotUpload { .. }
-                ) {
-                    self.display_settings.pictograms.loading = false;
-                }
                 self.finish_vial_hid_error(result.operation, error, result.disconnected);
             }
         }
@@ -912,6 +911,28 @@ impl EntropyApp {
         error: String,
         disconnected: bool,
     ) {
+        match &operation {
+            VialHidOperation::PictogramLoad { .. } => {
+                self.display_settings.pictograms.loading = false;
+                // A failed read is not proof that the firmware lacks storage.
+                if self.display_settings.pictograms.supported != Some(true) {
+                    self.display_settings.pictograms.supported = Some(false);
+                }
+            }
+            VialHidOperation::PictogramUpload { .. }
+            | VialHidOperation::PictogramSlotUpload { .. } => {
+                let pictograms = &mut self.display_settings.pictograms;
+                // Flash/transport errors can leave even the old library uncertain.
+                // Invalidate the device snapshot, not the user's editor; the next
+                // storage read preserves that editor and confirms the actual bytes.
+                pictograms.loaded = false;
+                pictograms.loading = false;
+                pictograms.library = PictogramLibrary::default();
+                pictograms.upload_due = None;
+            }
+            _ => {}
+        }
+
         if let VialHidOperation::MacroWrite { revision, .. } = &operation {
             self.keycode_picker.macros_dirty = true;
             self.keycode_picker.macro_attempted_revision =
@@ -941,8 +962,30 @@ impl EntropyApp {
         }
 
         if disconnected {
+            // Connection cleanup owns device state, but an uncertain write must
+            // not erase the user's independent editor. Carry the invalidated
+            // snapshot through cleanup; never restore a confirmed device library.
+            let draft = matches!(
+                operation,
+                VialHidOperation::PictogramUpload { .. }
+                    | VialHidOperation::PictogramSlotUpload { .. }
+                    | VialHidOperation::PictogramLoad {
+                        preserve_editor: true
+                    }
+            )
+            .then(|| {
+                let mut draft = std::mem::take(&mut self.display_settings.pictograms);
+                draft.supported = None;
+                draft.loaded = false;
+                draft.loading = false;
+                draft.library = PictogramLibrary::default();
+                draft
+            });
             if !self.begin_bluetooth_reconnect(error.clone()) {
                 self.clear_connected_keyboard_state(error);
+            }
+            if let Some(draft) = draft {
+                self.display_settings.pictograms = draft;
             }
             return;
         }
@@ -991,7 +1034,7 @@ impl EntropyApp {
                     &[("error", &error)],
                 );
             }
-            VialHidOperation::PictogramLoad => {
+            VialHidOperation::PictogramLoad { .. } => {
                 self.status_msg = format!(
                     "{}: {error}",
                     crate::i18n::tr_catalog(

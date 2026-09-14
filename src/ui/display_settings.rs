@@ -1141,7 +1141,10 @@ impl EntropyApp {
                     && matches!(
                         self.start_vial_hid_operation(
                             ui.ctx(),
-                            super::vial_hid_task::VialHidOperation::PictogramLoad,
+                            super::vial_hid_task::VialHidOperation::PictogramLoad {
+                                preserve_editor: self.display_settings.pictograms.supported
+                                    == Some(true),
+                            },
                         ),
                         super::vial_hid_task::VialHidTaskStart::Started
                     )
@@ -1698,12 +1701,17 @@ impl EntropyApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn restore_pictogram_editor_from_device(&mut self) {
-        let accent = self.display_settings.color;
         let pictograms = &self.display_settings.pictograms;
         let bitmap = pictograms
             .library
             .bitmap(pictograms.selected_kind, pictograms.selected_slot)
             .map(ToOwned::to_owned);
+        self.set_pictogram_editor_bitmap(bitmap);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn set_pictogram_editor_bitmap(&mut self, bitmap: Option<Vec<u8>>) {
+        let accent = self.display_settings.color;
         let pictograms = &mut self.display_settings.pictograms;
         pictograms.threshold = 128;
         pictograms.inverted = false;
@@ -1742,6 +1750,9 @@ impl EntropyApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn apply_current_pictogram(&mut self, ctx: &egui::Context) -> bool {
+        if !self.display_settings.pictograms.loaded || self.display_settings.pictograms.loading {
+            return false;
+        }
         let accent = self.display_settings.color;
         let pictograms = &self.display_settings.pictograms;
         if pictograms.source_levels.is_empty() {
@@ -1771,7 +1782,6 @@ impl EntropyApp {
             ),
             super::vial_hid_task::VialHidTaskStart::Started
         ) {
-            self.display_settings.pictograms.library = library;
             self.display_settings.pictograms.loading = true;
             self.display_settings.pictograms.upload_due = None;
             true
@@ -1782,6 +1792,9 @@ impl EntropyApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn assign_selected_pictogram(&mut self, ctx: &egui::Context, bitmap: Option<&[u8]>) -> bool {
+        if !self.display_settings.pictograms.loaded || self.display_settings.pictograms.loading {
+            return false;
+        }
         let pictograms = &self.display_settings.pictograms;
         let kind = pictograms.selected_kind;
         let slot = pictograms.selected_slot;
@@ -1803,7 +1816,6 @@ impl EntropyApp {
             ),
             super::vial_hid_task::VialHidTaskStart::Started
         ) {
-            self.display_settings.pictograms.library = library;
             self.display_settings.pictograms.loading = true;
             true
         } else {
@@ -1881,6 +1893,9 @@ impl EntropyApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn reset_current_pictogram(&mut self, ctx: &egui::Context) -> bool {
+        if !self.display_settings.pictograms.loaded || self.display_settings.pictograms.loading {
+            return false;
+        }
         let pictograms = &self.display_settings.pictograms;
         let mut library = pictograms.library.clone();
         library.clear(pictograms.selected_kind, pictograms.selected_slot);
@@ -1897,7 +1912,6 @@ impl EntropyApp {
             super::vial_hid_task::VialHidTaskStart::Started
         ) {
             let pictograms = &mut self.display_settings.pictograms;
-            pictograms.library = library;
             pictograms.loading = true;
             pictograms.source_levels.clear();
             pictograms.source_file_name.clear();
@@ -2261,7 +2275,7 @@ impl EntropyApp {
         );
         if let Some(bitmap) = assignment_choice {
             if self.assign_selected_pictogram(ui.ctx(), bitmap.as_deref()) {
-                self.restore_pictogram_editor_from_device();
+                self.set_pictogram_editor_bitmap(bitmap);
             }
         }
         let (mut name_row, _) = ui.allocate_exact_size(
@@ -4364,5 +4378,172 @@ mod tests {
         assert_eq!(cells, vec![(2, 3), (3, 3), (4, 3), (5, 3), (6, 3), (7, 3)]);
         let diagonal = pictogram_editor_line((1, 1), (4, 4));
         assert_eq!(diagonal, vec![(1, 1), (2, 2), (3, 3), (4, 4)]);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod pictogram_confirmation_tests {
+    use super::super::vial_hid_task::{VialHidOperation, VialHidTaskStart};
+    use super::*;
+
+    fn poll(app: &mut EntropyApp, ctx: &egui::Context) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.vial_hid_task.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pictogram worker timed out"
+            );
+            app.poll_vial_hid_task(ctx);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn rejected_slot_assignment_save_reset_and_full_upload_never_confirm_pending_library() {
+        for action in 0..4 {
+            let ctx = egui::Context::default();
+            let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+            let mut app = EntropyApp::new(&cc);
+            let (hid, recorder) = crate::hid::HidDevice::test_device();
+            recorder.respond_with(test_pictogram_upload_responses(action != 3, 4));
+            app.hid_device = Some(hid);
+            let p = &mut app.display_settings.pictograms;
+            p.supported = Some(true);
+            p.loaded = true;
+            p.library
+                .set(PictogramKind::Macro, 0, &vec![0xAA; PICTOGRAM_BYTES]);
+            p.library
+                .set(PictogramKind::TapDance, 2, &vec![0xBB; PICTOGRAM_BYTES]);
+            let before = p.library.clone();
+            let mut desired = before.clone();
+            desired.set(PictogramKind::Macro, 0, &vec![0xFF; PICTOGRAM_BYTES]);
+            match action {
+                0 => {
+                    assert!(app.assign_selected_pictogram(&ctx, Some(&vec![0xFF; PICTOGRAM_BYTES])))
+                }
+                1 => assert!(app.apply_current_pictogram(&ctx)),
+                2 => assert!(app.reset_current_pictogram(&ctx)),
+                _ => assert!(matches!(
+                    app.start_vial_hid_operation(
+                        &ctx,
+                        VialHidOperation::PictogramUpload { library: desired }
+                    ),
+                    VialHidTaskStart::Started
+                )),
+            }
+            assert_eq!(
+                app.display_settings.pictograms.library, before,
+                "pending write must not change confirmed state"
+            );
+            // A user can continue editing while the worker finishes.
+            app.display_settings.pictograms.source_levels =
+                vec![42; PICTOGRAM_WIDTH * PICTOGRAM_HEIGHT];
+            app.display_settings.pictograms.editor_name = "unsaved draft".into();
+            app.display_settings.pictograms.undo =
+                vec![vec![17; PICTOGRAM_WIDTH * PICTOGRAM_HEIGHT]];
+            poll(&mut app, &ctx);
+            assert!(app.status_msg.contains("status 4"), "{}", app.status_msg);
+            assert!(recorder
+                .requests()
+                .iter()
+                .any(|request| request[0] == if action == 3 { 0xC4 } else { 0xC9 }));
+            let p = &app.display_settings.pictograms;
+            assert!(!p.loaded);
+            assert!(!p.loading);
+            assert!(!p.library.has(PictogramKind::Macro, 0));
+            assert_eq!(p.editor_name, "unsaved draft");
+            let draft = p.source_levels.clone();
+            let undo = p.undo.clone();
+            assert!(
+                !app.apply_current_pictogram(&ctx),
+                "unknown device state cannot seed another slot/full upload"
+            );
+            recorder.respond_with(test_pictogram_read_responses(&before));
+            assert!(matches!(
+                app.start_vial_hid_operation(
+                    &ctx,
+                    VialHidOperation::PictogramLoad {
+                        preserve_editor: true
+                    }
+                ),
+                VialHidTaskStart::Started
+            ));
+            poll(&mut app, &ctx);
+            let p = &app.display_settings.pictograms;
+            assert!(p.loaded);
+            assert_eq!(p.library, before);
+            assert_eq!(p.source_levels, draft);
+            assert_eq!(p.undo, undo);
+            assert_eq!(p.editor_name, "unsaved draft");
+        }
+    }
+
+    #[test]
+    fn successful_slot_and_full_upload_confirm_only_on_completion_and_keep_newer_edits() {
+        for slot_upload in [true, false] {
+            let ctx = egui::Context::default();
+            let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+            let mut app = EntropyApp::new(&cc);
+            let (hid, recorder) = crate::hid::HidDevice::test_device();
+            recorder.respond_with(test_pictogram_upload_responses(slot_upload, 0));
+            app.hid_device = Some(hid);
+            app.display_settings.pictograms.loaded = true;
+            app.display_settings.pictograms.supported = Some(true);
+            let before = app.display_settings.pictograms.library.clone();
+            let mut desired = before.clone();
+            desired.set_colored(
+                PictogramKind::Macro,
+                0,
+                &vec![0xFF; PICTOGRAM_BYTES],
+                app.display_settings.color,
+            );
+            if slot_upload {
+                assert!(app.assign_selected_pictogram(&ctx, Some(&vec![0xFF; PICTOGRAM_BYTES])));
+            } else {
+                assert!(matches!(
+                    app.start_vial_hid_operation(
+                        &ctx,
+                        VialHidOperation::PictogramUpload {
+                            library: desired.clone()
+                        }
+                    ),
+                    VialHidTaskStart::Started
+                ));
+            }
+            assert_eq!(app.display_settings.pictograms.library, before);
+            app.display_settings.pictograms.editor_name = "newer draft".into();
+            poll(&mut app, &ctx);
+            assert!(app.display_settings.pictograms.loaded);
+            assert_eq!(app.display_settings.pictograms.library, desired);
+            assert_eq!(app.display_settings.pictograms.editor_name, "newer draft");
+        }
+    }
+
+    #[test]
+    fn uncertain_transport_error_invalidates_confirmed_library_without_losing_editor() {
+        for fault in [
+            crate::hid::TestHidFault::Timeout,
+            crate::hid::TestHidFault::Disconnect,
+            crate::hid::TestHidFault::WorkerPanic,
+        ] {
+            let ctx = egui::Context::default();
+            let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+            let mut app = EntropyApp::new(&cc);
+            let (hid, _) =
+                crate::hid::HidDevice::test_device_with_fault_after_requests(Some((0, fault)));
+            app.hid_device = Some(hid);
+            app.display_settings.pictograms.loaded = true;
+            app.display_settings.pictograms.supported = Some(true);
+            app.display_settings.pictograms.editor_name = "retain".into();
+            app.display_settings.pictograms.source_levels =
+                vec![42; PICTOGRAM_WIDTH * PICTOGRAM_HEIGHT];
+            let draft = app.display_settings.pictograms.source_levels.clone();
+            assert!(app.apply_current_pictogram(&ctx));
+            poll(&mut app, &ctx);
+            assert!(!app.display_settings.pictograms.loaded);
+            assert!(!app.display_settings.pictograms.loading);
+            assert_eq!(app.display_settings.pictograms.source_levels, draft);
+            assert_eq!(app.display_settings.pictograms.editor_name, "retain");
+        }
     }
 }

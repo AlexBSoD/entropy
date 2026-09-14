@@ -457,7 +457,8 @@ fn decode_cached_background(
     }
     let header: &[u8; HEADER_SIZE] = package[..HEADER_SIZE].try_into().ok()?;
     if read_u32(&header[0..4]) != MAGIC
-        || header[4] != FORMAT_VERSION
+        || !matches!(header[4], LEGACY_FORMAT_VERSION | FORMAT_VERSION)
+        || header[4] != info.format_version
         || header[5] != info.kind
         || header[6] != info.frame_count
         || header_crc(header) != info.header_crc
@@ -468,6 +469,8 @@ fn decode_cached_background(
     }
     let frame_size = if info.kind == 1 {
         IMAGE_FRAME_SIZE
+    } else if info.kind == 2 && header[4] == LEGACY_FORMAT_VERSION {
+        LEGACY_ANIMATION_FRAME_SIZE
     } else if info.kind == 2 {
         ANIMATION_FRAME_SIZE
     } else {
@@ -486,6 +489,13 @@ fn decode_cached_background(
         for pixel in 0..WIDTH as usize * HEIGHT as usize {
             let index = if info.kind == 1 {
                 frame[1024 + pixel] as usize
+            } else if header[4] == LEGACY_FORMAT_VERSION {
+                let packed = frame[LEGACY_ANIMATION_PALETTE_SIZE + pixel / 2];
+                (if pixel % 2 == 0 {
+                    packed >> 4
+                } else {
+                    packed & 15
+                }) as usize
             } else {
                 let packed = &frame[256 + (pixel / 4) * 3..];
                 (match pixel % 4 {
@@ -1595,5 +1605,101 @@ mod tests {
             .map(|pixel| pixel.0)
             .collect::<std::collections::HashSet<_>>();
         assert!(unique.len() <= 63);
+    }
+}
+
+#[cfg(test)]
+mod legacy_preview_tests {
+    use super::*;
+
+    #[test]
+    fn both_package_versions_restore_still_and_animation_pixels_and_delays() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = RgbaImage::from_fn(12, 8, |x, y| {
+            image::Rgba([
+                (x * 20) as u8,
+                (y * 30) as u8,
+                120,
+                if x < 2 { 0 } else { 255 },
+            ])
+        });
+        let png = directory.path().join("still.png");
+        image.save(&png).unwrap();
+        let gif = directory.path().join("animation.gif");
+        {
+            let mut encoder =
+                image::codecs::gif::GifEncoder::new(std::fs::File::create(&gif).unwrap());
+            for delay in [70, 160] {
+                encoder
+                    .encode_frame(image::Frame::from_parts(
+                        image.clone(),
+                        0,
+                        0,
+                        image::Delay::from_numer_denom_ms(delay, 1),
+                    ))
+                    .unwrap();
+            }
+        }
+        for version in [LEGACY_FORMAT_VERSION, FORMAT_VERSION] {
+            for path in [&png, &gif] {
+                let prepared = prepare_background(
+                    path,
+                    [0, 0, 0],
+                    super::super::StandbyBackgroundScale::Fit,
+                    MAX_FRAMES,
+                    version,
+                    &AtomicU32::new(0),
+                )
+                .unwrap();
+                let info = BackgroundInfo {
+                    format_version: version,
+                    kind: prepared.kind,
+                    frame_count: prepared.frame_count,
+                    total_size: prepared.package.len() as u32,
+                    header_crc: read_u32(&prepared.package[24..28]),
+                    ..Default::default()
+                };
+                let restored = decode_cached_background(&prepared.package, info).unwrap();
+                assert_eq!(restored.preview_rgba, prepared.preview_rgba);
+                assert_eq!(restored.preview_frames_rgba, prepared.preview_frames_rgba);
+                assert_eq!(restored.preview_delays_ms, prepared.preview_delays_ms);
+                assert!(restored
+                    .preview_rgba
+                    .chunks_exact(4)
+                    .any(|pixel| pixel[3] == 0));
+                let mut damaged = prepared.package.clone();
+                damaged[HEADER_SIZE + 7] ^= 1;
+                assert!(decode_cached_background(&damaged, info).is_none());
+                assert!(decode_cached_background(
+                    &prepared.package[..prepared.package.len() - 1],
+                    info
+                )
+                .is_none());
+                assert!(decode_cached_background(
+                    &prepared.package,
+                    BackgroundInfo {
+                        format_version: 9,
+                        ..info
+                    }
+                )
+                .is_none());
+                assert!(decode_cached_background(
+                    &prepared.package,
+                    BackgroundInfo {
+                        format_version: if version == 3 { 4 } else { 3 },
+                        ..info
+                    }
+                )
+                .is_none());
+                assert!(decode_cached_background(
+                    &prepared.package,
+                    BackgroundInfo {
+                        frame_count: 0,
+                        ..info
+                    }
+                )
+                .is_none());
+            }
+        }
     }
 }

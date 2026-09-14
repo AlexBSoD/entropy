@@ -1879,3 +1879,87 @@ mod tests {
         assert!(bitmap_pixel(&move_right, 34, 17));
     }
 }
+
+#[cfg(test)]
+pub(crate) fn test_pictogram_upload_responses(
+    slot_upload: bool,
+    commit_status: u8,
+) -> Vec<[u8; 32]> {
+    let mut query = [0u8; 32];
+    query[0] = CMD_QUERY;
+    query[2] = FORMAT_VERSION;
+    query[16] = 2;
+    query[17] = FORMAT_VERSION;
+    let mut responses = vec![query];
+    let mut begin = [0; 32];
+    begin[0] = if slot_upload {
+        CMD_SLOT_BEGIN
+    } else {
+        CMD_BEGIN
+    };
+    responses.push(begin);
+    let bytes = if slot_upload {
+        RECORD_BYTES
+    } else {
+        PACKAGE_SIZE
+    };
+    let packets = bytes.div_ceil(29);
+    for sequence in 0..packets {
+        if slot_upload || (sequence + 1) % STREAM_ACK_INTERVAL == 0 || sequence + 1 == packets {
+            let mut reply = [0; 32];
+            reply[0] = if slot_upload { CMD_SLOT_DATA } else { CMD_DATA };
+            reply[2..4].copy_from_slice(&((sequence + 1) as u16).to_le_bytes());
+            responses.push(reply);
+        }
+    }
+    let mut commit = [0; 32];
+    commit[0] = if slot_upload {
+        CMD_SLOT_COMMIT
+    } else {
+        CMD_COMMIT
+    };
+    commit[1] = commit_status;
+    responses.push(commit);
+    responses
+}
+
+#[cfg(test)]
+pub(crate) fn test_pictogram_read_responses(library: &PictogramLibrary) -> Vec<[u8; 32]> {
+    let mut query = [0; 32];
+    query[0] = CMD_QUERY;
+    query[2] = FORMAT_VERSION;
+    query[3] = 1;
+    query[4] = PICTOGRAM_WIDTH as u8;
+    query[5] = PICTOGRAM_HEIGHT as u8;
+    query[6..8].copy_from_slice(&(PICTOGRAM_BYTES as u16).to_le_bytes());
+    query[8..12].copy_from_slice(&(PACKAGE_SIZE as u32).to_le_bytes());
+    query[16] = 2;
+    let mut responses = vec![query];
+    for kind in [PictogramKind::Macro, PictogramKind::TapDance] {
+        for offset in (0..VALID_BYTES).step_by(30) {
+            let mut response = [0; 32];
+            response[0] = CMD_VALID_READ;
+            let amount = (VALID_BYTES - offset).min(30);
+            let start = kind.valid_offset() + offset;
+            response[2..2 + amount].copy_from_slice(&library.package[start..start + amount]);
+            responses.push(response);
+        }
+    }
+    for kind in [PictogramKind::Macro, PictogramKind::TapDance] {
+        for slot in 0..SLOTS_PER_KIND {
+            if !library.has(kind, slot) {
+                continue;
+            }
+            let start = HEADER_SIZE + kind.payload_slot(slot) * RECORD_BYTES;
+            for offset in (0..RECORD_BYTES).step_by(30) {
+                let mut response = [0; 32];
+                response[0] = CMD_SLOT_READ;
+                let amount = (RECORD_BYTES - offset).min(30);
+                response[2..2 + amount]
+                    .copy_from_slice(&library.package[start + offset..start + offset + amount]);
+                responses.push(response);
+            }
+        }
+    }
+    responses
+}

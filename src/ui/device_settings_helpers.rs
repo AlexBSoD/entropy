@@ -1880,6 +1880,7 @@ impl EntropyApp {
                 crate::device::Device,
                 crate::qmk_hid_host::HostDataMode,
                 Option<crate::hid::SharedHidOutput>,
+                crate::qmk_hid_host::HostProtocol,
             ),
         >::new();
 
@@ -1908,19 +1909,35 @@ impl EntropyApp {
                 let shared_output = (Some(device.path.as_str()) == selected_path)
                     .then(|| self.shared_hid_output.clone())
                     .flatten();
-                desired.insert(device.path.clone(), (device.clone(), mode, shared_output));
+                let protocol = if Some(device.path.as_str()) == selected_path {
+                    crate::qmk_hid_host::HostProtocol::Selected(
+                        self.layout
+                            .as_ref()
+                            .is_some_and(|layout| layout.live_features.extended_host_protocol),
+                    )
+                } else {
+                    crate::qmk_hid_host::HostProtocol::Discover
+                };
+                desired.insert(
+                    device.path.clone(),
+                    (device.clone(), mode, shared_output, protocol),
+                );
             }
         }
 
         self.qmk_hid_hosts.retain(|path, bridge| {
-            desired.get(path).is_some_and(|(_, mode, shared_output)| {
-                *mode == bridge.mode() && shared_output.is_some() == bridge.uses_shared_output()
-            })
+            desired
+                .get(path)
+                .is_some_and(|(_, mode, shared_output, protocol)| {
+                    *mode == bridge.mode()
+                        && shared_output.is_some() == bridge.uses_shared_output()
+                        && *protocol == bridge.protocol()
+                })
         });
 
-        for (path, (device, mode, shared_output)) in desired {
+        for (path, (device, mode, shared_output, protocol)) in desired {
             self.qmk_hid_hosts.entry(path).or_insert_with(|| {
-                crate::qmk_hid_host::QmkHidHostBridge::start(device, mode, shared_output)
+                crate::qmk_hid_host::QmkHidHostBridge::start(device, mode, shared_output, protocol)
             });
         }
     }
@@ -2824,6 +2841,7 @@ mod tests {
 
         app.device_manager.replace_devices(vec![device.clone()]);
         app.selected_device = Some(0);
+        layout.live_features.extended_host_protocol = true;
         app.layout = Some(layout);
         app.app_settings.layout_sync_enabled = true;
         app.shared_hid_output = hid.shared_output();
@@ -2833,6 +2851,10 @@ mod tests {
 
         let bridge = app.qmk_hid_hosts.get(&device.path).unwrap();
         assert!(bridge.uses_shared_output());
+        assert_eq!(
+            bridge.protocol(),
+            crate::qmk_hid_host::HostProtocol::Selected(true)
+        );
         app.qmk_hid_hosts.clear();
     }
 

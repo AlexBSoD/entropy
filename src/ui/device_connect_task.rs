@@ -258,15 +258,20 @@ fn load_cached_qmk_settings(
 
 // Firmware builds may keep both their version and Vial definition unchanged.
 // Discover capabilities on each connection; the disk cache is only a fallback.
+#[cfg(not(target_arch = "wasm32"))]
 fn current_qmk_settings(
     query: impl FnOnce() -> anyhow::Result<Vec<u16>>,
     fallback: impl FnOnce() -> Option<Vec<u16>>,
-) -> Vec<u16> {
+) -> (Vec<u16>, bool) {
     match query() {
-        Ok(settings) => settings,
+        Ok(settings) => {
+            let extended_host_protocol =
+                crate::qmk_hid_host::supports_extended_host_protocol(&settings);
+            (settings, extended_host_protocol)
+        }
         Err(error) => {
             log::warn!("live QMK capability query failed, using cached fallback: {error}");
-            fallback().unwrap_or_default()
+            (fallback().unwrap_or_default(), false)
         }
     }
 }
@@ -799,9 +804,9 @@ impl EntropyApp {
                         }
                     },
                 );
-                let supported_qmk_settings = if vial_protocol >= 4 {
+                let (supported_qmk_settings, extended_host_protocol) = if vial_protocol >= 4 {
                     progress("Querying QMK settings…");
-                    let settings = current_qmk_settings(
+                    let (settings, extended_host_protocol) = current_qmk_settings(
                         || dev_conn.query_qmk_settings(),
                         || {
                             qmk_cache_context.as_ref().and_then(|context| {
@@ -813,15 +818,16 @@ impl EntropyApp {
                     if let Some(context) = qmk_cache_context.as_ref() {
                         save_cached_qmk_settings(cache_key, context, &settings);
                     }
-                    settings
+                    (settings, extended_host_protocol)
                 } else {
-                    Vec::new()
+                    (Vec::new(), false)
                 };
                 let has_qmk_setting = |qsid: u16| supported_qmk_settings.contains(&qsid);
 
                 progress("Parsing keyboard layout…");
                 let mut layout = KeyboardLayout::from_vial_json(&json)
                     .map_err(|e| format!("Layout parse failed: {e}"))?;
+                layout.live_features.extended_host_protocol = extended_host_protocol;
                 use_device_name_for_unnamed_layout(&mut layout, &dev.name);
 
                 progress("Reading layer count…");
@@ -1442,24 +1448,38 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(not(target_arch = "wasm32"))]
     fn live_capabilities_replace_cache_even_when_firmware_version_is_unchanged() {
-        let settings = current_qmk_settings(
+        let (settings, extended) = current_qmk_settings(
             || Ok((333..=371).collect()),
             || panic!("A successful discovery must not reuse pre-date cached capabilities"),
         );
         assert!(DATE_QSIDS.iter().all(|qsid| settings.contains(qsid)));
-        let older = current_qmk_settings(|| Ok(vec![333]), || Some((333..=371).collect()));
+        assert!(extended);
+        let (older, extended) =
+            current_qmk_settings(|| Ok(vec![333]), || Some((333..=371).collect()));
         assert!(
             !older.contains(&357),
             "Downgrades must also remove stale capabilities"
         );
+        assert!(!extended);
     }
 
     #[test]
+    #[cfg(not(target_arch = "wasm32"))]
     fn capability_query_failure_can_use_previous_cache() {
         assert_eq!(
             current_qmk_settings(|| Err(anyhow::anyhow!("offline")), || Some(vec![333])),
-            vec![333]
+            (vec![333], false)
+        );
+        let (cached, extended) = current_qmk_settings(
+            || Err(anyhow::anyhow!("timeout after firmware downgrade")),
+            || Some((333..=371).collect()),
+        );
+        assert!(cached.contains(&357));
+        assert!(
+            !extended,
+            "a cache must never authorize BA/AF on this connection"
         );
     }
 
