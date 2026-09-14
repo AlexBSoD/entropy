@@ -323,10 +323,12 @@ fn normalized_keyboard_name(name: &str) -> String {
 }
 
 pub(crate) fn layout_uses_combined_encoder_press(layout: &KeyboardLayout) -> bool {
+    let name = normalized_keyboard_name(&layout.name);
     matches!(
-        normalized_keyboard_name(&layout.name).as_str(),
+        name.as_str(),
         "ergohavenk03" | "k03" | "ergohavenimperial44" | "imperial44"
-    )
+    ) || name.starts_with("m4cr0pad")
+        || name.starts_with("ergohavenm4cr0pad")
 }
 
 pub(crate) fn encoder_group_layout_condition(
@@ -798,8 +800,6 @@ mod tests {
 
     #[test]
     fn encoder_press_keeps_geometric_macro_pad_matching() {
-        let mut layout = encoder_test_layout(&[None], None);
-        layout.name = "Ergohaven Imperial44".to_owned();
         let group_rect =
             egui::Rect::from_center_size(egui::pos2(50.0, 50.0), egui::vec2(80.0, 80.0));
         let key_rects = vec![(
@@ -807,10 +807,24 @@ mod tests {
             egui::Rect::from_center_size(egui::pos2(52.0, 50.0), egui::vec2(20.0, 20.0)),
         )];
 
-        let press_rects = encoder_press_key_rects(&layout, &key_rects, &[(0, group_rect)], &[]);
+        for name in [
+            "Ergohaven Imperial44",
+            "M4CR0Pad v1",
+            "M4CR0Pad v2",
+            "M4CR0Pad v3",
+        ] {
+            let mut layout = encoder_test_layout(&[None], None);
+            layout.name = name.to_owned();
+            let press_rects = encoder_press_key_rects(&layout, &key_rects, &[(0, group_rect)], &[]);
 
-        assert_eq!(press_rects.len(), 1);
-        assert_eq!(press_rects[0].key_idx, 0);
+            assert_eq!(press_rects.len(), 1, "{name}");
+            assert_eq!(press_rects[0].key_idx, 0, "{name}");
+            assert_eq!(
+                press_rects[0].press_rect.center(),
+                key_rects[0].1.center(),
+                "{name}"
+            );
+        }
     }
 
     #[test]

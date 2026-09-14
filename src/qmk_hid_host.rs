@@ -1,11 +1,9 @@
 //! Small built-in qmk-hid-host bridge for display presets that expect host data.
 //! Sends the same Raw HID packet family as https://github.com/ergohaven/qmk-hid-host.
 
-#[cfg(target_os = "linux")]
-use std::sync::OnceLock;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+    atomic::{AtomicBool, AtomicU8, Ordering},
+    Arc, Mutex, OnceLock,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -16,8 +14,24 @@ const DATA_VOLUME: u8 = 0xAB;
 const DATA_LAYOUT: u8 = 0xAC;
 const DATA_MEDIA_ARTIST: u8 = 0xAD;
 const DATA_MEDIA_TITLE: u8 = 0xAE;
+const DATA_DATE: u8 = 0xAF;
 const DEFAULT_LAYOUT_CODES: [&str; 2] = ["en", "ru"];
 const LAYOUT_RESEND_INTERVAL: Duration = Duration::from_secs(10);
+static CURRENT_MEDIA: OnceLock<Mutex<Option<(String, String)>>> = OnceLock::new();
+
+fn set_media_snapshot(media: Option<(String, String)>) {
+    if let Ok(mut current) = CURRENT_MEDIA.get_or_init(|| Mutex::new(None)).lock() {
+        *current = media;
+    }
+}
+
+pub fn media_snapshot() -> Option<(String, String)> {
+    CURRENT_MEDIA
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|current| current.clone())
+}
 #[cfg(target_os = "linux")]
 const KDE_LAYOUT_DESTINATION: &str = "org.kde.keyboard";
 #[cfg(target_os = "linux")]
@@ -30,6 +44,17 @@ const IBUS_DESTINATION: &str = "org.freedesktop.IBus";
 const IBUS_PATH: &str = "/org/freedesktop/IBus";
 #[cfg(target_os = "linux")]
 const IBUS_INTERFACE: &str = "org.freedesktop.IBus";
+const DATA_HOST_STATUS: u8 = 0xBA;
+// Native Windows audio queries can follow each bridge tick. Only changed
+// percentages are sent, allowing the display to retarget small volume steps.
+#[cfg(target_os = "windows")]
+const VOLUME_POLL_INTERVAL: Duration = Duration::from_millis(20);
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const VOLUME_POLL_INTERVAL: Duration = Duration::from_millis(40);
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+const VOLUME_POLL_INTERVAL: Duration = Duration::from_millis(250);
+#[cfg(any(target_os = "macos", test))]
+mod macos_volume;
 #[cfg(target_os = "macos")]
 const MACOS_AUTOMATION_COMMAND_TIMEOUT: Duration = Duration::from_millis(1_500);
 #[cfg(not(target_os = "windows"))]
@@ -278,6 +303,8 @@ pub struct QmkHidHostBridge {
     shared_output: Option<crate::hid::SharedHidOutput>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    send_shutdown_on_drop: bool,
+    layout_snapshot: Arc<AtomicU8>,
 }
 
 impl QmkHidHostBridge {
@@ -290,15 +317,30 @@ impl QmkHidHostBridge {
         let worker_stop = stop.clone();
         let worker_device = device.clone();
         let worker_output = shared_output.clone();
-        let thread =
-            thread::spawn(move || run_bridge(worker_device, mode, worker_output, worker_stop));
+        let layout_snapshot = Arc::new(AtomicU8::new(u8::MAX));
+        let worker_layout = layout_snapshot.clone();
+        let thread = thread::spawn(move || {
+            run_bridge(
+                worker_device,
+                mode,
+                worker_output,
+                worker_stop,
+                worker_layout,
+            )
+        });
         Self {
             device,
             mode,
             shared_output,
             stop,
             thread: Some(thread),
+            send_shutdown_on_drop: true,
+            layout_snapshot,
         }
+    }
+
+    pub fn layout_label(&self) -> Option<&'static str> {
+        layout_snapshot_label(&self.layout_snapshot)
     }
 
     pub fn mode(&self) -> HostDataMode {
@@ -309,10 +351,17 @@ impl QmkHidHostBridge {
         self.shared_output.is_some()
     }
 
+    /// Keep the display contents intact while replacing this bridge with a
+    /// different HID owner for the same, still-connected device.
+    pub fn suppress_shutdown(&mut self) {
+        self.send_shutdown_on_drop = false;
+    }
+
     pub fn stop(&mut self) {
         let was_running = self.thread.is_some();
         self.stop.store(true, Ordering::Relaxed);
-        if was_running {
+        self.layout_snapshot.store(u8::MAX, Ordering::Relaxed);
+        if was_running && self.send_shutdown_on_drop {
             send_shutdown_payloads(&self.device, self.mode, self.shared_output.as_ref());
         }
         if let Some(thread) = self.thread.take() {
@@ -336,6 +385,7 @@ fn run_bridge(
     mode: HostDataMode,
     shared_output: Option<crate::hid::SharedHidOutput>,
     stop: Arc<AtomicBool>,
+    layout_snapshot: Arc<AtomicU8>,
 ) {
     let mut device: Option<HostDataHid> = None;
     let mut last_open_attempt = Instant::now() - Duration::from_secs(5);
@@ -383,6 +433,7 @@ fn run_bridge(
         #[cfg(target_os = "linux")]
         if !target.uses_bluez_gatt_transport() && !std::path::Path::new(&target.path).exists() {
             log::warn!("qmk-hid-host device path disappeared; reconnecting");
+            layout_snapshot.store(u8::MAX, Ordering::Relaxed);
             device = None;
             reset_layout_sync_state(&mut last_layout, &mut last_layout_full_send);
             thread::sleep(Duration::from_millis(250));
@@ -393,15 +444,31 @@ fn run_bridge(
 
         if mode.time && last_time_poll.elapsed() >= Duration::from_secs(1) {
             last_time_poll = Instant::now();
+            write_failed |= write_payload(dev, &[DATA_HOST_STATUS, 1]).is_err();
             let now = current_time_payload();
             if last_time != Some(now) {
                 last_time = Some(now);
                 write_failed |= write_payload(dev, &[DATA_TIME, now.0, now.1]).is_err();
                 pause_between_packets();
+                use chrono::Datelike;
+                let today = chrono::Local::now();
+                let year = today.year() as u16;
+                write_failed |= write_payload(
+                    dev,
+                    &[
+                        DATA_DATE,
+                        today.day() as u8,
+                        today.month() as u8,
+                        year as u8,
+                        (year >> 8) as u8,
+                    ],
+                )
+                .is_err();
+                pause_between_packets();
             }
         }
 
-        if mode.volume && last_volume_poll.elapsed() >= Duration::from_secs(2) {
+        if mode.volume && last_volume_poll.elapsed() >= VOLUME_POLL_INTERVAL {
             last_volume_poll = Instant::now();
             if let Some(volume) = current_volume_percent() {
                 if last_volume != Some(volume) {
@@ -426,7 +493,7 @@ fn run_bridge(
             {
                 if layout_needs_send(last_layout, last_layout_full_send.elapsed(), layout) {
                     last_layout = Some(layout);
-                    let layout_write = write_payload(dev, &[DATA_LAYOUT, layout]);
+                    let layout_write = write_layout_snapshot(dev, layout, &layout_snapshot);
                     write_failed |= layout_write.is_err();
                     if layout_write.is_ok() {
                         last_layout_full_send = Instant::now();
@@ -439,6 +506,9 @@ fn run_bridge(
         if mode.media && last_media_poll.elapsed() >= Duration::from_secs(3) {
             last_media_poll = Instant::now();
             let (artist, title) = current_media_info().unwrap_or_default();
+            set_media_snapshot(
+                (!artist.is_empty() || !title.is_empty()).then(|| (artist.clone(), title.clone())),
+            );
             if stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -460,6 +530,7 @@ fn run_bridge(
 
         if write_failed {
             log::warn!("qmk-hid-host bridge write failed; reconnecting");
+            layout_snapshot.store(u8::MAX, Ordering::Relaxed);
             device = None;
             last_time = None;
             last_volume = None;
@@ -469,10 +540,31 @@ fn run_bridge(
             last_media_full_send = Instant::now() - Duration::from_secs(60);
         }
 
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(20));
     }
 
+    layout_snapshot.store(u8::MAX, Ordering::Relaxed);
+    set_media_snapshot(None);
     log::info!("qmk-hid-host bridge stopped");
+}
+
+// Preview state belongs to this device bridge and is published only after
+// the same language packet has successfully been written to its HID channel.
+fn layout_snapshot_label(snapshot: &AtomicU8) -> Option<&'static str> {
+    match snapshot.load(Ordering::Relaxed) {
+        0 => Some("EN"),
+        1 => Some("RU"),
+        _ => None,
+    }
+}
+
+fn write_layout_snapshot(dev: &HostDataHid, layout: u8, snapshot: &AtomicU8) -> anyhow::Result<()> {
+    let result = write_payload(dev, &[DATA_LAYOUT, layout]);
+    snapshot.store(
+        if result.is_ok() { layout } else { u8::MAX },
+        Ordering::Relaxed,
+    );
+    result
 }
 
 fn reset_layout_sync_state(last_layout: &mut Option<u8>, last_layout_full_send: &mut Instant) {
@@ -515,8 +607,10 @@ fn send_shutdown_payloads(
 
 fn shutdown_payloads(mode: HostDataMode) -> Vec<Vec<u8>> {
     let mut payloads = Vec::new();
+    // Dedicated status command: old firmware ignores it, never renders a
+    // malformed clock value. New firmware also expires a lost heartbeat.
     if mode.time {
-        payloads.push(vec![DATA_TIME, u8::MAX, u8::MAX]);
+        payloads.push(vec![DATA_HOST_STATUS, 0]);
     }
     if mode.media {
         payloads.push(vec![DATA_MEDIA_ARTIST, 0]);
@@ -607,15 +701,28 @@ fn current_volume_percent() -> Option<u8> {
 }
 
 #[cfg(target_os = "linux")]
+fn linux_volume_command(program: &str, args: &[&str]) -> Option<String> {
+    // These short queries run sequentially in the bridge, never concurrently.
+    // Do not add the generic 25 ms wait to every fast wpctl/pactl response, or
+    // let a stalled audio server block display updates for ten seconds.
+    command_stdout_timeout_with_poll(
+        program,
+        args,
+        Duration::from_millis(250),
+        Duration::from_millis(2),
+    )
+}
+
+#[cfg(target_os = "linux")]
 fn current_volume_percent() -> Option<u8> {
-    command_stdout("wpctl", &["get-volume", "@DEFAULT_AUDIO_SINK@"])
+    linux_volume_command("wpctl", &["get-volume", "@DEFAULT_AUDIO_SINK@"])
         .and_then(|out| {
             out.split_whitespace()
                 .find_map(|part| part.parse::<f32>().ok())
                 .map(|v| (v * 100.0).round().clamp(0.0, 100.0) as u8)
         })
         .or_else(|| {
-            command_stdout("pactl", &["get-sink-volume", "@DEFAULT_SINK@"]).and_then(|out| {
+            linux_volume_command("pactl", &["get-sink-volume", "@DEFAULT_SINK@"]).and_then(|out| {
                 out.split_whitespace()
                     .find(|part| part.ends_with('%'))
                     .and_then(|part| part.trim_end_matches('%').parse::<u8>().ok())
@@ -625,8 +732,7 @@ fn current_volume_percent() -> Option<u8> {
 
 #[cfg(target_os = "macos")]
 fn current_volume_percent() -> Option<u8> {
-    macos_automation_stdout(&["-e", "output volume of (get volume settings)"])
-        .and_then(|out| out.trim().parse::<u8>().ok())
+    macos_volume::volume_percent()
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
@@ -787,6 +893,16 @@ fn macos_automation_stdout(args: &[&str]) -> Option<String> {
 
 #[cfg(not(target_os = "windows"))]
 fn command_stdout_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    command_stdout_timeout_with_poll(program, args, timeout, COMMAND_POLL_INTERVAL)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn command_stdout_timeout_with_poll(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Option<String> {
     use std::io::Read;
 
     let mut child = std::process::Command::new(program)
@@ -813,7 +929,7 @@ fn command_stdout_timeout(program: &str, args: &[&str], timeout: Duration) -> Op
             return None;
         }
 
-        thread::sleep(COMMAND_POLL_INTERVAL);
+        thread::sleep(poll_interval);
     }
 }
 
@@ -847,11 +963,24 @@ mod tests {
         let host_data_hid = open_host_data_hid(&target, Some(&output)).unwrap();
 
         assert!(host_data_hid.uses_shared_output());
-        write_payload(&host_data_hid, &[DATA_LAYOUT, 1]).unwrap();
-
+        let snapshot = AtomicU8::new(u8::MAX);
+        let other_device = AtomicU8::new(1);
+        assert_eq!(layout_snapshot_label(&snapshot), None);
+        for (index, label) in [(0, "EN"), (1, "RU"), (0, "EN")] {
+            write_layout_snapshot(&host_data_hid, index, &snapshot).unwrap();
+            assert_eq!(layout_snapshot_label(&snapshot), Some(label));
+            assert_eq!(layout_snapshot_label(&other_device), Some("RU"));
+        }
         let requests = recorder.requests();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(&requests[0][..4], &[DATA_LAYOUT, 1, 0, 0]);
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request[1])
+                .collect::<Vec<_>>(),
+            vec![0, 1, 0]
+        );
+        assert!(requests.iter().all(|request| request[0] == DATA_LAYOUT));
     }
 
     #[test]
@@ -974,6 +1103,19 @@ mod tests {
         assert_eq!(output.as_deref(), Some("entropy"));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_volume_queries_return_output_and_bound_stalled_audio_commands() {
+        assert_eq!(
+            linux_volume_command("/bin/sh", &["-c", "printf 'Volume: 0.42'"]).as_deref(),
+            Some("Volume: 0.42")
+        );
+        assert!(linux_volume_command("/bin/sh", &["-c", "exit 1"]).is_none());
+        let started_at = Instant::now();
+        assert!(linux_volume_command("/bin/sh", &["-c", "exec sleep 2"]).is_none());
+        assert!(started_at.elapsed() < Duration::from_secs(1));
+    }
+
     #[test]
     fn command_stdout_timeout_stops_slow_command() {
         let started_at = Instant::now();
@@ -988,7 +1130,7 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_payloads_clear_time_and_media() {
+    fn shutdown_payloads_clear_media_without_sending_invalid_time() {
         let payloads = shutdown_payloads(HostDataMode {
             time: true,
             volume: true,
@@ -999,7 +1141,7 @@ mod tests {
         assert_eq!(
             payloads,
             vec![
-                vec![DATA_TIME, u8::MAX, u8::MAX],
+                vec![DATA_HOST_STATUS, 0],
                 vec![DATA_MEDIA_ARTIST, 0],
                 vec![DATA_MEDIA_TITLE, 0],
             ]
@@ -1487,7 +1629,7 @@ mod windows_platform {
                 MMDeviceEnumerator,
             },
             System::Com::{
-                CoCreateInstance, CoInitializeEx, CLSCTX_ALL, CLSCTX_INPROC_SERVER,
+                CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, CLSCTX_INPROC_SERVER,
                 COINIT_MULTITHREADED,
             },
         },
@@ -1502,17 +1644,23 @@ mod windows_platform {
 
     pub fn volume_percent() -> Option<u8> {
         unsafe {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-            let enumerator: IMMDeviceEnumerator =
-                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_INPROC_SERVER).ok()?;
-            let endpoint = enumerator
-                .GetDefaultAudioEndpoint(eRender, eMultimedia)
-                .ok()?;
-            let volume = endpoint
-                .Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
-                .ok()?;
-            let scalar = volume.GetMasterVolumeLevelScalar().ok()?;
-            Some((scalar * 100.0).round().clamp(0.0, 100.0) as u8)
+            let initialized = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+            let result = (|| {
+                let enumerator: IMMDeviceEnumerator =
+                    CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_INPROC_SERVER).ok()?;
+                let endpoint = enumerator
+                    .GetDefaultAudioEndpoint(eRender, eMultimedia)
+                    .ok()?;
+                let volume = endpoint
+                    .Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
+                    .ok()?;
+                let scalar = volume.GetMasterVolumeLevelScalar().ok()?;
+                Some((scalar * 100.0).round().clamp(0.0, 100.0) as u8)
+            })();
+            if initialized {
+                CoUninitialize();
+            }
+            result
         }
     }
 

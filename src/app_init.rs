@@ -163,6 +163,7 @@ impl EntropyApp {
             alt_repeat_pick_target: None,
             last_single_instance_signal: read_single_instance_signal(),
             rgb_settings: RgbSettingsState::default(),
+            display_settings: DisplaySettingsState::default(),
             layout_options_value: None,
             encoder_visibility: vec![],
             combo_term_dirty: false,

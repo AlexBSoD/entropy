@@ -1,5 +1,10 @@
 use super::*;
 
+#[cfg(not(target_arch = "wasm32"))]
+fn qmk_bridge_device_still_connected(devices: &[Device], path: &str) -> bool {
+    devices.iter().any(|device| device.path == path)
+}
+
 impl EntropyApp {
     pub(super) fn is_encoder_layout_option(option: &LayoutOption) -> bool {
         if !option.choices.is_empty() {
@@ -1920,6 +1925,16 @@ impl EntropyApp {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn clear_qmk_hid_host_bridges_for_reconnect(&mut self) {
+        for (path, bridge) in &mut self.qmk_hid_hosts {
+            if qmk_bridge_device_still_connected(self.device_manager.devices(), path) {
+                bridge.suppress_shutdown();
+            }
+        }
+        self.qmk_hid_hosts.clear();
+    }
+
     pub(super) fn open_layout_options_settings_page(&mut self) {
         self.settings_tab = SettingsTab::LayoutOptions;
         self.main_menu_tab = MainMenuTab::Settings;
@@ -1988,6 +2003,29 @@ impl EntropyApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_preserves_only_the_bridge_for_the_remaining_macropad() {
+        let remaining = Device {
+            name: "M4CR0Pad v3".to_owned(),
+            vendor_id: 0xE126,
+            product_id: 0x0066,
+            manufacturer: "Ergohaven".to_owned(),
+            serial_number: "second".to_owned(),
+            bus_type: "USB".to_owned(),
+            path: "second-path".to_owned(),
+            firmware: FirmwareProtocol::Vial,
+        };
+
+        assert!(qmk_bridge_device_still_connected(
+            std::slice::from_ref(&remaining),
+            "second-path"
+        ));
+        assert!(!qmk_bridge_device_still_connected(
+            std::slice::from_ref(&remaining),
+            "disconnected-first-path"
+        ));
+    }
 
     fn test_app() -> EntropyApp {
         let ctx = egui::Context::default();

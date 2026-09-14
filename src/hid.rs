@@ -997,6 +997,11 @@ fn is_optional_qmk_settings_query(data: &[u8]) -> bool {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn is_qmk_settings_get(data: &[u8]) -> bool {
+    data.starts_with(&[CMD_VIA_VIAL_PREFIX, CMD_VIAL_QMK_SETTINGS_GET])
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn is_keymap_read_request(data: &[u8]) -> bool {
     matches!(
         data.first(),
@@ -1021,9 +1026,13 @@ fn usb_send_max_attempts(transport: HidTransport, data: &[u8]) -> usize {
     if transport.is_bluetooth()
         || is_optional_firmware_version_request(data)
         || is_optional_qmk_settings_query(data)
+        || is_qmk_settings_get(data)
         || is_keymap_read_request(data)
         || crate::rmk_native::is_rmk_native_capabilities_request(data)
         || is_optional_dynamic_entry_count_request(data)
+        || data.first().is_some_and(|command| {
+            (0xB0..=0xB7).contains(command) || (0xD0..=0xD5).contains(command)
+        })
     {
         1
     } else {
@@ -2178,6 +2187,15 @@ mod tests {
         let command = [CMD_VIA_VIAL_PREFIX, CMD_VIAL_QMK_SETTINGS_QUERY, 0, 0];
 
         assert_eq!(usb_send_max_attempts(HidTransport::Usb, &command), 1);
+    }
+
+    #[test]
+    fn qmk_settings_reads_and_standby_session_use_one_usb_attempt() {
+        let qmk_get = [CMD_VIA_VIAL_PREFIX, CMD_VIAL_QMK_SETTINGS_GET, 0, 0];
+
+        assert_eq!(usb_send_max_attempts(HidTransport::Usb, &qmk_get), 1);
+        assert_eq!(usb_send_max_attempts(HidTransport::Usb, &[0xB6, 1]), 1);
+        assert_eq!(usb_send_max_attempts(HidTransport::Usb, &[0xB7, 100, 0]), 1);
     }
 
     #[test]

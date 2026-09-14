@@ -547,6 +547,7 @@ impl EntropyApp {
                 self.grave_escape_settings = r.grave_escape_settings;
                 self.layer_led_settings = r.layer_led_settings;
                 self.rgb_settings = r.rgb_settings;
+                self.display_settings = r.display_settings;
                 self.layout_options_value = r.layout_options_value;
                 let highest_used_combo = self
                     .combo_entries
