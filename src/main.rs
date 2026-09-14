@@ -279,7 +279,7 @@ fn initial_window_size() -> [f32; 2] {
 }
 
 fn main() -> eframe::Result<()> {
-    #[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
+    #[cfg(not(target_arch = "wasm32"))]
     if hid::run_hid_proxy_if_requested() {
         return Ok(());
     }

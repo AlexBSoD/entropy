@@ -228,6 +228,10 @@ impl EntropyApp {
             #[cfg(not(target_arch = "wasm32"))]
             connect_state: ConnectState::Idle,
             #[cfg(not(target_arch = "wasm32"))]
+            retiring_connects: Vec::new(),
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            test_connect_requests: None,
+            #[cfg(not(target_arch = "wasm32"))]
             device_scan_state: DeviceScanState::Idle,
         }
     }

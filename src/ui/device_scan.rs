@@ -176,6 +176,33 @@ impl EntropyApp {
         self.device_display_names
             .retain(|key, _| connected_display_name_keys.contains(key));
 
+        // A user-requested identity takes precedence over discovery's automatic
+        // choice, including an empty scan while its cancelled predecessor retires.
+        if let Some(identity) = &self.pending_device_connect {
+            let pending_index =
+                unique_reconnect_device_index(self.device_manager.devices(), identity);
+            if self.layout.is_some() && !was_loading {
+                // A blocked replacement must not relabel the currently live HID.
+                self.selected_device = previous_device.as_ref().and_then(|device| {
+                    unique_reconnect_device_index(
+                        self.device_manager.devices(),
+                        &device.stable_identity(),
+                    )
+                });
+                if self.selected_device.is_none() {
+                    let pending = self.pending_device_connect.take();
+                    self.clear_connected_keyboard_state("No device detected");
+                    self.pending_device_connect = pending;
+                }
+            } else {
+                self.selected_device = pending_index;
+            }
+            if pending_index.is_some() {
+                self.resume_pending_device_connect();
+            }
+            return;
+        }
+
         if self.device_manager.devices().is_empty() {
             if selecting_device {
                 self.selected_device = None;
@@ -183,12 +210,9 @@ impl EntropyApp {
                 return;
             }
             if was_loading {
-                if let ConnectState::Loading { cancel, .. } = &self.connect_state {
-                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-                // Do not leave the UI owned by a worker that is blocked on a
-                // disconnected HID handle. Dropping its receiver makes any late
-                // result inert; the next scan can immediately start a fresh owner.
+                // Release the UI, but keep the cancelled transport serialized
+                // until it finishes. clear_connected_keyboard_state retires it
+                // and makes every late result inert.
                 self.selected_device = None;
                 self.clear_connected_keyboard_state("No device detected");
                 return;
@@ -267,7 +291,6 @@ impl EntropyApp {
             return;
         }
 
-        self.selected_device = Some(0);
         self.start_connect(0);
     }
 }
@@ -275,6 +298,111 @@ impl EntropyApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scan_test_device(name: &str) -> Device {
+        Device {
+            name: name.to_owned(),
+            vendor_id: 0xFFFF,
+            product_id: 0xFFFF,
+            manufacturer: "Test".to_owned(),
+            serial_number: name.to_owned(),
+            bus_type: "Usb".to_owned(),
+            path: format!("/nonexistent/entropy-test-{name}"),
+            instance_token: "original-instance".to_owned(),
+            firmware: FirmwareProtocol::Vial,
+        }
+    }
+
+    #[test]
+    fn scans_preserve_queued_identity_through_absence_and_reordering() {
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = EntropyApp::new(&cc);
+        let (launch_tx, requests) = mpsc::channel();
+        app.test_connect_requests = Some(launch_tx);
+        let a = scan_test_device("A");
+        let b = scan_test_device("B");
+        app.device_manager
+            .replace_devices(vec![a.clone(), b.clone()]);
+        app.start_connect(0);
+        let (_, old_tx) = requests.try_recv().unwrap();
+        app.start_connect(1);
+        app.apply_device_scan_result(vec![a.clone()]);
+        assert_eq!(app.pending_device_connect, Some(b.stable_identity()));
+        assert_eq!(app.selected_device, None);
+        assert!(requests.try_recv().is_err());
+        assert!(matches!(app.device_scan_state, DeviceScanState::Idle));
+        app.apply_device_scan_result(Vec::new());
+        assert_eq!(app.pending_device_connect, Some(b.stable_identity()));
+        app.apply_device_scan_result(vec![b.clone(), a]);
+        assert_eq!(app.selected_device, Some(0));
+        assert!(requests.try_recv().is_err());
+        old_tx
+            .send(ConnectTaskMessage::Done(Box::new(Err(
+                "Layout read failed: Connect cancelled".to_owned(),
+            ))))
+            .unwrap();
+        app.poll_connect(&ctx);
+        assert_eq!(
+            requests.try_recv().unwrap().0.stable_identity(),
+            b.stable_identity()
+        );
+        assert_eq!(app.selected_device, Some(0));
+    }
+
+    #[test]
+    fn reused_hidraw_instance_cancels_loading_owner_before_reopening() {
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = EntropyApp::new(&cc);
+        let (launch_tx, requests) = mpsc::channel();
+        app.test_connect_requests = Some(launch_tx);
+        let mut device = scan_test_device("A");
+        app.device_manager.replace_devices(vec![device.clone()]);
+        app.start_connect(0);
+        let (_, old_tx) = requests.try_recv().unwrap();
+        device.instance_token = "replacement-instance".to_owned();
+        app.apply_device_scan_result(vec![device]);
+        assert!(
+            matches!(&app.connect_state, ConnectState::Loading { cancel, .. } if cancel.load(std::sync::atomic::Ordering::Relaxed))
+        );
+        assert!(requests.try_recv().is_err());
+        old_tx
+            .send(ConnectTaskMessage::Done(Box::new(Err(
+                "old device disconnected".to_owned(),
+            ))))
+            .unwrap();
+        app.poll_connect(&ctx);
+        assert_eq!(
+            requests.try_recv().unwrap().0.instance_token,
+            "replacement-instance"
+        );
+        assert_eq!(app.selected_device, Some(0));
+    }
+
+    #[test]
+    fn unplug_and_reselection_do_not_overlap_a_blocked_transport_worker() {
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = EntropyApp::new(&cc);
+        let (launch_tx, requests) = mpsc::channel();
+        app.test_connect_requests = Some(launch_tx);
+        let device = scan_test_device("A");
+        app.device_manager.replace_devices(vec![device.clone()]);
+        app.start_connect(0);
+        let (_, old_tx) = requests.try_recv().unwrap();
+        app.apply_device_scan_result(Vec::new());
+        assert!(matches!(app.connect_state, ConnectState::Idle));
+        assert!(!app.retiring_connects.is_empty());
+        app.device_manager.replace_devices(vec![device]);
+        app.start_connect(0);
+        app.poll_connect(&ctx);
+        assert!(requests.try_recv().is_err());
+        drop(old_tx);
+        app.poll_connect(&ctx);
+        assert_eq!(requests.try_recv().unwrap().0.serial_number, "A");
+        assert!(app.retiring_connects.is_empty());
+    }
 
     #[test]
     fn manual_device_selection_waits_after_open_failure() {
@@ -325,11 +453,11 @@ mod tests {
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let now = std::time::Instant::now();
         app.connect_state = ConnectState::Loading {
+            device: scan_test_device("Loading"),
             rx: std::sync::mpsc::channel().1,
             started_at: now,
             last_progress_at: now,
             cancel: cancel.clone(),
-            cancel_requested: false,
             reconnect: None,
         };
 

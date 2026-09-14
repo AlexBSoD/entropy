@@ -492,23 +492,34 @@ mod tests {
 
         let (_sender, receiver) = std::sync::mpsc::channel();
         let now = std::time::Instant::now();
+        let device = Device {
+            name: "Test keyboard".to_owned(),
+            vendor_id: 0xFFFF,
+            product_id: 0xFFFF,
+            manufacturer: "Test".to_owned(),
+            serial_number: "test".to_owned(),
+            bus_type: "Usb".to_owned(),
+            path: "/nonexistent/entropy-test".to_owned(),
+            instance_token: "test".to_owned(),
+            firmware: FirmwareProtocol::Vial,
+        };
         let loading = ConnectState::Loading {
+            device: device.clone(),
             rx: receiver,
             started_at: now,
             last_progress_at: now,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            cancel_requested: false,
             reconnect: None,
         };
         assert!(connection_replaces_layout_canvas(&loading, false));
         assert!(connection_replaces_layout_canvas(&loading, true));
 
         let reconnecting_loading = ConnectState::Loading {
+            device,
             rx: std::sync::mpsc::channel().1,
             started_at: now,
             last_progress_at: now,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            cancel_requested: false,
             reconnect: Some(BluetoothReconnectState::new(
                 Device {
                     name: "K:04".to_owned(),

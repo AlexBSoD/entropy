@@ -272,11 +272,52 @@ fn command_exists(program: &str) -> bool {
     std::env::split_paths(&paths).any(|dir| dir.join(program).is_file())
 }
 
+/// Stops transport ownership independently of desktop-query progress. This
+/// mutex protects only token publication, never HID I/O or desktop queries.
+#[derive(Default)]
+struct BridgeTransportControl {
+    stop: AtomicBool,
+    retirement: std::sync::Mutex<Option<crate::hid::HidRetirement>>,
+}
+
+impl BridgeTransportControl {
+    fn publish(&self, token: Option<crate::hid::HidRetirement>) -> anyhow::Result<()> {
+        if self.stop.load(Ordering::Acquire) {
+            if let Some(token) = token {
+                token.retire();
+            }
+            anyhow::bail!("Host bridge stopped during open");
+        }
+        if let Ok(mut current) = self.retirement.try_lock() {
+            *current = token;
+        } else {
+            if let Some(token) = token {
+                token.retire();
+            }
+            anyhow::bail!("Host bridge transport publication busy");
+        }
+        // Covers stop racing with publication, including stop's failed try_lock.
+        if self.stop.load(Ordering::Acquire) {
+            self.retire();
+            anyhow::bail!("Host bridge stopped during open");
+        }
+        Ok(())
+    }
+
+    fn retire(&self) {
+        self.stop.store(true, Ordering::Release);
+        if let Ok(mut token) = self.retirement.try_lock() {
+            if let Some(token) = token.take() {
+                token.retire();
+            }
+        }
+    }
+}
+
 pub struct QmkHidHostBridge {
-    device: crate::device::Device,
     mode: HostDataMode,
     shared_output: Option<crate::hid::SharedHidOutput>,
-    stop: Arc<AtomicBool>,
+    control: Arc<BridgeTransportControl>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -286,17 +327,14 @@ impl QmkHidHostBridge {
         mode: HostDataMode,
         shared_output: Option<crate::hid::SharedHidOutput>,
     ) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = stop.clone();
-        let worker_device = device.clone();
+        let control = Arc::new(BridgeTransportControl::default());
+        let worker_control = control.clone();
         let worker_output = shared_output.clone();
-        let thread =
-            thread::spawn(move || run_bridge(worker_device, mode, worker_output, worker_stop));
+        let thread = thread::spawn(move || run_bridge(device, mode, worker_output, worker_control));
         Self {
-            device,
             mode,
             shared_output,
-            stop,
+            control,
             thread: Some(thread),
         }
     }
@@ -310,18 +348,10 @@ impl QmkHidHostBridge {
     }
 
     pub fn stop(&mut self) {
-        let was_running = self.thread.is_some();
-        self.stop.store(true, Ordering::Relaxed);
-        if was_running {
-            send_shutdown_payloads(&self.device, self.mode, self.shared_output.as_ref());
-        }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread::Builder::new()
-                .name("qmk-hid-host-join".to_owned())
-                .spawn(move || {
-                    let _ = thread.join();
-                });
-        }
+        // Atomic revocation is independent of an unresponsive desktop query.
+        // Never open/write HID, join, or spawn a join-waiter from UI/Drop.
+        self.control.retire();
+        self.thread.take();
     }
 }
 
@@ -335,8 +365,9 @@ fn run_bridge(
     target: crate::device::Device,
     mode: HostDataMode,
     shared_output: Option<crate::hid::SharedHidOutput>,
-    stop: Arc<AtomicBool>,
+    control: Arc<BridgeTransportControl>,
 ) {
+    let stop = &control.stop;
     let mut device: Option<HostDataHid> = None;
     let mut last_open_attempt = Instant::now() - Duration::from_secs(5);
     let mut last_time = None;
@@ -357,6 +388,14 @@ fn run_bridge(
         if device.is_none() && last_open_attempt.elapsed() >= Duration::from_secs(2) {
             last_open_attempt = Instant::now();
             device = open_host_data_hid(&target, shared_output.as_ref())
+                .and_then(|device| {
+                    let retirement = match &device {
+                        HostDataHid::Dedicated(hid) => hid.retirement_handle(),
+                        HostDataHid::Shared(_) => None,
+                    };
+                    control.publish(retirement)?;
+                    Ok(device)
+                })
                 .map_err(|e| log::warn!("qmk-hid-host open failed: {e}"))
                 .ok();
             if device.is_some() {
@@ -404,6 +443,9 @@ fn run_bridge(
         if mode.volume && last_volume_poll.elapsed() >= Duration::from_secs(2) {
             last_volume_poll = Instant::now();
             if let Some(volume) = current_volume_percent() {
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
                 if last_volume != Some(volume) {
                     last_volume = Some(volume);
                     write_failed |= write_payload(dev, &[DATA_VOLUME, volume]).is_err();
@@ -424,6 +466,9 @@ fn run_bridge(
                 .as_mut()
                 .and_then(LayoutTracker::current_layout_index)
             {
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
                 if layout_needs_send(last_layout, last_layout_full_send.elapsed(), layout) {
                     last_layout = Some(layout);
                     let layout_write = write_payload(dev, &[DATA_LAYOUT, layout]);
@@ -472,6 +517,11 @@ fn run_bridge(
         thread::sleep(Duration::from_millis(200));
     }
 
+    // Best effort only, on this background owner. Dedicated transport may have
+    // already been revoked; selected/shared transport must not be revoked here.
+    if let Some(device) = device.as_ref() {
+        send_shutdown_payloads(device, mode);
+    }
     log::info!("qmk-hid-host bridge stopped");
 }
 
@@ -488,25 +538,10 @@ fn layout_needs_send(
     last_layout != Some(layout) || elapsed_since_last_send >= LAYOUT_RESEND_INTERVAL
 }
 
-fn send_shutdown_payloads(
-    target: &crate::device::Device,
-    mode: HostDataMode,
-    shared_output: Option<&crate::hid::SharedHidOutput>,
-) {
-    let payloads = shutdown_payloads(mode);
-    if payloads.is_empty() {
-        return;
-    }
-
-    let Ok(device) = open_host_data_hid(target, shared_output).map_err(|e| {
-        log::warn!("qmk-hid-host shutdown open failed: {e}");
-    }) else {
-        return;
-    };
-
-    for payload in payloads {
-        if let Err(e) = write_payload(&device, &payload) {
-            log::warn!("qmk-hid-host shutdown write failed: {e}");
+fn send_shutdown_payloads(device: &HostDataHid, mode: HostDataMode) {
+    for payload in shutdown_payloads(mode) {
+        if let Err(e) = write_payload(device, &payload) {
+            log::debug!("qmk-hid-host shutdown write skipped: {e}");
             break;
         }
         pause_between_packets();
@@ -1550,4 +1585,36 @@ mod windows_platform {
             String::from_utf16(&buffer[..len as usize - 1]).ok()
         }
     }
+}
+
+// Test-only stalled-desktop-query seam: exercises the real bridge stop/control
+// with a real proxy while no OS desktop service or physical HID is accessed.
+#[cfg(test)]
+pub(crate) fn test_bridge_holding_transport(
+    hid: crate::hid::HidDevice,
+) -> (
+    QmkHidHostBridge,
+    std::sync::mpsc::Sender<()>,
+    Arc<AtomicBool>,
+) {
+    let control = Arc::new(BridgeTransportControl::default());
+    control.publish(hid.retirement_handle()).unwrap();
+    let (release, blocked_query) = std::sync::mpsc::channel();
+    let finished = Arc::new(AtomicBool::new(false));
+    let worker_finished = finished.clone();
+    let thread = thread::spawn(move || {
+        let _ = blocked_query.recv_timeout(Duration::from_secs(10));
+        drop(hid);
+        worker_finished.store(true, Ordering::Release);
+    });
+    (
+        QmkHidHostBridge {
+            mode: HostDataMode::default(),
+            shared_output: None,
+            control,
+            thread: Some(thread),
+        },
+        release,
+        finished,
+    )
 }

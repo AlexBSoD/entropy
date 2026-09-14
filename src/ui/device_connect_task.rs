@@ -508,10 +508,35 @@ impl EntropyApp {
             }
         };
         let pending_identity = dev.stable_identity();
-
         if let ConnectState::Loading { cancel, .. } = &self.connect_state {
+            self.selected_device = Some(device_idx);
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             if reconnect.is_none() {
+                self.pending_device_connect = Some(pending_identity);
+            }
+            return;
+        }
+        if self.retiring_connects.len() >= MAX_CONNECT_WORKERS
+            || self
+                .retiring_connects
+                .iter()
+                .any(|retiring| retiring.device.may_share_physical_device(&dev))
+        {
+            if let Some(reconnect) = reconnect {
+                self.schedule_bluetooth_reconnect_retry(
+                    reconnect,
+                    "Connect endpoint still retiring",
+                );
+            } else {
+                if self.bluetooth_reconnect_active() {
+                    self.clear_connected_keyboard_state(format!(
+                        "Connecting to {}…",
+                        dev.display_name_with_transport(&dev.name)
+                    ));
+                }
+                if self.layout.is_none() {
+                    self.selected_device = Some(device_idx);
+                }
                 self.pending_device_connect = Some(pending_identity);
             }
             return;
@@ -539,6 +564,10 @@ impl EntropyApp {
                 return;
             }
         }
+        // The index is mutable discovery state, so bind it only when this
+        // identity actually becomes the UI owner. A queued request must not
+        // relabel the still-live layout/HID of the previous keyboard.
+        self.selected_device = Some(device_idx);
         self.pending_device_connect = None;
         self.pending_layout_undo = false;
         self.pending_layer_write = None;
@@ -628,13 +657,21 @@ impl EntropyApp {
         let now = std::time::Instant::now();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.connect_state = ConnectState::Loading {
+            device: dev.clone(),
             rx,
             started_at: now,
             last_progress_at: now,
             cancel: cancel.clone(),
-            cancel_requested: false,
             reconnect,
         };
+
+        #[cfg(test)]
+        if let Some(requests) = &self.test_connect_requests {
+            requests
+                .send((dev, tx))
+                .expect("test connect worker receiver");
+            return;
+        }
 
         std::thread::spawn(move || {
             let progress = |message: &str| -> Result<(), String> {
@@ -1443,11 +1480,13 @@ impl EntropyApp {
             .enumerate()
             .filter_map(|(index, device)| identity.matches(device).then_some(index));
         let Some(device_idx) = matches.next() else {
+            self.selected_device = None;
             self.pending_device_connect = Some(identity);
             self.start_device_scan();
             return;
         };
         if matches.next().is_some() {
+            self.selected_device = None;
             self.connect_state = ConnectState::SelectingDevice;
             self.status_msg.clear();
             return;
@@ -1480,11 +1519,11 @@ mod tests {
         app.device_manager.replace_devices(vec![target]);
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         app.connect_state = ConnectState::Loading {
+            device: app.device_manager.devices()[0].clone(),
             rx: std::sync::mpsc::channel().1,
             started_at: std::time::Instant::now(),
             last_progress_at: std::time::Instant::now(),
             cancel: cancel.clone(),
-            cancel_requested: false,
             reconnect: None,
         };
 
