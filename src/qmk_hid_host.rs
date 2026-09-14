@@ -842,6 +842,7 @@ mod tests {
             serial_number: "test".to_owned(),
             bus_type: "Bluetooth".to_owned(),
             path: "test".to_owned(),
+            instance_token: String::new(),
             firmware: crate::firmware::FirmwareProtocol::Vial,
         };
         let host_data_hid = open_host_data_hid(&target, Some(&output)).unwrap();

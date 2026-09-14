@@ -1140,6 +1140,8 @@ pub(crate) enum ConnectState {
         rx: mpsc::Receiver<ConnectTaskMessage>,
         started_at: std::time::Instant,
         last_progress_at: std::time::Instant,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        cancel_requested: bool,
         reconnect: Option<BluetoothReconnectState>,
     },
 }
@@ -1147,7 +1149,12 @@ pub(crate) enum ConnectState {
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) enum DeviceScanState {
     Idle,
-    Scanning(mpsc::Receiver<Vec<Device>>),
+    Scanning {
+        rx: mpsc::Receiver<Result<Vec<Device>, String>>,
+        started_at: std::time::Instant,
+        generation: u64,
+        timeout_logged: bool,
+    },
 }
 
 pub(crate) fn toggle_handed_modifier(value: u16) -> Option<u16> {
@@ -4557,7 +4564,7 @@ pub struct EntropyApp {
     pub(super) settings_write_queue: SettingsWriteQueueState,
     pub(super) settings_write_generation: u64,
     pub(super) qmk_settings_write_queue: QmkSettingsWriteQueue,
-    pub(super) pending_device_connect: Option<usize>,
+    pub(super) pending_device_connect: Option<DeviceIdentity>,
     /// Built-in qmk-hid-host bridges for displays/presets that need host data
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) qmk_hid_hosts:

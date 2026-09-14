@@ -1,11 +1,20 @@
 use super::*;
 
+const DEVICE_SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
 fn should_wait_for_manual_device_selection(status_msg: &str) -> bool {
     status_msg.starts_with("Open failed:") || status_msg.starts_with("Connect timeout")
 }
 
 fn should_auto_connect_only_device(device_count: usize) -> bool {
     device_count == 1
+}
+
+fn usb_endpoint_was_reenumerated(previous: &Device, current: &Device) -> bool {
+    !previous.is_bluetooth_transport()
+        && !previous.instance_token.is_empty()
+        && !current.instance_token.is_empty()
+        && previous.instance_token != current.instance_token
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -52,29 +61,74 @@ impl EntropyApp {
         }
 
         let (tx, rx) = mpsc::channel();
-        self.device_scan_state = DeviceScanState::Scanning(rx);
+        self.device_scan_state = DeviceScanState::Scanning {
+            rx,
+            started_at: std::time::Instant::now(),
+            generation: self.connection_generation,
+            timeout_logged: false,
+        };
         std::thread::spawn(move || {
-            let _ = tx.send(DeviceManager::scan_devices());
+            let result = DeviceManager::scan_devices();
+            if let Ok(devices) = &result {
+                log::debug!(
+                    "HID scan completed with {} Vial endpoint(s): {}",
+                    devices.len(),
+                    devices
+                        .iter()
+                        .map(|device| format!(
+                            "{:04X}:{:04X}@{} [{}]",
+                            device.vendor_id, device.product_id, device.path, device.instance_token
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            let _ = tx.send(result);
         });
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn poll_device_scan(&mut self, ctx: &egui::Context) {
-        let devices = match &self.device_scan_state {
+        let completed = match &mut self.device_scan_state {
             DeviceScanState::Idle => return,
-            DeviceScanState::Scanning(rx) => match rx.try_recv() {
-                Ok(devices) => Some(devices),
+            DeviceScanState::Scanning {
+                rx,
+                started_at,
+                generation,
+                timeout_logged,
+            } => match rx.try_recv() {
+                Ok(result) => Some((*generation, result)),
                 Err(mpsc::TryRecvError::Empty) => {
+                    if started_at.elapsed() >= DEVICE_SCAN_TIMEOUT && !*timeout_logged {
+                        log::warn!(
+                            "HID device scan exceeded {:?}; keeping the single worker alive",
+                            DEVICE_SCAN_TIMEOUT
+                        );
+                        *timeout_logged = true;
+                    }
                     ctx.request_repaint_after(std::time::Duration::from_millis(25));
                     return;
                 }
-                Err(mpsc::TryRecvError::Disconnected) => Some(Vec::new()),
+                Err(mpsc::TryRecvError::Disconnected) => Some((
+                    *generation,
+                    Err("HID device scan worker stopped".to_owned()),
+                )),
             },
         };
 
         self.device_scan_state = DeviceScanState::Idle;
-        if let Some(devices) = devices {
-            self.apply_device_scan_result(devices);
+        if let Some((generation, result)) = completed {
+            if generation != self.connection_generation {
+                log::debug!(
+                    "Ignoring HID scan from connection generation {generation}; current generation is {}",
+                    self.connection_generation
+                );
+                return;
+            }
+            match result {
+                Ok(devices) => self.apply_device_scan_result(devices),
+                Err(error) => log::warn!("{error}; preserving the previous device list"),
+            }
         }
     }
 
@@ -104,10 +158,11 @@ impl EntropyApp {
             return;
         }
 
-        let previous_device_key = self
+        let previous_device = self
             .selected_device
             .and_then(|idx| self.device_manager.devices().get(idx))
-            .map(Device::display_name_cache_key);
+            .cloned();
+        let previous_device_key = previous_device.as_ref().map(Device::display_name_cache_key);
         let was_loading = matches!(self.connect_state, ConnectState::Loading { .. });
         let selecting_device = matches!(self.connect_state, ConnectState::SelectingDevice);
 
@@ -125,6 +180,17 @@ impl EntropyApp {
             if selecting_device {
                 self.selected_device = None;
                 self.qmk_hid_hosts.clear();
+                return;
+            }
+            if was_loading {
+                if let ConnectState::Loading { cancel, .. } = &self.connect_state {
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                // Do not leave the UI owned by a worker that is blocked on a
+                // disconnected HID handle. Dropping its receiver makes any late
+                // result inert; the next scan can immediately start a fresh owner.
+                self.selected_device = None;
+                self.clear_connected_keyboard_state("No device detected");
                 return;
             }
             if self.selected_device.is_some() || self.layout.is_some() || was_loading {
@@ -175,7 +241,13 @@ impl EntropyApp {
                 .position(|dev| dev.display_name_cache_key() == device_key)
             {
                 self.selected_device = Some(idx);
-                if self.layout.is_none() && !was_loading {
+                let endpoint_was_reenumerated = previous_device.as_ref().is_some_and(|previous| {
+                    usb_endpoint_was_reenumerated(previous, &self.device_manager.devices()[idx])
+                });
+                if endpoint_was_reenumerated {
+                    log::info!("USB HID endpoint was re-enumerated; reopening the device");
+                    self.start_connect(idx);
+                } else if self.layout.is_none() && !was_loading {
                     self.start_connect(idx);
                 } else {
                     self.sync_qmk_hid_host_bridges();
@@ -224,6 +296,110 @@ mod tests {
     }
 
     #[test]
+    fn reused_usb_path_with_a_new_instance_requires_reopen() {
+        let mut previous = Device {
+            name: "M4CR0Pad v3".to_owned(),
+            vendor_id: 0xE126,
+            product_id: 0x0042,
+            manufacturer: "Ergohaven".to_owned(),
+            serial_number: String::new(),
+            bus_type: "Usb".to_owned(),
+            path: "/dev/hidraw4".to_owned(),
+            instance_token: "1:100:60932".to_owned(),
+            firmware: FirmwareProtocol::Vial,
+        };
+        let mut current = previous.clone();
+        current.instance_token = "1:104:60932".to_owned();
+
+        assert!(usb_endpoint_was_reenumerated(&previous, &current));
+        previous.bus_type = "Bluetooth".to_owned();
+        current.bus_type = "Bluetooth".to_owned();
+        assert!(!usb_endpoint_was_reenumerated(&previous, &current));
+    }
+
+    #[test]
+    fn unplug_while_loading_releases_the_connect_owner_for_the_next_scan() {
+        let ctx = egui::Context::default();
+        let creation_context = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = EntropyApp::new(&creation_context);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let now = std::time::Instant::now();
+        app.connect_state = ConnectState::Loading {
+            rx: std::sync::mpsc::channel().1,
+            started_at: now,
+            last_progress_at: now,
+            cancel: cancel.clone(),
+            cancel_requested: false,
+            reconnect: None,
+        };
+
+        app.apply_device_scan_result(Vec::new());
+
+        assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(matches!(app.connect_state, ConnectState::Idle));
+        assert_eq!(app.status_msg, "No device detected");
+    }
+
+    #[test]
+    fn timed_out_scan_keeps_its_single_worker_and_receiver() {
+        let ctx = egui::Context::default();
+        let creation_context = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = EntropyApp::new(&creation_context);
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.device_scan_state = DeviceScanState::Scanning {
+            rx,
+            started_at: std::time::Instant::now() - DEVICE_SCAN_TIMEOUT,
+            generation: app.connection_generation,
+            timeout_logged: false,
+        };
+
+        app.poll_device_scan(&ctx);
+        app.start_device_scan();
+
+        assert!(matches!(
+            app.device_scan_state,
+            DeviceScanState::Scanning {
+                timeout_logged: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn stale_scan_generation_cannot_restore_an_old_usb_endpoint() {
+        let ctx = egui::Context::default();
+        let creation_context = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = EntropyApp::new(&creation_context);
+        app.device_manager.replace_devices(Vec::new());
+        let old_generation = app.connection_generation;
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(vec![Device {
+            name: "M4CR0Pad v3".to_owned(),
+            vendor_id: 0xE126,
+            product_id: 0x0042,
+            manufacturer: "Ergohaven".to_owned(),
+            serial_number: String::new(),
+            bus_type: "Usb".to_owned(),
+            path: "/dev/hidraw4".to_owned(),
+            instance_token: "sysfs:.0007".to_owned(),
+            firmware: FirmwareProtocol::Vial,
+        }]))
+        .unwrap();
+        app.device_scan_state = DeviceScanState::Scanning {
+            rx,
+            started_at: std::time::Instant::now(),
+            generation: old_generation,
+            timeout_logged: false,
+        };
+        app.connection_generation = app.connection_generation.wrapping_add(1);
+
+        app.poll_device_scan(&ctx);
+
+        assert!(app.device_manager.devices().is_empty());
+        assert!(matches!(app.device_scan_state, DeviceScanState::Idle));
+    }
+
+    #[test]
     fn explicit_device_selection_does_not_auto_connect_only_scan_result() {
         let ctx = egui::Context::default();
         let creation_context = eframe::CreationContext::_new_kittest(ctx);
@@ -236,6 +412,7 @@ mod tests {
             serial_number: "AA:BB:CC:DD:EE:FF".to_owned(),
             bus_type: "Bluetooth".to_owned(),
             path: "/dev/hidraw4".to_owned(),
+            instance_token: "/dev/hidraw4".to_owned(),
             firmware: FirmwareProtocol::Vial,
         };
         app.connect_state = ConnectState::SelectingDevice;
@@ -248,6 +425,47 @@ mod tests {
     }
 
     #[test]
+    fn unplugged_wired_keyboard_returns_to_the_device_menu_after_replug() {
+        let ctx = egui::Context::default();
+        let creation_context = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = EntropyApp::new(&creation_context);
+        // The device menu must update without opening a real HID handle.
+        app.connect_state = ConnectState::SelectingDevice;
+        let mut keyboard = Device {
+            name: "Wired Keyboard".to_owned(),
+            vendor_id: 0xE126,
+            product_id: 0x0042,
+            manufacturer: "Ergohaven".to_owned(),
+            serial_number: "replug-test".to_owned(),
+            bus_type: "Usb".to_owned(),
+            path: "/dev/hidraw4".to_owned(),
+            instance_token: "sysfs:.0007".to_owned(),
+            firmware: FirmwareProtocol::Vial,
+        };
+        app.apply_device_scan_result(vec![keyboard.clone()]);
+        app.apply_device_scan_result(Vec::new());
+        assert!(app.device_manager.devices().is_empty());
+        keyboard.instance_token = "sysfs:.0008".to_owned();
+        app.apply_device_scan_result(vec![keyboard.clone()]);
+        assert_eq!(app.device_manager.devices().len(), 1);
+        assert_eq!(app.device_manager.devices()[0].instance_token, keyboard.instance_token);
+        assert!(app.selected_device.is_none());
+
+        // Enumeration errors are not successful empty scans (unplugs).
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Err("temporary enumeration failure".to_owned())).unwrap();
+        app.device_scan_state = DeviceScanState::Scanning {
+            rx,
+            started_at: std::time::Instant::now(),
+            generation: app.connection_generation,
+            timeout_logged: false,
+        };
+        app.poll_device_scan(&ctx);
+        assert_eq!(app.device_manager.devices().len(), 1);
+        assert!(matches!(app.device_scan_state, DeviceScanState::Idle));
+    }
+
+    #[test]
     fn reconnect_selects_only_the_same_bluetooth_identity() {
         let mut expected = Device {
             name: "K:04".to_owned(),
@@ -257,6 +475,7 @@ mod tests {
             serial_number: "AA:BB:CC:DD:EE:FF".to_owned(),
             bus_type: "Bluetooth".to_owned(),
             path: "/dev/hidraw4".to_owned(),
+            instance_token: "/dev/hidraw4".to_owned(),
             firmware: FirmwareProtocol::Vial,
         };
         let identity = expected.stable_identity();
@@ -280,6 +499,7 @@ mod tests {
             serial_number: String::new(),
             bus_type: "Bluetooth".to_owned(),
             path: "/dev/hidraw4".to_owned(),
+            instance_token: "/dev/hidraw4".to_owned(),
             firmware: FirmwareProtocol::Vial,
         };
         let identity = expected.stable_identity();

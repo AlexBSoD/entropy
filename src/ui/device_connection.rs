@@ -396,6 +396,7 @@ mod tests {
             serial_number: "AA:BB:CC:DD:EE:FF".to_owned(),
             bus_type: "Bluetooth".to_owned(),
             path: path.to_owned(),
+            instance_token: path.to_owned(),
             firmware: FirmwareProtocol::Vial,
         }
     }

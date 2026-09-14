@@ -46,6 +46,11 @@ pub struct Device {
     pub bus_type: String,
     /// HID path used by Vial.
     pub path: String,
+    /// Identifies one concrete OS enumeration of this HID endpoint. On Linux
+    /// `/dev/hidrawN` can be reused after a quick unplug/replug, so the path
+    /// alone is not enough to decide that the existing open handle is alive.
+    #[serde(default)]
+    pub(crate) instance_token: String,
     pub firmware: FirmwareProtocol,
 }
 
@@ -102,6 +107,50 @@ impl Device {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn device_instance_token(path: &str) -> String {
+    use std::os::unix::fs::MetadataExt;
+
+    // The devtmpfs node can reuse both `/dev/hidrawN` and its device number
+    // after a quick replug. The sysfs HID instance path ends in a kernel
+    // enumeration id (for example `.0007`) and therefore changes for every
+    // concrete USB attachment.
+    let sysfs_device = std::path::Path::new(path).file_name().map(|name| {
+        std::path::Path::new("/sys/class/hidraw")
+            .join(name)
+            .join("device")
+    });
+    if let Some(sysfs_device) = sysfs_device {
+        if let Ok(canonical) = std::fs::canonicalize(&sysfs_device) {
+            if let Ok(metadata) = std::fs::metadata(&canonical) {
+                return format!(
+                    "sysfs:{}:{}:{}",
+                    canonical.display(),
+                    metadata.dev(),
+                    metadata.ino()
+                );
+            }
+            return format!("sysfs:{}", canonical.display());
+        }
+    }
+
+    std::fs::metadata(path)
+        .map(|metadata| {
+            format!(
+                "dev:{}:{}:{}",
+                metadata.dev(),
+                metadata.ino(),
+                metadata.rdev()
+            )
+        })
+        .unwrap_or_else(|_| path.to_owned())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn device_instance_token(path: &str) -> String {
+    path.to_owned()
+}
+
 fn normalized_device_identity(value: &str) -> String {
     value
         .chars()
@@ -133,51 +182,55 @@ impl DeviceManager {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn scan_devices() -> Vec<Device> {
+    pub fn scan_devices() -> Result<Vec<Device>, String> {
         let mut devices = Vec::new();
 
         #[cfg(target_os = "macos")]
         if crate::hid::macos_hid_scan_disabled_for_rosetta() {
-            return devices;
+            return Ok(devices);
         }
 
         #[cfg(target_os = "macos")]
         let _hid_lock = crate::hid::macos_hid_operation_lock();
-        if let Ok(api) = hidapi::HidApi::new() {
-            for info in api.device_list() {
-                // Filter: Vial usage page 0xFF60, usage 0x61
-                if info.usage_page() == 0xFF60 && info.usage() == 0x61 {
-                    devices.push(Device {
-                        name: info
-                            .product_string()
-                            .unwrap_or("Unknown Keyboard")
-                            .to_string(),
-                        vendor_id: info.vendor_id(),
-                        product_id: info.product_id(),
-                        manufacturer: info.manufacturer_string().unwrap_or("").to_string(),
-                        serial_number: info.serial_number().unwrap_or("").to_string(),
-                        bus_type: format!("{:?}", info.bus_type()),
-                        path: info.path().to_string_lossy().to_string(),
-                        firmware: FirmwareProtocol::Vial,
-                    });
-                }
+        let api = hidapi::HidApi::new().map_err(|error| format!("HID scan failed: {error}"))?;
+        for info in api.device_list() {
+            // Filter: Vial usage page 0xFF60, usage 0x61
+            if info.usage_page() == 0xFF60 && info.usage() == 0x61 {
+                let path = info.path().to_string_lossy().to_string();
+                devices.push(Device {
+                    name: info
+                        .product_string()
+                        .unwrap_or("Unknown Keyboard")
+                        .to_string(),
+                    vendor_id: info.vendor_id(),
+                    product_id: info.product_id(),
+                    manufacturer: info.manufacturer_string().unwrap_or("").to_string(),
+                    serial_number: info.serial_number().unwrap_or("").to_string(),
+                    bus_type: format!("{:?}", info.bus_type()),
+                    instance_token: device_instance_token(&path),
+                    path,
+                    firmware: FirmwareProtocol::Vial,
+                });
             }
         }
 
         #[cfg(target_os = "linux")]
         {
             deduplicate_kernel_bluetooth_devices(&mut devices);
-            let bluez_devices = crate::linux_ble::scan_devices();
+            let bluez_devices = crate::linux_ble::scan_devices_cached_nonblocking();
             merge_bluez_vial_devices(&mut devices, bluez_devices);
         }
 
-        devices
+        Ok(devices)
     }
 
     pub fn scan(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.devices = Self::scan_devices();
+            match Self::scan_devices() {
+                Ok(devices) => self.devices = devices,
+                Err(error) => log::warn!("{error}"),
+            }
         }
 
         log::info!("Found {} Vial device(s)", self.devices.len());
@@ -266,6 +319,7 @@ mod tests {
             serial_number: "serial".to_owned(),
             bus_type: bus_type.to_owned(),
             path: path.to_owned(),
+            instance_token: path.to_owned(),
             firmware: FirmwareProtocol::Vial,
         }
     }

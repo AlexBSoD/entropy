@@ -379,6 +379,8 @@ impl EntropyApp {
                 rx,
                 started_at,
                 last_progress_at,
+                cancel,
+                cancel_requested,
                 reconnect,
             } => match drain_connect_task_messages(rx) {
                 ConnectTaskChannelState::Progress(message) => {
@@ -408,11 +410,17 @@ impl EntropyApp {
                         let error = format!(
                             "Connect timeout — RMK/Vial device did not finish loading while: {stage}"
                         );
-                        log::warn!("Connect timeout while waiting for stage: {stage}");
-                        ConnectPollEvent::Failed {
-                            error,
-                            reconnect: reconnect.clone(),
+                        if !*cancel_requested {
+                            log::warn!(
+                                "Connect timeout while waiting for stage: {stage}; cancelling worker"
+                            );
+                            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                            *cancel_requested = true;
+                            self.status_msg = error;
                         }
+                        #[cfg(not(target_os = "windows"))]
+                        ctx.request_repaint_after(CONNECT_POLL_INTERVAL);
+                        return;
                     } else {
                         #[cfg(not(target_os = "windows"))]
                         ctx.request_repaint_after(CONNECT_POLL_INTERVAL);
@@ -437,6 +445,18 @@ impl EntropyApp {
             ConnectPollEvent::Done { result, reconnect } => (result, reconnect),
             ConnectPollEvent::Failed { error, reconnect } => (Err(error), reconnect),
         };
+
+        if matches!(&result, Err(error) if error == "Connect cancelled") {
+            if let Some(reconnect) = reconnect {
+                self.schedule_bluetooth_reconnect_retry(reconnect, "connect cancelled");
+            } else if self.pending_device_connect.is_some() {
+                self.resume_pending_device_connect();
+            } else {
+                self.selected_device = None;
+                self.start_device_scan();
+            }
+            return;
+        }
 
         match result {
             Ok(mut r) => {
@@ -708,6 +728,13 @@ impl EntropyApp {
                 if crate::hid::is_disconnect_error_message(&e)
                     && self.begin_bluetooth_reconnect(e.clone())
                 {
+                    return;
+                }
+
+                if crate::hid::is_disconnect_error_message(&e) {
+                    self.selected_device = None;
+                    self.clear_connected_keyboard_state(e);
+                    self.start_device_scan();
                     return;
                 }
 

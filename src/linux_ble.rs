@@ -8,7 +8,7 @@ use crate::hid::hid_protocol::{
 use anyhow::{bail, Context, Result};
 use futures_lite::{future, StreamExt};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use zbus::blocking::connection::Builder as ConnectionBuilder;
@@ -538,6 +538,7 @@ fn devices_from_objects(connection: &Connection, objects: &ManagedObjects) -> Ve
             serial_number: summary.address.clone(),
             bus_type: "Bluetooth".to_owned(),
             path: format!("{BLUEZ_GATT_PREFIX}{}", endpoints.service),
+            instance_token: endpoints.service.clone(),
             firmware: FirmwareProtocol::Vial,
         })
     })
@@ -573,6 +574,35 @@ pub(crate) fn scan_devices() -> Vec<Device> {
             Vec::new()
         }
     }
+}
+
+/// Return the last completed BlueZ scan and refresh it on a dedicated worker.
+/// USB discovery must never wait for a stalled D-Bus call.
+pub(crate) fn scan_devices_cached_nonblocking() -> Vec<Device> {
+    static SCAN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+    static SCAN_CACHE: OnceLock<Mutex<Vec<Device>>> = OnceLock::new();
+
+    let cache = SCAN_CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let cached = cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+
+    if SCAN_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
+    {
+        std::thread::spawn(|| {
+            let devices = scan_devices();
+            *SCAN_CACHE
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = devices;
+            SCAN_IN_FLIGHT.store(false, Ordering::Release);
+        });
+    }
+
+    cached
 }
 
 fn service_device_path(objects: &ManagedObjects, service: &str) -> Option<String> {
