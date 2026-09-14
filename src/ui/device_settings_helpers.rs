@@ -1,5 +1,10 @@
 use super::*;
 
+#[cfg(not(target_arch = "wasm32"))]
+fn qmk_bridge_device_still_connected(devices: &[Device], path: &str) -> bool {
+    devices.iter().any(|device| device.path == path)
+}
+
 impl EntropyApp {
     pub(super) fn is_encoder_layout_option(option: &LayoutOption) -> bool {
         if !option.choices.is_empty() {
@@ -1875,6 +1880,7 @@ impl EntropyApp {
                 crate::device::Device,
                 crate::qmk_hid_host::HostDataMode,
                 Option<crate::hid::SharedHidOutput>,
+                crate::qmk_hid_host::HostProtocol,
             ),
         >::new();
 
@@ -1903,21 +1909,47 @@ impl EntropyApp {
                 let shared_output = (Some(device.path.as_str()) == selected_path)
                     .then(|| self.shared_hid_output.clone())
                     .flatten();
-                desired.insert(device.path.clone(), (device.clone(), mode, shared_output));
+                let protocol = if Some(device.path.as_str()) == selected_path {
+                    crate::qmk_hid_host::HostProtocol::Selected(
+                        self.layout
+                            .as_ref()
+                            .is_some_and(|layout| layout.live_features.extended_host_protocol),
+                    )
+                } else {
+                    crate::qmk_hid_host::HostProtocol::Discover
+                };
+                desired.insert(
+                    device.path.clone(),
+                    (device.clone(), mode, shared_output, protocol),
+                );
             }
         }
 
         self.qmk_hid_hosts.retain(|path, bridge| {
-            desired.get(path).is_some_and(|(_, mode, shared_output)| {
-                *mode == bridge.mode() && shared_output.is_some() == bridge.uses_shared_output()
-            })
+            desired
+                .get(path)
+                .is_some_and(|(_, mode, shared_output, protocol)| {
+                    *mode == bridge.mode()
+                        && shared_output.is_some() == bridge.uses_shared_output()
+                        && *protocol == bridge.protocol()
+                })
         });
 
-        for (path, (device, mode, shared_output)) in desired {
+        for (path, (device, mode, shared_output, protocol)) in desired {
             self.qmk_hid_hosts.entry(path).or_insert_with(|| {
-                crate::qmk_hid_host::QmkHidHostBridge::start(device, mode, shared_output)
+                crate::qmk_hid_host::QmkHidHostBridge::start(device, mode, shared_output, protocol)
             });
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn clear_qmk_hid_host_bridges_for_reconnect(&mut self) {
+        for (path, bridge) in &mut self.qmk_hid_hosts {
+            if qmk_bridge_device_still_connected(self.device_manager.devices(), path) {
+                bridge.suppress_shutdown();
+            }
+        }
+        self.qmk_hid_hosts.clear();
     }
 
     pub(super) fn open_layout_options_settings_page(&mut self) {
@@ -1988,6 +2020,30 @@ impl EntropyApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_preserves_only_the_bridge_for_the_remaining_macropad() {
+        let remaining = Device {
+            name: "M4CR0Pad v3".to_owned(),
+            vendor_id: 0xE126,
+            product_id: 0x0066,
+            manufacturer: "Ergohaven".to_owned(),
+            serial_number: "second".to_owned(),
+            bus_type: "USB".to_owned(),
+            path: "second-path".to_owned(),
+            instance_token: "second-instance".to_owned(),
+            firmware: FirmwareProtocol::Vial,
+        };
+
+        assert!(qmk_bridge_device_still_connected(
+            std::slice::from_ref(&remaining),
+            "second-path"
+        ));
+        assert!(!qmk_bridge_device_still_connected(
+            std::slice::from_ref(&remaining),
+            "disconnected-first-path"
+        ));
+    }
 
     fn test_app() -> EntropyApp {
         let ctx = egui::Context::default();
@@ -2774,6 +2830,7 @@ mod tests {
             serial_number: "test".to_owned(),
             bus_type: "Bluetooth".to_owned(),
             path: "test-shared-live-features".to_owned(),
+            instance_token: String::new(),
             firmware: FirmwareProtocol::Vial,
         };
         let mut layout = test_layout_with_encoders(&[]);
@@ -2786,6 +2843,7 @@ mod tests {
 
         app.device_manager.replace_devices(vec![device.clone()]);
         app.selected_device = Some(0);
+        layout.live_features.extended_host_protocol = true;
         app.layout = Some(layout);
         app.app_settings.layout_sync_enabled = true;
         app.shared_hid_output = hid.shared_output();
@@ -2795,6 +2853,10 @@ mod tests {
 
         let bridge = app.qmk_hid_hosts.get(&device.path).unwrap();
         assert!(bridge.uses_shared_output());
+        assert_eq!(
+            bridge.protocol(),
+            crate::qmk_hid_host::HostProtocol::Selected(true)
+        );
         app.qmk_hid_hosts.clear();
     }
 

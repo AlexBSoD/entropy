@@ -163,6 +163,7 @@ impl EntropyApp {
             alt_repeat_pick_target: None,
             last_single_instance_signal: read_single_instance_signal(),
             rgb_settings: RgbSettingsState::default(),
+            display_settings: DisplaySettingsState::default(),
             layout_options_value: None,
             encoder_visibility: vec![],
             combo_term_dirty: false,
@@ -227,6 +228,10 @@ impl EntropyApp {
             vial_unlock_animation_nonce: 0,
             #[cfg(not(target_arch = "wasm32"))]
             connect_state: ConnectState::Idle,
+            #[cfg(not(target_arch = "wasm32"))]
+            retiring_connects: Vec::new(),
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            test_connect_requests: None,
             #[cfg(not(target_arch = "wasm32"))]
             device_scan_state: DeviceScanState::Idle,
         }
