@@ -2031,6 +2031,7 @@ mod tests {
             serial_number: "second".to_owned(),
             bus_type: "USB".to_owned(),
             path: "second-path".to_owned(),
+            instance_token: "second-instance".to_owned(),
             firmware: FirmwareProtocol::Vial,
         };
 
@@ -2829,6 +2830,7 @@ mod tests {
             serial_number: "test".to_owned(),
             bus_type: "Bluetooth".to_owned(),
             path: "test-shared-live-features".to_owned(),
+            instance_token: String::new(),
             firmware: FirmwareProtocol::Vial,
         };
         let mut layout = test_layout_with_encoders(&[]);

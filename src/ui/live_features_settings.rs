@@ -323,6 +323,7 @@ mod tests {
                 serial_number: "test".to_owned(),
                 bus_type: "Usb".to_owned(),
                 path: "test-live-features".to_owned(),
+                instance_token: String::new(),
                 firmware: FirmwareProtocol::Vial,
             }]);
         app.selected_device = Some(0);

@@ -1176,17 +1176,36 @@ pub(crate) enum ConnectState {
     SelectingDevice,
     Reconnecting(BluetoothReconnectState),
     Loading {
+        /// Physical endpoint snapshot, independent of the mutable selected index.
+        device: Device,
         rx: mpsc::Receiver<ConnectTaskMessage>,
         started_at: std::time::Instant,
         last_progress_at: std::time::Instant,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
         reconnect: Option<BluetoothReconnectState>,
     },
+}
+
+/// Bound connection-thread accumulation even if a cancelled task never returns.
+/// Transport helpers have their own global resource/reservation bound.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) const MAX_CONNECT_WORKERS: usize = 2;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct RetiringConnect {
+    pub(crate) device: Device,
+    pub(crate) rx: mpsc::Receiver<ConnectTaskMessage>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) enum DeviceScanState {
     Idle,
-    Scanning(mpsc::Receiver<Vec<Device>>),
+    Scanning {
+        rx: mpsc::Receiver<Result<Vec<Device>, String>>,
+        started_at: std::time::Instant,
+        generation: u64,
+        timeout_logged: bool,
+    },
 }
 
 pub(crate) fn toggle_handed_modifier(value: u16) -> Option<u16> {
@@ -5110,6 +5129,14 @@ pub struct EntropyApp {
     pub(super) linux_setup_task: Option<LinuxSetupTask>,
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) connect_state: ConnectState,
+    /// Cancelled workers no longer owning the UI. Keep their endpoint reservations
+    /// until completion; at most MAX_CONNECT_WORKERS including Loading may exist.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) retiring_connects: Vec<RetiringConnect>,
+    /// Deterministic worker-launch seam: tests supply completions without HID I/O.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) test_connect_requests:
+        Option<mpsc::Sender<(Device, mpsc::Sender<ConnectTaskMessage>)>>,
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) device_scan_state: DeviceScanState,
     /// Persistent open HID device for real-time writes (Vial)
@@ -5148,7 +5175,7 @@ pub struct EntropyApp {
     pub(super) settings_write_queue: SettingsWriteQueueState,
     pub(super) settings_write_generation: u64,
     pub(super) qmk_settings_write_queue: QmkSettingsWriteQueue,
-    pub(super) pending_device_connect: Option<usize>,
+    pub(super) pending_device_connect: Option<DeviceIdentity>,
     /// Built-in qmk-hid-host bridges for displays/presets that need host data
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) qmk_hid_hosts:
