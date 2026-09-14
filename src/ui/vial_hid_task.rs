@@ -737,6 +737,7 @@ impl EntropyApp {
                 self.display_settings.pictograms.loaded = true;
                 self.display_settings.pictograms.loading = false;
                 self.display_settings.pictograms.library = library;
+                self.display_settings.pictograms.preserve_editor_on_load = false;
                 if !matches!(
                     result.operation,
                     VialHidOperation::PictogramLoad {
@@ -752,6 +753,7 @@ impl EntropyApp {
                 .into();
             }
             Ok(VialHidOutcome::PictogramsUploaded(library)) => {
+                self.display_settings.pictograms.preserve_editor_on_load = false;
                 self.display_settings.pictograms.supported = Some(true);
                 self.display_settings.pictograms.loaded = true;
                 self.display_settings.pictograms.loading = false;
@@ -927,6 +929,7 @@ impl EntropyApp {
                 // storage read preserves that editor and confirms the actual bytes.
                 pictograms.loaded = false;
                 pictograms.loading = false;
+                pictograms.preserve_editor_on_load = true;
                 pictograms.library = PictogramLibrary::default();
                 pictograms.upload_due = None;
             }

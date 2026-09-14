@@ -337,6 +337,108 @@ impl HostProtocol {
     }
 }
 
+// One ordering domain per physical HID owner, shared by every output clone.
+// Claiming a generation is lock-free: only workers serialize actual HID writes.
+#[derive(Default)]
+pub(crate) struct HostOutputOwner {
+    generation: std::sync::atomic::AtomicU64,
+    active: Mutex<Option<HostOutputFootprint>>,
+}
+
+#[derive(Clone, Copy)]
+struct HostOutputFootprint {
+    generation: u64,
+    mode: HostDataMode,
+    extended: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct HostOutputLease {
+    owner: Arc<HostOutputOwner>,
+    footprint: HostOutputFootprint,
+}
+
+impl HostOutputOwner {
+    pub(crate) fn claim(self: &Arc<Self>, mode: HostDataMode, extended: bool) -> HostOutputLease {
+        let generation = self
+            .generation
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
+        HostOutputLease {
+            owner: self.clone(),
+            footprint: HostOutputFootprint {
+                generation,
+                mode,
+                extended,
+            },
+        }
+    }
+}
+
+impl HostOutputLease {
+    pub(crate) fn is_current(&self) -> bool {
+        self.owner.generation.load(Ordering::SeqCst) == self.footprint.generation
+    }
+
+    pub(crate) fn write(
+        &self,
+        payload: &[u8],
+        mut send: impl FnMut(&[u8]) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let mut active = self
+            .owner
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // Check inside the output ordering lock, not before waiting for I/O.
+        anyhow::ensure!(self.is_current(), "Host bridge output session superseded");
+        if active.as_ref().map(|old| old.generation) != Some(self.footprint.generation) {
+            if let Some(old) = *active {
+                let removed = HostDataMode {
+                    time: old.mode.time && !self.footprint.mode.time,
+                    media: old.mode.media && !self.footprint.mode.media,
+                    ..Default::default()
+                };
+                for clear in shutdown_payloads(removed, old.extended) {
+                    send(&clear)?;
+                }
+            }
+            // Retain the last initialized footprint across stop/re-enable and
+            // skipped generations, so dropped modes are cleared by the successor.
+            *active = Some(self.footprint);
+        }
+        send(payload)
+    }
+
+    pub(crate) fn shutdown(
+        &self,
+        mut send: impl FnMut(&[u8]) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let mut active = self
+            .owner
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !self.is_current() {
+            return Ok(());
+        }
+        let mut mode = self.footprint.mode;
+        let mut extended = self.footprint.extended;
+        if let Some(old) = *active {
+            mode.time |= old.mode.time;
+            mode.media |= old.mode.media;
+            extended |= old.extended;
+        }
+        // A final shutdown is a single ordered batch. A concurrent new claim
+        // never blocks the UI and its worker writes only after this batch ends.
+        for clear in shutdown_payloads(mode, extended) {
+            send(&clear)?;
+        }
+        *active = None;
+        Ok(())
+    }
+}
+
 pub struct QmkHidHostBridge {
     mode: HostDataMode,
     protocol: HostProtocol,
@@ -355,6 +457,19 @@ impl QmkHidHostBridge {
         shared_output: Option<crate::hid::SharedHidOutput>,
         protocol: HostProtocol,
     ) -> Self {
+        Self::start_with_media_source(device, mode, shared_output, protocol, current_media_info)
+    }
+
+    fn start_with_media_source(
+        device: crate::device::Device,
+        mode: HostDataMode,
+        shared_output: Option<crate::hid::SharedHidOutput>,
+        protocol: HostProtocol,
+        media_source: impl FnMut() -> Option<(String, String)> + Send + 'static,
+    ) -> Self {
+        let shared_output = shared_output.map(|output| {
+            output.for_host_bridge(mode, matches!(protocol, HostProtocol::Selected(true)))
+        });
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
         let query_gate = Arc::new(Mutex::new(()));
@@ -375,6 +490,7 @@ impl QmkHidHostBridge {
                 protocol,
                 worker_shutdown,
                 worker_query_gate,
+                media_source,
             )
         });
         Self {
@@ -416,11 +532,15 @@ impl QmkHidHostBridge {
         self.layout_snapshot.store(u8::MAX, Ordering::Relaxed);
         // Drain any in-flight capability query before selection opens another
         // HID reader. Do not wait here for unrelated desktop/media queries.
-        drop(
-            self.query_gate
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()),
-        );
+        if self.shared_output.is_none() {
+            // Standalone dedicated discovery still owns its reader. PR165 owns
+            // replacing this existing drain with bounded transport retirement.
+            drop(
+                self.query_gate
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()),
+            );
+        }
         if let Some(thread) = self.thread.take() {
             let _ = thread::Builder::new()
                 .name("qmk-hid-host-join".to_owned())
@@ -446,6 +566,7 @@ fn run_bridge(
     mut protocol: HostProtocol,
     send_shutdown: Arc<AtomicBool>,
     query_gate: Arc<Mutex<()>>,
+    mut media_source: impl FnMut() -> Option<(String, String)>,
 ) {
     let mut extended_protocol = false;
     let mut device: Option<HostDataHid> = None;
@@ -578,7 +699,10 @@ fn run_bridge(
 
         if mode.media && last_media_poll.elapsed() >= Duration::from_secs(3) {
             last_media_poll = Instant::now();
-            let (artist, title) = current_media_info().unwrap_or_default();
+            let (artist, title) = media_source().unwrap_or_default();
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
             set_media_snapshot(
                 (!artist.is_empty() || !title.is_empty()).then(|| (artist.clone(), title.clone())),
             );
@@ -621,10 +745,21 @@ fn run_bridge(
     if send_shutdown.load(Ordering::Relaxed) {
         if let Some(device) = device.as_ref() {
             send_shutdown_payloads(device, mode, extended_protocol);
+        } else if let Some(output) = shared_output.as_ref() {
+            // A successor stopped before opening must also finish any retained
+            // mode footprint; this uses the existing owner, never a reopened path.
+            if let Err(error) = output.write_host_shutdown(&[]) {
+                log::warn!("qmk-hid-host shutdown write failed: {error}");
+            }
         }
     }
     layout_snapshot.store(u8::MAX, Ordering::Relaxed);
-    set_media_snapshot(None);
+    if shared_output
+        .as_ref()
+        .is_none_or(|output| output.host_session_is_current())
+    {
+        set_media_snapshot(None);
+    }
     log::info!("qmk-hid-host bridge stopped");
 }
 
@@ -662,6 +797,12 @@ fn layout_needs_send(
 
 fn send_shutdown_payloads(device: &HostDataHid, mode: HostDataMode, extended_protocol: bool) {
     let payloads = shutdown_payloads(mode, extended_protocol);
+    if let HostDataHid::Shared(output) = device {
+        if let Err(error) = output.write_host_shutdown(&payloads) {
+            log::warn!("qmk-hid-host shutdown write failed: {error}");
+        }
+        return;
+    }
     for payload in payloads {
         if let Err(e) = write_payload(device, &payload) {
             log::warn!("qmk-hid-host shutdown write failed: {e}");
@@ -1895,7 +2036,15 @@ mod host_protocol_tests {
                 firmware: crate::firmware::FirmwareProtocol::Vial,
             };
             let (hid, recorder) = crate::hid::HidDevice::test_device();
-            let output = hid.shared_output();
+            let output = hid.shared_output().map(|output| {
+                output.for_host_bridge(
+                    HostDataMode {
+                        time: true,
+                        ..Default::default()
+                    },
+                    extended,
+                )
+            });
             let stop = Arc::new(AtomicBool::new(false));
             let worker_stop = stop.clone();
             let worker = thread::spawn(move || {
@@ -1911,6 +2060,7 @@ mod host_protocol_tests {
                     HostProtocol::Selected(extended),
                     Arc::new(AtomicBool::new(true)),
                     Arc::new(Mutex::new(())),
+                    current_media_info,
                 )
             });
             let deadline = Instant::now() + Duration::from_secs(3);
@@ -1943,5 +2093,323 @@ mod host_protocol_tests {
                 assert_eq!(commands, vec![DATA_TIME]);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod qa_followup_shared_output {
+    use super::*;
+    use std::sync::mpsc;
+
+    struct Finished(mpsc::Sender<()>);
+    impl Drop for Finished {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    fn target() -> crate::device::Device {
+        // Existing source path satisfies the Linux presence check. All output
+        // uses the scripted owner; no file, real HID or desktop process is opened.
+        crate::device::Device {
+            name: "host ordering fixture".into(),
+            vendor_id: 0,
+            product_id: 0,
+            manufacturer: String::new(),
+            serial_number: String::new(),
+            bus_type: "USB".into(),
+            path: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/qmk_hid_host.rs")
+                .to_string_lossy()
+                .into_owned(),
+            firmware: crate::firmware::FirmwareProtocol::Vial,
+        }
+    }
+
+    fn wait_for(recorder: &crate::hid::TestHidRecorder, from: usize, command: u8) -> Vec<[u8; 32]> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let reports = recorder.requests();
+            if reports[from..].iter().any(|r| r[0] == command) {
+                return reports;
+            }
+            assert!(Instant::now() < deadline, "missing report {command:02X}");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn blocked_media_bridge(
+        output: crate::hid::SharedHidOutput,
+    ) -> (
+        QmkHidHostBridge,
+        mpsc::Receiver<()>,
+        mpsc::Sender<()>,
+        mpsc::Receiver<()>,
+    ) {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let finished = Finished(finished_tx);
+        let bridge = QmkHidHostBridge::start_with_media_source(
+            target(),
+            HostDataMode {
+                time: true,
+                media: true,
+                ..Default::default()
+            },
+            Some(output),
+            HostProtocol::Selected(true),
+            move || {
+                let _keep_until_worker_exit = &finished;
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Some(("retired artist".into(), "retired title".into()))
+            },
+        );
+        (bridge, entered_rx, release_tx, finished_rx)
+    }
+
+    #[test]
+    fn retiring_shared_bridge_cannot_shutdown_after_replacement_date() {
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        let output = hid.shared_output().unwrap();
+        let (mut old, entered, release, finished) = blocked_media_bridge(output.clone());
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let before = recorder.requests().len();
+        let stopped = Instant::now();
+        old.stop();
+        assert!(
+            stopped.elapsed() < Duration::from_secs(1),
+            "shared stop waited for desktop I/O"
+        );
+        let mut replacement = QmkHidHostBridge::start_with_media_source(
+            target(),
+            HostDataMode {
+                time: true,
+                ..Default::default()
+            },
+            Some(output),
+            HostProtocol::Selected(true),
+            || panic!("time-only bridge must not poll media"),
+        );
+        let reports = wait_for(&recorder, before, DATA_DATE);
+        assert_eq!(
+            reports[before..].iter().map(|r| r[0]).collect::<Vec<_>>(),
+            vec![
+                DATA_MEDIA_ARTIST,
+                DATA_MEDIA_TITLE,
+                DATA_HOST_STATUS,
+                DATA_TIME,
+                DATA_DATE
+            ]
+        );
+        assert_eq!(&reports[before][..2], &[DATA_MEDIA_ARTIST, 0]);
+        assert_eq!(&reports[before + 1][..2], &[DATA_MEDIA_TITLE, 0]);
+        let after_date = reports.len();
+        release.send(()).unwrap();
+        finished.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            recorder.requests().len(),
+            after_date,
+            "retiring worker wrote after replacement AF"
+        );
+        replacement.suppress_shutdown();
+        replacement.stop();
+    }
+
+    #[test]
+    fn stop_then_later_reenable_and_skipped_generation_keep_ordering() {
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        let output = hid.shared_output().unwrap();
+        let (mut old, entered, release, finished) = blocked_media_bridge(output.clone());
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        old.stop();
+        // No replacement was available to old.stop(). An intermediate claim is
+        // never initialized; the next generation must still clear the old modes.
+        let unused = output.for_host_bridge(HostDataMode::default(), false);
+        drop(unused);
+        let before = recorder.requests().len();
+        let mut next = QmkHidHostBridge::start_with_media_source(
+            target(),
+            HostDataMode {
+                time: true,
+                ..Default::default()
+            },
+            Some(output),
+            HostProtocol::Selected(true),
+            || None,
+        );
+        let reports = wait_for(&recorder, before, DATA_DATE);
+        assert_eq!(&reports[before][..2], &[DATA_MEDIA_ARTIST, 0]);
+        assert_eq!(&reports[before + 1][..2], &[DATA_MEDIA_TITLE, 0]);
+        let after_date = reports.len();
+        release.send(()).unwrap();
+        finished.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(recorder.requests().len(), after_date);
+        next.suppress_shutdown();
+        next.stop();
+    }
+
+    #[test]
+    fn final_shared_bridge_shutdown_clears_clock_and_media_once() {
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        let mut bridge = QmkHidHostBridge::start_with_media_source(
+            target(),
+            HostDataMode {
+                time: true,
+                media: true,
+                ..Default::default()
+            },
+            hid.shared_output(),
+            HostProtocol::Selected(true),
+            || Some(("artist".into(), "title".into())),
+        );
+        wait_for(&recorder, 0, DATA_MEDIA_TITLE);
+        let before = recorder.requests().len();
+        bridge.stop();
+        let reports = wait_for(&recorder, before, DATA_MEDIA_TITLE);
+        assert_eq!(
+            reports[before..]
+                .iter()
+                .map(|r| [r[0], r[1]])
+                .collect::<Vec<_>>(),
+            vec![
+                [DATA_HOST_STATUS, 0],
+                [DATA_MEDIA_ARTIST, 0],
+                [DATA_MEDIA_TITLE, 0]
+            ]
+        );
+        bridge.stop();
+        assert_eq!(recorder.requests().len(), reports.len());
+    }
+
+    #[test]
+    fn blocked_final_bridge_still_shuts_down_when_no_successor_claims_the_owner() {
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        let (mut old, entered, release, finished) =
+            blocked_media_bridge(hid.shared_output().unwrap());
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let before = recorder.requests().len();
+        old.stop();
+        release.send(()).unwrap();
+        finished.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            recorder.requests()[before..]
+                .iter()
+                .map(|r| [r[0], r[1]])
+                .collect::<Vec<_>>(),
+            vec![
+                [DATA_HOST_STATUS, 0],
+                [DATA_MEDIA_ARTIST, 0],
+                [DATA_MEDIA_TITLE, 0]
+            ]
+        );
+    }
+
+    #[test]
+    fn removing_clock_clears_it_before_new_media_and_does_not_revoke_keyboard_owner() {
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        let output = hid.shared_output().unwrap();
+        let old = output.for_host_bridge(
+            HostDataMode {
+                time: true,
+                media: true,
+                ..Default::default()
+            },
+            true,
+        );
+        old.write_output_report(&[DATA_HOST_STATUS, 1]).unwrap();
+        let next = hid.shared_output().unwrap().for_host_bridge(
+            HostDataMode {
+                media: true,
+                ..Default::default()
+            },
+            false,
+        );
+        next.write_output_report(&[DATA_MEDIA_ARTIST, 1, b'N'])
+            .unwrap();
+        assert_eq!(&recorder.requests()[1][..2], &[DATA_HOST_STATUS, 0]);
+        assert_eq!(&recorder.requests()[2][..3], &[DATA_MEDIA_ARTIST, 1, b'N']);
+        old.write_host_shutdown(&[]).unwrap();
+        assert!(old.write_output_report(&[DATA_MEDIA_ARTIST, 0]).is_err());
+        // Only the stale host consumer loses permission, never the selected HID owner.
+        hid.write_output_report(&[0xC6, 0, 0]).unwrap();
+        output.write_output_report(&[DATA_VOLUME, 42]).unwrap();
+        let before = recorder.requests().len();
+        next.write_host_shutdown(&[]).unwrap();
+        assert_eq!(
+            recorder.requests()[before..]
+                .iter()
+                .map(|r| [r[0], r[1]])
+                .collect::<Vec<_>>(),
+            vec![[DATA_MEDIA_ARTIST, 0], [DATA_MEDIA_TITLE, 0]]
+        );
+    }
+
+    #[test]
+    fn host_output_generations_are_per_physical_owner() {
+        let (a, ar) = crate::hid::HidDevice::test_device();
+        let (b, br) = crate::hid::HidDevice::test_device();
+        let mode = HostDataMode {
+            time: true,
+            ..Default::default()
+        };
+        let aw = a.shared_output().unwrap().for_host_bridge(mode, true);
+        aw.write_output_report(&[DATA_HOST_STATUS, 1]).unwrap();
+        let bw = b.shared_output().unwrap().for_host_bridge(mode, true);
+        bw.write_output_report(&[DATA_HOST_STATUS, 1]).unwrap();
+        aw.write_host_shutdown(&[]).unwrap();
+        assert_eq!(&ar.requests().last().unwrap()[..2], &[DATA_HOST_STATUS, 0]);
+        assert_eq!(br.requests().len(), 1);
+        assert!(bw.host_session_is_current());
+    }
+
+    #[test]
+    fn new_claim_never_waits_for_old_io_and_new_updates_follow_its_atomic_shutdown_batch() {
+        let owner = Arc::new(HostOutputOwner::default());
+        let mode = HostDataMode {
+            time: true,
+            media: true,
+            ..Default::default()
+        };
+        let old = owner.claim(mode, true);
+        old.write(&[DATA_HOST_STATUS, 1], |_| Ok(())).unwrap();
+        let reports = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let old_reports = reports.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let old_worker = thread::spawn(move || {
+            old.shutdown(|payload| {
+                if payload[0] == DATA_HOST_STATUS {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }
+                old_reports.lock().unwrap().push(payload.to_vec());
+                Ok(())
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let start = Instant::now();
+        let next = owner.claim(mode, true);
+        assert!(start.elapsed() < Duration::from_secs(1));
+        let next_reports = reports.clone();
+        let next_worker = thread::spawn(move || {
+            next.write(&[DATA_HOST_STATUS, 1], |payload| {
+                next_reports.lock().unwrap().push(payload.to_vec());
+                Ok(())
+            })
+        });
+        release_tx.send(()).unwrap();
+        old_worker.join().unwrap().unwrap();
+        next_worker.join().unwrap().unwrap();
+        assert_eq!(
+            *reports.lock().unwrap(),
+            vec![
+                vec![DATA_HOST_STATUS, 0],
+                vec![DATA_MEDIA_ARTIST, 0],
+                vec![DATA_MEDIA_TITLE, 0],
+                vec![DATA_HOST_STATUS, 1]
+            ]
+        );
     }
 }

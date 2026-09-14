@@ -192,17 +192,24 @@ mod hid_vial;
 #[cfg(not(target_arch = "wasm32"))]
 pub struct HidDevice {
     backend: HidBackend,
+    host_output: std::sync::Arc<crate::qmk_hid_host::HostOutputOwner>,
 }
 
 #[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct TestHidRecorder {
+    pictogram_backup_directory: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
     requests: std::sync::Arc<std::sync::Mutex<Vec<[u8; MSG_LEN]>>>,
     responses: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<[u8; MSG_LEN]>>>,
 }
 
 #[cfg(test)]
 impl TestHidRecorder {
+    // Per scripted physical owner; survives moving the HID device into its worker.
+    pub(crate) fn set_pictogram_backup_directory(&self, directory: PathBuf) {
+        *self.pictogram_backup_directory.lock().unwrap() = Some(directory);
+    }
+
     pub(crate) fn respond_with(&self, responses: impl IntoIterator<Item = [u8; MSG_LEN]>) {
         self.responses.lock().unwrap().extend(responses);
     }
@@ -361,6 +368,8 @@ struct HidProxy {
 #[derive(Clone)]
 pub(crate) struct SharedHidOutput {
     backend: SharedHidOutputBackend,
+    host_output: std::sync::Arc<crate::qmk_hid_host::HostOutputOwner>,
+    host_lease: Option<crate::qmk_hid_host::HostOutputLease>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -385,6 +394,8 @@ impl SharedHidOutput {
     #[cfg(test)]
     pub(crate) fn test_expired_local_owner() -> Self {
         Self {
+            host_output: Default::default(),
+            host_lease: None,
             backend: SharedHidOutputBackend::Local {
                 device: std::sync::Weak::new(),
                 write_framing: HidWriteFraming::ReportIdPrefixed(0),
@@ -405,7 +416,40 @@ impl SharedHidOutput {
         }
     }
 
+    pub(crate) fn for_host_bridge(
+        &self,
+        mode: crate::qmk_hid_host::HostDataMode,
+        extended: bool,
+    ) -> Self {
+        let mut output = self.clone();
+        output.host_lease = Some(self.host_output.claim(mode, extended));
+        output
+    }
+
+    pub(crate) fn host_session_is_current(&self) -> bool {
+        self.host_lease
+            .as_ref()
+            .is_none_or(|lease| lease.is_current())
+    }
+
+    pub(crate) fn write_host_shutdown(&self, payloads: &[Vec<u8>]) -> Result<()> {
+        if let Some(lease) = self.host_lease.as_ref() {
+            return lease.shutdown(|payload| self.write_output_report_unordered(payload));
+        }
+        for payload in payloads {
+            self.write_output_report_unordered(payload)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn write_output_report(&self, data: &[u8]) -> Result<()> {
+        if let Some(lease) = self.host_lease.as_ref() {
+            return lease.write(data, |payload| self.write_output_report_unordered(payload));
+        }
+        self.write_output_report_unordered(data)
+    }
+
+    fn write_output_report_unordered(&self, data: &[u8]) -> Result<()> {
         ensure_output_report_len(data)?;
         match &self.backend {
             SharedHidOutputBackend::Local {
@@ -544,10 +588,12 @@ impl HidDevice {
         fault_after_requests: Option<(usize, TestHidFault)>,
     ) -> (Self, TestHidRecorder) {
         let recorder = TestHidRecorder {
+            pictogram_backup_directory: Default::default(),
             requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             responses: Default::default(),
         };
         let device = Self {
+            host_output: Default::default(),
             backend: HidBackend::Test {
                 recorder: recorder.clone(),
                 combo: std::sync::Mutex::new(([0; 4], 0)),
@@ -558,6 +604,21 @@ impl HidDevice {
         (device, recorder)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_pictogram_backup_directory(&self) -> Result<Option<PathBuf>> {
+        if let HidBackend::Test { recorder, .. } = &self.backend {
+            // Never let a scripted upload write into the real user's library.
+            return recorder
+                .pictogram_backup_directory
+                .lock()
+                .unwrap()
+                .clone()
+                .map(Some)
+                .context("Scripted pictogram upload requires a per-test backup directory");
+        }
+        Ok(None)
+    }
+
     pub fn open(path: &str) -> Result<Self> {
         #[cfg(target_os = "macos")]
         let _hid_lock = macos_hid_operation_lock();
@@ -566,6 +627,7 @@ impl HidDevice {
             .open_path(&std::ffi::CString::new(path)?)
             .context("Failed to open HID device")?;
         Ok(Self {
+            host_output: Default::default(),
             backend: HidBackend::Local {
                 device: std::sync::Arc::new(std::sync::Mutex::new(device)),
                 transport: HidTransport::Usb,
@@ -586,6 +648,7 @@ impl HidDevice {
                         device.name
                     );
                     return Ok(Self {
+                        host_output: Default::default(),
                         backend: HidBackend::LinuxBle(bluez_device),
                     });
                 }
@@ -620,6 +683,8 @@ impl HidDevice {
                 path,
                 ..
             } => Some(SharedHidOutput {
+                host_output: self.host_output.clone(),
+                host_lease: None,
                 backend: SharedHidOutputBackend::Local {
                     device: std::sync::Arc::downgrade(device),
                     write_framing: *write_framing,
@@ -628,10 +693,14 @@ impl HidDevice {
             }),
             #[cfg(target_os = "windows")]
             HidBackend::Proxy(proxy) => Some(SharedHidOutput {
+                host_output: self.host_output.clone(),
+                host_lease: None,
                 backend: SharedHidOutputBackend::Proxy(std::sync::Arc::downgrade(proxy)),
             }),
             #[cfg(test)]
             HidBackend::Test { recorder, .. } => Some(SharedHidOutput {
+                host_output: self.host_output.clone(),
+                host_lease: None,
                 backend: SharedHidOutputBackend::Test(recorder.clone()),
             }),
             _ => None,
@@ -713,6 +782,7 @@ impl HidDevice {
         }
 
         Ok(Self {
+            host_output: Default::default(),
             backend: HidBackend::Proxy(std::sync::Arc::new(HidProxy {
                 request_lock: Mutex::new(()),
                 child: Mutex::new(child),
@@ -735,6 +805,7 @@ impl HidDevice {
                         let transport = device_transport(device);
                         let write_framing = detect_hid_write_framing(&hid_device, transport)?;
                         return Ok(Self {
+                            host_output: Default::default(),
                             backend: HidBackend::Local {
                                 device: std::sync::Arc::new(std::sync::Mutex::new(hid_device)),
                                 transport,
@@ -773,6 +844,7 @@ impl HidDevice {
             let transport = device_transport(device);
             let write_framing = detect_hid_write_framing(&hid_device, transport)?;
             return Ok(Self {
+                host_output: Default::default(),
                 backend: HidBackend::Local {
                     device: std::sync::Arc::new(std::sync::Mutex::new(hid_device)),
                     transport,
@@ -801,6 +873,7 @@ impl HidDevice {
             let transport = device_transport(device);
             let write_framing = detect_hid_write_framing(&hid_device, transport)?;
             return Ok(Self {
+                host_output: Default::default(),
                 backend: HidBackend::Local {
                     device: std::sync::Arc::new(std::sync::Mutex::new(hid_device)),
                     transport,

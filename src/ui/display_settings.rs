@@ -1142,8 +1142,11 @@ impl EntropyApp {
                         self.start_vial_hid_operation(
                             ui.ctx(),
                             super::vial_hid_task::VialHidOperation::PictogramLoad {
-                                preserve_editor: self.display_settings.pictograms.supported
-                                    == Some(true),
+                                preserve_editor: self
+                                    .display_settings
+                                    .pictograms
+                                    .preserve_editor_on_load
+                                    || self.display_settings.pictograms.supported == Some(true),
                             },
                         ),
                         super::vial_hid_task::VialHidTaskStart::Started
@@ -4405,6 +4408,8 @@ mod pictogram_confirmation_tests {
             let cc = eframe::CreationContext::_new_kittest(ctx.clone());
             let mut app = EntropyApp::new(&cc);
             let (hid, recorder) = crate::hid::HidDevice::test_device();
+            let backup = tempfile::tempdir().unwrap();
+            recorder.set_pictogram_backup_directory(backup.path().join("pictogram-backups"));
             recorder.respond_with(test_pictogram_upload_responses(action != 3, 4));
             app.hid_device = Some(hid);
             let p = &mut app.display_settings.pictograms;
@@ -4485,6 +4490,8 @@ mod pictogram_confirmation_tests {
             let cc = eframe::CreationContext::_new_kittest(ctx.clone());
             let mut app = EntropyApp::new(&cc);
             let (hid, recorder) = crate::hid::HidDevice::test_device();
+            let backup = tempfile::tempdir().unwrap();
+            recorder.set_pictogram_backup_directory(backup.path().join("pictogram-backups"));
             recorder.respond_with(test_pictogram_upload_responses(slot_upload, 0));
             app.hid_device = Some(hid);
             app.display_settings.pictograms.loaded = true;

@@ -53,8 +53,7 @@ pub(crate) fn normalize_pictogram_bitmap(bitmap: &[u8]) -> Result<Vec<u8>> {
     Ok(result)
 }
 
-fn backup_pictogram_package(package: &[u8]) -> Result<()> {
-    let directory = super::pictogram_library_path().with_file_name("pictogram-backups");
+fn backup_pictogram_package(directory: &Path, package: &[u8]) -> Result<()> {
     std::fs::create_dir_all(&directory)?;
     let path = directory.join(format!("device-{:08x}.ehp", crc32(package)));
     if path.exists() && std::fs::read(&path)? == package {
@@ -1216,6 +1215,8 @@ pub(crate) struct PictogramSettingsState {
     pub(crate) supported: Option<bool>,
     pub(crate) loaded: bool,
     pub(crate) loading: bool,
+    // A failed transfer leaves an independent draft that recovery reads must not replace.
+    pub(crate) preserve_editor_on_load: bool,
     pub(crate) library: PictogramLibrary,
     pub(crate) selected_kind: PictogramKind,
     pub(crate) selected_slot: usize,
@@ -1241,6 +1242,7 @@ impl Default for PictogramSettingsState {
             supported: None,
             loaded: false,
             loading: false,
+            preserve_editor_on_load: false,
             library: PictogramLibrary::default(),
             selected_kind: PictogramKind::default(),
             selected_slot: 0,
@@ -1538,7 +1540,7 @@ impl crate::hid::HidDevice {
                 original[12..16].copy_from_slice(&crc.to_le_bytes());
                 let crc = pictogram_header_crc(&original[..HEADER_SIZE]);
                 original[16..20].copy_from_slice(&crc.to_le_bytes());
-                backup_pictogram_package(&original)?;
+                self.backup_pictogram_package(&original)?;
             }
             return Ok(library);
         }
@@ -1558,6 +1560,15 @@ impl crate::hid::HidDevice {
         PictogramLibrary::from_package(package)
     }
 
+    fn backup_pictogram_package(&self, package: &[u8]) -> Result<()> {
+        #[cfg(test)]
+        if let Some(directory) = self.test_pictogram_backup_directory()? {
+            return backup_pictogram_package(&directory, package);
+        }
+        let directory = super::pictogram_library_path().with_file_name("pictogram-backups");
+        backup_pictogram_package(&directory, package)
+    }
+
     pub(crate) fn upload_pictograms(
         &self,
         mut library: PictogramLibrary,
@@ -1568,7 +1579,7 @@ impl crate::hid::HidDevice {
             bail!("Update macropad firmware to use 35x35 pictograms");
         }
         library.refresh_checksums();
-        backup_pictogram_package(&library.package)?;
+        self.backup_pictogram_package(&library.package)?;
         let crc = crc32(&library.package);
         let mut begin = [0u8; 9];
         begin[0] = CMD_BEGIN;
@@ -1711,6 +1722,90 @@ mod tests {
         );
         old[300] ^= 1;
         assert!(PictogramLibrary::from_package(old).is_err());
+    }
+
+    #[test]
+    fn full_upload_writes_real_backup_in_each_test_owner_directory() {
+        let mut library = PictogramLibrary::blank();
+        library.set(PictogramKind::Macro, 7, &[0xA5; PICTOGRAM_BYTES]);
+        library.refresh_checksums();
+        let filename = format!("device-{:08x}.ehp", crc32(&library.package));
+        // Independent owners can back up identical packages concurrently without
+        // sharing HOME or colliding in one global backup namespace.
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        for root in [&first, &second] {
+            let directory = root.path().join("backups");
+            let (hid, recorder) = crate::hid::HidDevice::test_device();
+            recorder.set_pictogram_backup_directory(directory.clone());
+            for _ in 0..2 {
+                recorder.respond_with(test_pictogram_upload_responses(false, 0));
+                let uploaded = hid
+                    .upload_pictograms(library.clone(), &AtomicU32::new(0))
+                    .unwrap();
+                assert_eq!(uploaded, library);
+                assert_eq!(
+                    std::fs::read(directory.join(&filename)).unwrap(),
+                    library.package
+                );
+                assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+            }
+            assert_eq!(
+                recorder
+                    .requests()
+                    .iter()
+                    .filter(|r| r[0] == CMD_BEGIN)
+                    .count(),
+                2
+            );
+            assert_eq!(
+                recorder
+                    .requests()
+                    .iter()
+                    .filter(|r| r[0] == CMD_COMMIT)
+                    .count(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn mandatory_backup_failure_prevents_destructive_begin_and_all_upload_packets() {
+        let mut library = PictogramLibrary::blank();
+        library.refresh_checksums();
+        for failure in 0..3 {
+            let root = tempfile::tempdir().unwrap();
+            let directory = root.path().join("backups");
+            let (hid, recorder) = crate::hid::HidDevice::test_device();
+            if failure == 0 {
+                // A file where a directory is required fails even as root and
+                // on Windows; no permission bits or environment mutation needed.
+                std::fs::write(&directory, b"not a directory").unwrap();
+                recorder.set_pictogram_backup_directory(directory.clone());
+            } else if failure == 1 {
+                std::fs::create_dir(&directory).unwrap();
+                let path = directory.join(format!("device-{:08x}.ehp", crc32(&library.package)));
+                std::fs::write(path, b"existing incomplete backup").unwrap();
+                recorder.set_pictogram_backup_directory(directory.clone());
+            } // failure 2: missing explicit test destination must not reach HOME.
+            recorder.respond_with(test_pictogram_upload_responses(false, 0));
+            let progress = AtomicU32::new(0);
+            assert!(hid.upload_pictograms(library.clone(), &progress).is_err());
+            let requests = recorder.requests();
+            assert_eq!(
+                requests.len(),
+                1,
+                "backup failure sent destructive upload traffic"
+            );
+            assert_eq!(requests[0][0], CMD_QUERY);
+            assert_eq!(progress.load(Ordering::Relaxed), 0);
+            if failure == 0 {
+                assert_eq!(std::fs::read(directory).unwrap(), b"not a directory");
+            } else if failure == 1 {
+                let path = directory.join(format!("device-{:08x}.ehp", crc32(&library.package)));
+                assert_eq!(std::fs::read(path).unwrap(), b"existing incomplete backup");
+            }
+        }
     }
 
     #[test]

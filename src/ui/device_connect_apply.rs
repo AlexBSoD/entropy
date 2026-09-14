@@ -440,8 +440,8 @@ impl EntropyApp {
 
         match result {
             Ok(mut r) => {
-                if reconnect.is_some() && self.layout.is_some() {
-                    self.preserve_deferred_snapshot_on_reconnect(&mut r);
+                if let Some(reconnect) = reconnect.as_ref().filter(|_| self.layout.is_some()) {
+                    self.preserve_deferred_snapshot_on_reconnect(&mut r, reconnect);
                 }
                 let staged_bluetooth_load = r.deferred_load.is_staged();
                 self.pending_tap_hold_numeric_writes.clear();
@@ -823,4 +823,206 @@ pub(super) fn sync_layer_names_to_store<S: LayerNameStore>(
         }
     }
     failed
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod qa_followup_reconnect {
+    use super::super::vial_hid_task::{VialHidOperation, VialHidTaskStart};
+    use super::*;
+
+    fn device(serial: &str) -> crate::device::Device {
+        crate::device::Device {
+            name: "Draft keyboard".into(),
+            vendor_id: 0x1111,
+            product_id: 0x2222,
+            manufacturer: "fixture".into(),
+            serial_number: serial.into(),
+            bus_type: "Bluetooth".into(),
+            path: format!("fixture-{serial}"),
+            firmware: FirmwareProtocol::Vial,
+        }
+    }
+    fn layout() -> KeyboardLayout {
+        KeyboardLayout::from_vial_json(&serde_json::json!({
+            "name":"Draft keyboard", "matrix":{"rows":1,"cols":1},
+            "layouts":{"keymap":[["0,0"]]}
+        }))
+        .unwrap()
+    }
+    fn result(device: &crate::device::Device, keyboard_id: u64) -> ConnectResult {
+        let (hid, _) = crate::hid::HidDevice::test_device();
+        ConnectResult {
+            device_name: device.name.clone(),
+            keyboard_id: keyboard_id,
+            vial_unlock_status: Default::default(),
+            hid_device: Some(hid),
+            layout: layout(),
+            layer_count: 1,
+            about_info: DeviceAboutInfo {
+                vendor_id: device.vendor_id,
+                product_id: device.product_id,
+                ..Default::default()
+            },
+            macro_texts: Default::default(),
+            supports_macro_ext_keycodes: Default::default(),
+            supports_rmk_native_key_actions: Default::default(),
+            supports_universal_symbols: Default::default(),
+            supports_universal_russian_letters: Default::default(),
+            supports_rmk_native_combo_output: Default::default(),
+            supports_rmk_native_tap_dance_actions: Default::default(),
+            supports_rmk_combo_layers: Default::default(),
+            macro_ext_keycodes_disabled_reason: Default::default(),
+            tap_dance_entries: Default::default(),
+            combo_entries: Default::default(),
+            combo_term: Default::default(),
+            auto_shift_options: Default::default(),
+            auto_shift_timeout: Default::default(),
+            mouse_keys_settings: Default::default(),
+            touchpad_settings: Default::default(),
+            bluetooth_settings: Default::default(),
+            module_settings: Default::default(),
+            tap_hold_settings: Default::default(),
+            magic_settings: Default::default(),
+            one_shot_settings: Default::default(),
+            grave_escape_settings: Default::default(),
+            layer_led_settings: Default::default(),
+            rgb_settings: Default::default(),
+            display_settings: Default::default(),
+            layout_options_value: Default::default(),
+            key_override_entries: Default::default(),
+            alt_repeat_entries: Default::default(),
+            vial_features: Default::default(),
+            layer_names_from_firmware: Default::default(),
+            supported_qmk_settings: Default::default(),
+            deferred_load: Default::default(),
+        }
+    }
+    fn poll_upload(app: &mut EntropyApp, ctx: &egui::Context) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.vial_hid_task.is_some() {
+            assert!(std::time::Instant::now() < deadline);
+            app.poll_vial_hid_task(ctx);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    fn failed_upload(ctx: &egui::Context) -> (EntropyApp, BluetoothReconnectState) {
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = EntropyApp::new(&cc);
+        app.device_manager.replace_devices(vec![device("a")]);
+        app.selected_device = Some(0);
+        app.layout = Some(layout());
+        app.current_keyboard_id = Some(7);
+        app.current_device_name = "Draft keyboard".into();
+        let (hid, _) = crate::hid::HidDevice::test_device_with_fault_after_requests(Some((
+            0,
+            crate::hid::TestHidFault::Disconnect,
+        )));
+        app.hid_device = Some(hid);
+        let p = &mut app.display_settings.pictograms;
+        p.loaded = true;
+        p.supported = Some(true);
+        p.editor_name = "rejected upload draft".into();
+        p.source_levels = vec![42; PICTOGRAM_WIDTH * PICTOGRAM_HEIGHT];
+        p.undo = vec![vec![17; PICTOGRAM_WIDTH * PICTOGRAM_HEIGHT]];
+        p.library
+            .set(PictogramKind::Macro, 0, &vec![0xAA; PICTOGRAM_BYTES]);
+        assert!(app.apply_current_pictogram(ctx));
+        poll_upload(&mut app, ctx);
+        let ConnectState::Reconnecting(reconnect) = &app.connect_state else {
+            panic!("did not enter actual automatic reconnect");
+        };
+        let reconnect = reconnect.clone();
+        assert_eq!(
+            app.display_settings.pictograms.editor_name,
+            "rejected upload draft"
+        );
+        assert!(!app.display_settings.pictograms.loaded);
+        (app, reconnect)
+    }
+    fn complete(
+        app: &mut EntropyApp,
+        ctx: &egui::Context,
+        result: ConnectResult,
+        reconnect: Option<BluetoothReconnectState>,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        let now = std::time::Instant::now();
+        app.connect_state = ConnectState::Loading {
+            rx,
+            started_at: now,
+            last_progress_at: now,
+            reconnect,
+        };
+        tx.send(ConnectTaskMessage::Done(Box::new(Ok(result))))
+            .unwrap();
+        app.poll_connect(ctx);
+        assert!(matches!(app.connect_state, ConnectState::Idle));
+    }
+
+    #[test]
+    fn failed_upload_draft_survives_successful_same_device_automatic_reconnect_and_reread() {
+        let ctx = egui::Context::default();
+        let (mut app, reconnect) = failed_upload(&ctx);
+        let draft = app.display_settings.pictograms.clone();
+        complete(&mut app, &ctx, result(&device("a"), 7), Some(reconnect));
+        let p = &app.display_settings.pictograms;
+        assert_eq!(p.editor_name, draft.editor_name);
+        assert_eq!(p.source_levels, draft.source_levels);
+        assert_eq!(p.undo, draft.undo);
+        assert!(!p.loaded);
+        assert!(!p.library.has(PictogramKind::Macro, 0));
+        assert!(p.preserve_editor_on_load);
+        let confirmed = PictogramLibrary::default();
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        recorder.respond_with(test_pictogram_read_responses(&confirmed));
+        app.hid_device = Some(hid);
+        assert!(matches!(
+            app.start_vial_hid_operation(
+                &ctx,
+                VialHidOperation::PictogramLoad {
+                    preserve_editor: app.display_settings.pictograms.preserve_editor_on_load,
+                }
+            ),
+            VialHidTaskStart::Started
+        ));
+        poll_upload(&mut app, &ctx);
+        let p = &app.display_settings.pictograms;
+        assert!(p.loaded);
+        assert_eq!(p.library, confirmed);
+        assert_eq!(p.editor_name, draft.editor_name);
+        assert_eq!(p.source_levels, draft.source_levels);
+        assert_eq!(p.undo, draft.undo);
+        assert!(!p.preserve_editor_on_load);
+    }
+
+    #[test]
+    fn reconnect_does_not_transfer_draft_to_another_physical_device_or_definition() {
+        for (serial, keyboard_id) in [("b", 7), ("a", 8)] {
+            let ctx = egui::Context::default();
+            let (mut app, reconnect) = failed_upload(&ctx);
+            app.device_manager.replace_devices(vec![device(serial)]);
+            complete(
+                &mut app,
+                &ctx,
+                result(&device(serial), keyboard_id),
+                Some(reconnect),
+            );
+            let p = &app.display_settings.pictograms;
+            assert!(p.editor_name.is_empty());
+            assert!(p.undo.is_empty());
+            assert!(!p.preserve_editor_on_load);
+            assert!(!p.loaded);
+            assert!(!p.library.has(PictogramKind::Macro, 0));
+        }
+    }
+
+    #[test]
+    fn explicit_new_connection_does_not_inherit_failed_upload_draft() {
+        let ctx = egui::Context::default();
+        let (mut app, _) = failed_upload(&ctx);
+        complete(&mut app, &ctx, result(&device("a"), 7), None);
+        assert!(app.display_settings.pictograms.editor_name.is_empty());
+        assert!(app.display_settings.pictograms.undo.is_empty());
+        assert!(!app.display_settings.pictograms.preserve_editor_on_load);
+    }
 }
