@@ -1135,24 +1135,12 @@ impl EntropyApp {
                 ui.ctx().data_mut(|data| data.insert_temp(mode_id, mode));
                 #[cfg(not(target_arch = "wasm32"))]
                 if mode == 3
-                    && !self.display_settings.pictograms.loaded
-                    && !self.display_settings.pictograms.loading
-                    && self.display_settings.pictograms.supported != Some(false)
-                    && matches!(
-                        self.start_vial_hid_operation(
-                            ui.ctx(),
-                            super::vial_hid_task::VialHidOperation::PictogramLoad {
-                                preserve_editor: self
-                                    .display_settings
-                                    .pictograms
-                                    .preserve_editor_on_load
-                                    || self.display_settings.pictograms.supported == Some(true),
-                            },
-                        ),
-                        super::vial_hid_task::VialHidTaskStart::Started
-                    )
+                    && self
+                        .display_settings
+                        .pictograms
+                        .needs_automatic_load(self.connection_generation)
                 {
-                    self.display_settings.pictograms.loading = true;
+                    self.start_pictogram_load(ui.ctx());
                 }
                 ui.add_space(18.0);
 
@@ -1752,6 +1740,17 @@ impl EntropyApp {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    fn start_pictogram_load(&mut self, ctx: &egui::Context) {
+        self.start_vial_hid_operation(
+            ctx,
+            super::vial_hid_task::VialHidOperation::PictogramLoad {
+                preserve_editor: self.display_settings.pictograms.preserve_editor_on_load
+                    || self.display_settings.pictograms.supported == Some(true),
+            },
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn apply_current_pictogram(&mut self, ctx: &egui::Context) -> bool {
         if !self.display_settings.pictograms.loaded || self.display_settings.pictograms.loading {
             return false;
@@ -2182,7 +2181,13 @@ impl EntropyApp {
                     supported && !busy,
                 );
                 if picker_response.clicked() {
-                    egui::Popup::toggle_id(ui.ctx(), picker_id);
+                    if self.display_settings.pictograms.loaded {
+                        egui::Popup::toggle_id(ui.ctx(), picker_id);
+                    } else {
+                        // Retry the read explicitly before offering assignments
+                        // based on an uncertain device snapshot.
+                        self.start_pictogram_load(ui.ctx());
+                    }
                 }
                 let popup_width = 6.0 * 48.0 * scale + 5.0 * 7.0 * scale + 20.0 * scale;
                 crate::ui_style::popup_below_widget_with_width(
@@ -4405,10 +4410,14 @@ mod pictogram_confirmation_tests {
     fn rejected_slot_assignment_save_reset_and_full_upload_never_confirm_pending_library() {
         for action in 0..4 {
             let ctx = egui::Context::default();
-            let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-            let mut app = EntropyApp::new(&cc);
+            let mut app = EntropyApp::new_inert_for_test();
             let (hid, recorder) = crate::hid::HidDevice::test_device();
-            let backup = tempfile::tempdir().unwrap();
+            let backup = tempfile::tempdir_in(
+                std::env::var_os("ENTROPY_TEST_ARTIFACT_DIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(std::env::temp_dir),
+            )
+            .unwrap();
             recorder.set_pictogram_backup_directory(backup.path().join("pictogram-backups"));
             recorder.respond_with(test_pictogram_upload_responses(action != 3, 4));
             app.hid_device = Some(hid);
@@ -4487,10 +4496,14 @@ mod pictogram_confirmation_tests {
     fn successful_slot_and_full_upload_confirm_only_on_completion_and_keep_newer_edits() {
         for slot_upload in [true, false] {
             let ctx = egui::Context::default();
-            let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-            let mut app = EntropyApp::new(&cc);
+            let mut app = EntropyApp::new_inert_for_test();
             let (hid, recorder) = crate::hid::HidDevice::test_device();
-            let backup = tempfile::tempdir().unwrap();
+            let backup = tempfile::tempdir_in(
+                std::env::var_os("ENTROPY_TEST_ARTIFACT_DIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(std::env::temp_dir),
+            )
+            .unwrap();
             recorder.set_pictogram_backup_directory(backup.path().join("pictogram-backups"));
             recorder.respond_with(test_pictogram_upload_responses(slot_upload, 0));
             app.hid_device = Some(hid);
@@ -4534,8 +4547,7 @@ mod pictogram_confirmation_tests {
             crate::hid::TestHidFault::WorkerPanic,
         ] {
             let ctx = egui::Context::default();
-            let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-            let mut app = EntropyApp::new(&cc);
+            let mut app = EntropyApp::new_inert_for_test();
             let (hid, _) =
                 crate::hid::HidDevice::test_device_with_fault_after_requests(Some((0, fault)));
             app.hid_device = Some(hid);

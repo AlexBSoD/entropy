@@ -379,6 +379,23 @@ impl EntropyApp {
         ctx: &egui::Context,
         operation: VialHidOperation,
     ) -> VialHidTaskStart {
+        self.start_vial_hid_operation_with_runner(ctx, operation, run_vial_hid_operation_with_progress)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start_vial_hid_operation_with_runner(
+        &mut self,
+        ctx: &egui::Context,
+        operation: VialHidOperation,
+        run: impl FnOnce(
+                &crate::hid::HidDevice,
+                VialHidOperation,
+                &std::sync::atomic::AtomicU32,
+                &std::sync::atomic::AtomicBool,
+            ) -> anyhow::Result<VialHidOutcome>
+            + Send
+            + 'static,
+    ) -> VialHidTaskStart {
         if self.vial_hid_task.is_some() || self.another_hid_owner_or_write_is_pending() {
             return VialHidTaskStart::Busy;
         }
@@ -386,6 +403,10 @@ impl EntropyApp {
             return VialHidTaskStart::NoDevice;
         };
 
+        if matches!(operation, VialHidOperation::PictogramLoad { .. }) {
+            self.display_settings.pictograms.loading = true;
+            self.display_settings.pictograms.load_failure = None;
+        }
         let generation = self.connection_generation;
         let (sender, receiver) = std::sync::mpsc::channel();
         let repaint_ctx = ctx.clone();
@@ -398,7 +419,7 @@ impl EntropyApp {
             #[cfg(target_os = "macos")]
             let _hid_lock = hid_device.macos_hid_operation_lock();
 
-            let outcome = run_vial_hid_operation_with_progress(
+            let outcome = run(
                 &hid_device,
                 operation.clone(),
                 &worker_progress,
@@ -517,6 +538,15 @@ impl EntropyApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn poll_vial_hid_task(&mut self, ctx: &egui::Context) {
+        self.poll_vial_hid_task_with_settings_save(ctx, save_app_settings);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn poll_vial_hid_task_with_settings_save(
+        &mut self,
+        ctx: &egui::Context,
+        save_settings: impl FnOnce(&AppSettings),
+    ) {
         let received = match self.vial_hid_task.as_ref() {
             Some(task) => task.receiver.try_recv(),
             None => return,
@@ -634,7 +664,7 @@ impl EntropyApp {
             }
             Ok(VialHidOutcome::BackgroundUploaded(upload)) => {
                 self.app_settings.standby_background_source_path = Some(upload.source_path.clone());
-                save_app_settings(&self.app_settings);
+                save_settings(&self.app_settings);
                 self.display_settings.clock_background_kind = upload.kind;
                 self.display_settings.clock_background_frames = upload.frame_count;
                 self.display_settings.clock_background_bytes = upload.total_size;
@@ -733,6 +763,7 @@ impl EntropyApp {
                 .into();
             }
             Ok(VialHidOutcome::PictogramsLoaded(library)) => {
+                self.display_settings.pictograms.load_failure = None;
                 self.display_settings.pictograms.supported = Some(true);
                 self.display_settings.pictograms.loaded = true;
                 self.display_settings.pictograms.loading = false;
@@ -753,6 +784,7 @@ impl EntropyApp {
                 .into();
             }
             Ok(VialHidOutcome::PictogramsUploaded(library)) => {
+                self.display_settings.pictograms.load_failure = None;
                 self.display_settings.pictograms.preserve_editor_on_load = false;
                 self.display_settings.pictograms.supported = Some(true);
                 self.display_settings.pictograms.loaded = true;
@@ -916,6 +948,8 @@ impl EntropyApp {
         match &operation {
             VialHidOperation::PictogramLoad { .. } => {
                 self.display_settings.pictograms.loading = false;
+                self.display_settings.pictograms.load_failure =
+                    Some((self.connection_generation, error.clone()));
                 // A failed read is not proof that the firmware lacks storage.
                 if self.display_settings.pictograms.supported != Some(true) {
                     self.display_settings.pictograms.supported = Some(false);
@@ -929,6 +963,7 @@ impl EntropyApp {
                 // storage read preserves that editor and confirms the actual bytes.
                 pictograms.loaded = false;
                 pictograms.loading = false;
+                pictograms.load_failure = None;
                 pictograms.preserve_editor_on_load = true;
                 pictograms.library = PictogramLibrary::default();
                 pictograms.upload_due = None;
@@ -1075,6 +1110,387 @@ impl EntropyApp {
                 _ => false,
             })
             .unwrap_or(false)
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod repeat_lifecycle_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU32};
+    use std::time::{Duration, Instant};
+
+    fn app() -> (EntropyApp, egui::Context, crate::hid::TestHidRecorder) {
+        let mut app = EntropyApp::new_inert_for_test();
+        assert!(app.device_manager.devices().is_empty());
+        assert!(matches!(app.update_check, UpdateCheckState::Idle));
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        app.hid_device = Some(hid);
+        app.app_settings.language = crate::i18n::Language::Russian;
+        app.display_settings.supported = true;
+        app.display_settings.clock_settings_supported = true;
+        app.display_settings.clock_background_asset_supported = true;
+        app.display_settings.pictograms.supported = Some(true);
+        app.display_settings.pictograms.loaded = true;
+        app.keycode_picker.macro_count = 4;
+        let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        for family in ["display_preview", "clock_montserrat"] {
+            fonts.families.insert(
+                egui::FontFamily::Name(family.into()),
+                fonts.families[&egui::FontFamily::Proportional].clone(),
+            );
+        }
+        ctx.set_fonts(fonts);
+        (app, ctx, recorder)
+    }
+
+    fn frame(
+        app: &mut EntropyApp,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1100.0, 1000.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| app.draw_display_settings_page(ui, ui.max_rect()),
+        )
+    }
+
+    fn text_position(output: &egui::FullOutput, label: &str) -> egui::Pos2 {
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == label => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing rendered text: {label}"))
+    }
+
+    fn tab(app: &mut EntropyApp, ctx: &egui::Context, label: &str) {
+        let output = frame(app, ctx, Vec::new());
+        let pos = text_position(&output, label);
+        for pressed in [true, false] {
+            frame(
+                app,
+                ctx,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+        }
+    }
+
+    fn poll(app: &mut EntropyApp, ctx: &egui::Context, saved: &mut usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.vial_hid_task_active() {
+            assert!(
+                Instant::now() < deadline,
+                "same-session worker did not finish"
+            );
+            app.poll_vial_hid_task_with_settings_save(ctx, |_| *saved += 1);
+            frame(app, ctx, Vec::new());
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn repeat_lifecycle_two_pictogram_uploads_use_one_app_and_remain_renderable() {
+        let (mut app, ctx, recorder) = app();
+        tab(&mut app, &ctx, "Пиктограммы");
+        let generation = app.connection_generation;
+        let mut saved = 0;
+        for byte in [0xAA, 0x55] {
+            recorder.respond_with(test_pictogram_upload_responses(true, 0));
+            app.display_settings.pictograms.source_levels =
+                pictogram_bitmap_levels(&[byte; PICTOGRAM_BYTES]);
+            assert!(app.apply_current_pictogram(&ctx));
+            frame(&mut app, &ctx, Vec::new());
+            poll(&mut app, &ctx, &mut saved);
+            assert_eq!(app.connection_generation, generation);
+            assert!(app.hid_device.is_some());
+            assert!(app.display_settings.pictograms.loaded);
+            assert!(!app.display_settings.pictograms.loading);
+            assert!(!app.vial_hid_task_blocks_user_action());
+            let output = frame(&mut app, &ctx, Vec::new());
+            text_position(&output, "Выбрать");
+            tab(&mut app, &ctx, "Выбрать");
+            assert!(
+                egui::Popup::is_any_open(&ctx),
+                "Select did not reopen after upload"
+            );
+            egui::Popup::close_all(&ctx);
+        }
+        assert_eq!(saved, 0);
+        assert_eq!(
+            recorder.requests().iter().filter(|r| r[0] == 0xC9).count(),
+            2
+        );
+    }
+
+    fn directory() -> tempfile::TempDir {
+        let root = std::env::var_os("ENTROPY_TEST_ARTIFACT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        tempfile::Builder::new()
+            .prefix("repeat-lifecycle-")
+            .tempdir_in(root)
+            .unwrap()
+    }
+
+    #[test]
+    fn repeat_lifecycle_failed_recovery_read_stops_until_explicit_retry() {
+        let (mut app, ctx, recorder) = app();
+        tab(&mut app, &ctx, "Пиктограммы");
+        let before = app.display_settings.pictograms.library.clone();
+        app.display_settings.pictograms.editor_name = "Unsaved draft".into();
+        let draft = app.display_settings.pictograms.source_levels.clone();
+        recorder.respond_with(test_pictogram_upload_responses(true, 4));
+        // A real firmware error on the automatic recovery QUERY, not a timeout
+        // or an unsupported capability. Known support must remain known.
+        let mut read_error = [0; 32];
+        read_error[0] = 0xC0;
+        read_error[1] = 4;
+        recorder.respond_with([read_error]);
+        assert!(app.apply_current_pictogram(&ctx));
+        for _ in 0..30 {
+            app.poll_vial_hid_task_with_settings_save(&ctx, |_| panic!("no settings write"));
+            frame(&mut app, &ctx, Vec::new());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let queries = recorder.requests().iter().filter(|r| r[0] == 0xC0).count();
+        assert_eq!(
+            queries, 2,
+            "upload QUERY + one recovery QUERY, not a render-driven retry loop"
+        );
+        assert!(!app.vial_hid_task_active());
+        assert_eq!(app.display_settings.pictograms.supported, Some(true));
+        assert!(!app.display_settings.pictograms.loaded);
+        assert_eq!(app.display_settings.pictograms.source_levels, draft);
+        assert_eq!(app.display_settings.pictograms.editor_name, "Unsaved draft");
+        assert!(app
+            .display_settings
+            .pictograms
+            .load_failure
+            .as_ref()
+            .unwrap()
+            .1
+            .contains("status 4"));
+        // Merely navigating away and back is not a recovery attempt.
+        tab(&mut app, &ctx, "Экран ожидания");
+        tab(&mut app, &ctx, "Пиктограммы");
+        assert_eq!(
+            recorder.requests().iter().filter(|r| r[0] == 0xC0).count(),
+            2
+        );
+        // The existing Select control is an explicit read retry boundary when
+        // the snapshot is unknown; it must never seed another upload itself.
+        recorder.respond_with(test_pictogram_read_responses(&before));
+        tab(&mut app, &ctx, "Выбрать");
+        poll(&mut app, &ctx, &mut 0);
+        assert!(app.display_settings.pictograms.loaded);
+        assert_eq!(app.display_settings.pictograms.library, before);
+        assert!(app.display_settings.pictograms.load_failure.is_none());
+        assert_eq!(app.display_settings.pictograms.source_levels, draft);
+        recorder.respond_with(test_pictogram_upload_responses(true, 0));
+        assert!(app.apply_current_pictogram(&ctx));
+        poll(&mut app, &ctx, &mut 0);
+        assert!(app.hid_device.is_some());
+        assert!(app.display_settings.pictograms.loaded);
+    }
+
+    #[test]
+    fn repeat_lifecycle_stale_read_result_cannot_overwrite_successor_state() {
+        let (mut app, ctx, _) = app();
+        let (release, gate) = std::sync::mpsc::channel();
+        assert_eq!(
+            app.start_vial_hid_operation_with_runner(
+                &ctx,
+                VialHidOperation::PictogramLoad {
+                    preserve_editor: true
+                },
+                move |_, _, _, _| {
+                    gate.recv_timeout(Duration::from_secs(3)).unwrap();
+                    anyhow::bail!("old read failed")
+                },
+            ),
+            VialHidTaskStart::Started
+        );
+        app.connection_generation += 1;
+        app.display_settings.pictograms = PictogramSettingsState::default();
+        app.display_settings.pictograms.editor_name = "Successor".into();
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.vial_hid_task_active() {
+            assert!(Instant::now() < deadline);
+            app.poll_vial_hid_task_with_settings_save(&ctx, |_| panic!("no save"));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.hid_device.is_none(), "stale HID handle was restored");
+        assert!(app.display_settings.pictograms.load_failure.is_none());
+        assert_eq!(app.display_settings.pictograms.editor_name, "Successor");
+    }
+
+    fn start_background(
+        app: &mut EntropyApp,
+        ctx: &egui::Context,
+        directory: &std::path::Path,
+        gate: Option<std::sync::mpsc::Receiver<()>>,
+    ) {
+        let path = directory.join("source.png");
+        let red = if app.display_settings.clock_background_preview_revision == 0 {
+            32
+        } else {
+            224
+        };
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([red, 87, 120, 255]))
+            .save(&path)
+            .unwrap();
+        let cache = directory.join("cache.ehbg");
+        assert_eq!(
+            app.start_vial_hid_operation_with_runner(
+                ctx,
+                VialHidOperation::BackgroundUpload {
+                    path,
+                    fallback: [0; 3],
+                    scale: StandbyBackgroundScale::Fill
+                },
+                move |hid, operation, progress: &AtomicU32, cancel: &AtomicBool| {
+                    if let Some(gate) = gate {
+                        gate.recv_timeout(Duration::from_secs(3)).unwrap();
+                    }
+                    let VialHidOperation::BackgroundUpload {
+                        path,
+                        fallback,
+                        scale,
+                    } = operation
+                    else {
+                        panic!("wrong operation")
+                    };
+                    hid.upload_standby_background_with_cache(
+                        &path,
+                        fallback,
+                        scale,
+                        progress,
+                        cancel,
+                        |package| Ok(std::fs::write(&cache, package)?),
+                    )
+                    .map(|upload| match upload {
+                        Some(upload) => VialHidOutcome::BackgroundUploaded(upload),
+                        None => VialHidOutcome::BackgroundCancelled {
+                            cleared: progress.load(std::sync::atomic::Ordering::Relaxed) >= 150,
+                        },
+                    })
+                },
+            ),
+            VialHidTaskStart::Started
+        );
+    }
+
+    #[test]
+    fn repeat_lifecycle_two_standby_uploads_keep_same_handle_and_gui_live() {
+        let (mut app, ctx, recorder) = app();
+        tab(&mut app, &ctx, "Экран ожидания");
+        let directory = directory();
+        let generation = app.connection_generation;
+        let mut saved = 0;
+        let mut previous_package = Vec::new();
+        for revision in 1..=2 {
+            recorder
+                .respond_with(crate::app::standby_background::test_background_upload_responses(0));
+            let (release, gate) = std::sync::mpsc::channel();
+            start_background(&mut app, &ctx, directory.path(), Some(gate));
+            // Deterministically stalled worker, not HID. GUI polling/rendering
+            // must remain independent while the original owner is in-flight.
+            let started = Instant::now();
+            for _ in 0..3 {
+                app.poll_vial_hid_task_with_settings_save(&ctx, |_| panic!("worker is gated"));
+                let output = frame(&mut app, &ctx, Vec::new());
+                text_position(&output, "Отмена");
+                assert!(app.standby_background_upload_progress().is_some());
+            }
+            assert!(started.elapsed() < Duration::from_secs(2));
+            release.send(()).unwrap();
+            poll(&mut app, &ctx, &mut saved);
+            assert_eq!(
+                app.display_settings.clock_background_preview_revision,
+                revision
+            );
+            assert!(app.standby_background_upload_progress().is_none());
+            assert!(!app.vial_hid_task_blocks_user_action());
+            assert!(app.hid_device.is_some());
+            assert_eq!(app.connection_generation, generation);
+            let output = frame(&mut app, &ctx, Vec::new());
+            text_position(&output, "Загрузить");
+            text_position(&output, "Сбросить");
+            assert!(
+                std::fs::metadata(directory.path().join("cache.ehbg"))
+                    .unwrap()
+                    .len()
+                    > 256
+            );
+            let package = std::fs::read(directory.path().join("cache.ehbg")).unwrap();
+            assert_ne!(package, previous_package, "second upload must replace different pixels");
+            previous_package = package;
+        }
+        assert_eq!(saved, 2);
+        assert_eq!(
+            recorder.requests().iter().filter(|r| r[0] == 0xB3).count(),
+            2
+        );
+    }
+
+    #[test]
+    fn repeat_lifecycle_failed_or_cancelled_standby_upload_can_retry() {
+        for cancel_first in [false, true] {
+            let (mut app, ctx, recorder) = app();
+            tab(&mut app, &ctx, "Экран ожидания");
+            let directory = directory();
+            let mut saved = 0;
+            let generation = app.connection_generation;
+            let (release, gate) = std::sync::mpsc::channel();
+            if !cancel_first {
+                recorder.respond_with(
+                    crate::app::standby_background::test_background_upload_responses(4),
+                );
+            }
+            start_background(&mut app, &ctx, directory.path(), Some(gate));
+            if cancel_first {
+                app.cancel_background_upload();
+            }
+            release.send(()).unwrap();
+            poll(&mut app, &ctx, &mut saved);
+            assert!(app.hid_device.is_some());
+            assert_eq!(saved, 0);
+            assert_eq!(app.display_settings.clock_background_preview_revision, 0);
+            if cancel_first {
+                assert!(recorder.requests().is_empty());
+            } else {
+                assert!(app.status_msg.contains("status 4"));
+            }
+            recorder
+                .respond_with(crate::app::standby_background::test_background_upload_responses(0));
+            start_background(&mut app, &ctx, directory.path(), None);
+            poll(&mut app, &ctx, &mut saved);
+            assert_eq!(saved, 1);
+            assert_eq!(app.connection_generation, generation);
+            assert!(app.hid_device.is_some());
+            assert!(!app.vial_hid_task_blocks_user_action());
+        }
     }
 }
 

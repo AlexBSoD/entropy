@@ -357,6 +357,10 @@ enum SharedHidOutputBackend {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl SharedHidOutput {
+    pub(crate) fn shares_owner_with(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.host_output, &other.host_output)
+    }
+
     #[cfg(test)]
     pub(crate) fn test_expired_proxy_owner() -> Self {
         Self {

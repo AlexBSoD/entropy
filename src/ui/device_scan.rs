@@ -133,12 +133,13 @@ impl EntropyApp {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn apply_device_scan_result(&mut self, devices: Vec<Device>) {
+    pub(super) fn apply_device_scan_result(&mut self, devices: Vec<Device>) {
         if let ConnectState::Reconnecting(reconnect) = &self.connect_state {
             let reconnect = reconnect.clone();
             let reconnect_device_index =
                 unique_reconnect_device_index(&devices, &reconnect.identity);
             self.device_manager.replace_devices(devices);
+            self.retain_connected_qmk_hid_host_bridges();
             let connected_display_name_keys: std::collections::HashSet<String> = self
                 .device_manager
                 .devices()
@@ -167,6 +168,7 @@ impl EntropyApp {
         let selecting_device = matches!(self.connect_state, ConnectState::SelectingDevice);
 
         self.device_manager.replace_devices(devices);
+        self.retain_connected_qmk_hid_host_bridges();
         let connected_display_name_keys: std::collections::HashSet<String> = self
             .device_manager
             .devices()
@@ -206,7 +208,7 @@ impl EntropyApp {
         if self.device_manager.devices().is_empty() {
             if selecting_device {
                 self.selected_device = None;
-                self.qmk_hid_hosts.clear();
+                self.retain_connected_qmk_hid_host_bridges();
                 return;
             }
             if was_loading {
@@ -221,7 +223,7 @@ impl EntropyApp {
                 self.selected_device = None;
                 self.clear_connected_keyboard_state("No device detected");
             } else {
-                self.qmk_hid_hosts.clear();
+                self.retain_connected_qmk_hid_host_bridges();
             }
             return;
         }
@@ -229,7 +231,7 @@ impl EntropyApp {
         if selecting_device {
             self.selected_device = None;
             self.status_msg.clear();
-            self.qmk_hid_hosts.clear();
+            self.retain_connected_qmk_hid_host_bridges();
             return;
         }
 
@@ -238,7 +240,7 @@ impl EntropyApp {
             && !was_loading
             && should_wait_for_manual_device_selection(&self.status_msg)
         {
-            self.qmk_hid_hosts.clear();
+            self.retain_connected_qmk_hid_host_bridges();
             return;
         }
 
@@ -253,7 +255,7 @@ impl EntropyApp {
                 .iter()
                 .any(Device::uses_bluez_gatt_transport)
         {
-            self.qmk_hid_hosts.clear();
+            self.retain_connected_qmk_hid_host_bridges();
             return;
         }
 
@@ -286,7 +288,7 @@ impl EntropyApp {
                 self.clear_connected_keyboard_state("");
             } else {
                 self.status_msg.clear();
-                self.qmk_hid_hosts.clear();
+                self.retain_connected_qmk_hid_host_bridges();
             }
             return;
         }

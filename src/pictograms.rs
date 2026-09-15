@@ -1215,6 +1215,10 @@ pub(crate) struct PictogramSettingsState {
     pub(crate) supported: Option<bool>,
     pub(crate) loaded: bool,
     pub(crate) loading: bool,
+    // Terminal read outcome for this connection. Keep the error separate from
+    // firmware support: a failed recovery read must not become an automatic
+    // per-render retry, nor make a supported device appear unsupported.
+    pub(crate) load_failure: Option<(u64, String)>,
     // A failed transfer leaves an independent draft that recovery reads must not replace.
     pub(crate) preserve_editor_on_load: bool,
     pub(crate) library: PictogramLibrary,
@@ -1242,6 +1246,7 @@ impl Default for PictogramSettingsState {
             supported: None,
             loaded: false,
             loading: false,
+            load_failure: None,
             preserve_editor_on_load: false,
             library: PictogramLibrary::default(),
             selected_kind: PictogramKind::default(),
@@ -1260,6 +1265,18 @@ impl Default for PictogramSettingsState {
             editor_last_cell: None,
             upload_due: None,
         }
+    }
+}
+
+impl PictogramSettingsState {
+    pub(crate) fn needs_automatic_load(&self, generation: u64) -> bool {
+        !self.loaded
+            && !self.loading
+            && self.supported != Some(false)
+            && self
+                .load_failure
+                .as_ref()
+                .is_none_or(|(failed_generation, _)| *failed_generation != generation)
     }
 }
 
@@ -1669,6 +1686,103 @@ impl crate::hid::HidDevice {
 mod tests {
     use super::*;
 
+    fn backup_directory() -> tempfile::TempDir {
+        tempfile::tempdir_in(
+            std::env::var_os("ENTROPY_TEST_ARTIFACT_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn repeat_read_failure_is_terminal_only_for_its_connection_generation() {
+        let mut state = PictogramSettingsState::default();
+        state.supported = Some(true);
+        state.load_failure = Some((7, "firmware read error".into()));
+        assert!(!state.needs_automatic_load(7));
+        assert!(state.needs_automatic_load(8));
+        state.loading = true;
+        assert!(!state.needs_automatic_load(8));
+        state.loading = false;
+        state.loaded = true;
+        assert!(!state.needs_automatic_load(8));
+        state.loaded = false;
+        state.supported = Some(false);
+        assert!(!state.needs_automatic_load(8));
+    }
+
+    #[test]
+    fn repeat_slot_replacement_on_same_connection_preserves_other_slots() {
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        let mut library = PictogramLibrary::blank();
+        library.set(PictogramKind::TapDance, 2, &[0xA5; PICTOGRAM_BYTES]);
+        for bitmap in [[0xAA; PICTOGRAM_BYTES], [0x55; PICTOGRAM_BYTES]] {
+            library.set(PictogramKind::Macro, 0, &bitmap);
+            recorder.respond_with(test_pictogram_upload_responses(true, 0));
+            let progress = AtomicU32::new(0);
+            library = hid
+                .upload_pictogram_slot(library, PictogramKind::Macro, 0, &progress)
+                .unwrap();
+            assert_eq!(progress.load(Ordering::Relaxed), 1000);
+            assert_eq!(
+                library.bitmap(PictogramKind::Macro, 0),
+                Some(bitmap.as_slice())
+            );
+            assert_eq!(
+                library.bitmap(PictogramKind::TapDance, 2),
+                Some([0xA5; PICTOGRAM_BYTES].as_slice())
+            );
+            recorder.respond_with(test_pictogram_read_responses(&library));
+            assert_eq!(hid.load_pictograms(&progress).unwrap(), library);
+        }
+        let requests = recorder.requests();
+        assert_eq!(requests.iter().filter(|r| r[0] == CMD_SLOT_BEGIN).count(), 2);
+        assert_eq!(requests.iter().filter(|r| r[0] == CMD_SLOT_COMMIT).count(), 2);
+        // Both replacements start at packet zero without opening another owner.
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r[0] == CMD_SLOT_DATA && r[1..3] == [0, 0])
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn repeat_slot_retry_after_firmware_rejection_uses_same_connection() {
+        for rejected_command in [CMD_SLOT_BEGIN, CMD_SLOT_DATA, CMD_SLOT_COMMIT] {
+            let (hid, recorder) = crate::hid::HidDevice::test_device();
+            let mut confirmed = PictogramLibrary::blank();
+            confirmed.set(PictogramKind::Macro, 0, &[0xAA; PICTOGRAM_BYTES]);
+            let mut desired = confirmed.clone();
+            desired.set(PictogramKind::Macro, 0, &[0x55; PICTOGRAM_BYTES]);
+            let mut responses = test_pictogram_upload_responses(true, 0);
+            let rejected = responses
+                .iter()
+                .position(|r| r[0] == rejected_command)
+                .unwrap();
+            responses.truncate(rejected + 1);
+            responses[rejected][1] = 4; // Firmware FLASH_ERROR, not a disconnect.
+            recorder.respond_with(responses);
+            let progress = AtomicU32::new(0);
+            let error = hid
+                .upload_pictogram_slot(desired.clone(), PictogramKind::Macro, 0, &progress)
+                .unwrap_err();
+            assert!(error.to_string().contains("status 4"));
+            assert!(!crate::hid::is_disconnect_error(&error));
+            // Re-read actual storage before retrying an uncertain operation.
+            recorder.respond_with(test_pictogram_read_responses(&confirmed));
+            assert_eq!(hid.load_pictograms(&progress).unwrap(), confirmed);
+            recorder.respond_with(test_pictogram_upload_responses(true, 0));
+            let uploaded = hid
+                .upload_pictogram_slot(desired.clone(), PictogramKind::Macro, 0, &progress)
+                .unwrap();
+            assert_eq!(uploaded, desired);
+            assert_eq!(progress.load(Ordering::Relaxed), 1000);
+        }
+    }
+
     fn bitmap_pixel(bitmap: &[u8], x: usize, y: usize) -> bool {
         let index = y * PICTOGRAM_WIDTH + x;
         bitmap[index / 8] & (1 << (7 - index % 8)) != 0
@@ -1732,8 +1846,8 @@ mod tests {
         let filename = format!("device-{:08x}.ehp", crc32(&library.package));
         // Independent owners can back up identical packages concurrently without
         // sharing HOME or colliding in one global backup namespace.
-        let first = tempfile::tempdir().unwrap();
-        let second = tempfile::tempdir().unwrap();
+        let first = backup_directory();
+        let second = backup_directory();
         for root in [&first, &second] {
             let directory = root.path().join("backups");
             let (hid, recorder) = crate::hid::HidDevice::test_device();
@@ -1774,7 +1888,7 @@ mod tests {
         let mut library = PictogramLibrary::blank();
         library.refresh_checksums();
         for failure in 0..3 {
-            let root = tempfile::tempdir().unwrap();
+            let root = backup_directory();
             let directory = root.path().join("backups");
             let (hid, recorder) = crate::hid::HidDevice::test_device();
             if failure == 0 {

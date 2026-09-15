@@ -259,19 +259,41 @@ fn load_cached_qmk_settings(
 // Firmware builds may keep both their version and Vial definition unchanged.
 // Discover capabilities on each connection; the disk cache is only a fallback.
 #[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LiveQmkHostCapabilities {
+    extended_protocol: bool,
+    legacy_lcd_clock: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl LiveQmkHostCapabilities {
+    fn apply(self, layout: &mut KeyboardLayout) {
+        layout.live_features.extended_host_protocol = self.extended_protocol;
+        layout.live_features.time |= self.legacy_lcd_clock;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn current_qmk_settings(
+    definition: &serde_json::Value,
     query: impl FnOnce() -> anyhow::Result<Vec<u16>>,
     fallback: impl FnOnce() -> Option<Vec<u16>>,
-) -> (Vec<u16>, bool) {
+) -> (Vec<u16>, LiveQmkHostCapabilities) {
     match query() {
         Ok(settings) => {
-            let extended_host_protocol =
-                crate::qmk_hid_host::supports_extended_host_protocol(&settings);
-            (settings, extended_host_protocol)
+            let host = LiveQmkHostCapabilities {
+                extended_protocol: crate::qmk_hid_host::supports_extended_host_protocol(&settings),
+                legacy_lcd_clock: !is_rmk_vial_definition(definition)
+                    && crate::qmk_hid_host::supports_legacy_lcd_clock(definition, &settings),
+            };
+            (settings, host)
         }
         Err(error) => {
             log::warn!("live QMK capability query failed, using cached fallback: {error}");
-            (fallback().unwrap_or_default(), false)
+            (
+                fallback().unwrap_or_default(),
+                LiveQmkHostCapabilities::default(),
+            )
         }
     }
 }
@@ -635,10 +657,6 @@ impl EntropyApp {
             self.undo_stack.clear();
             self.device_about_info = None;
             self.next_battery_refresh_at = None;
-            // A still-connected device may merely be changing from a dedicated
-            // host-data handle to the UI-owned HID handle. Do not send shutdown
-            // values during that ownership hand-off.
-            self.clear_qmk_hid_host_bridges_for_reconnect();
             self.combo_visible_count = 1;
             self.combo_undo_stack.clear();
             self.combo_pick_target = None;
@@ -686,6 +704,9 @@ impl EntropyApp {
             self.reset_matrix_tester_state();
         }
 
+        // Both ordinary selection and Bluetooth retry must release this
+        // endpoint's aliases without stopping unrelated background displays.
+        self.clear_qmk_hid_host_bridges_for_reconnect();
         let (tx, rx) = mpsc::channel();
         let now = std::time::Instant::now();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -868,9 +889,10 @@ impl EntropyApp {
                         }
                     },
                 );
-                let (supported_qmk_settings, extended_host_protocol) = if vial_protocol >= 4 {
+                let (supported_qmk_settings, live_host_capabilities) = if vial_protocol >= 4 {
                     progress("Querying QMK settings…")?;
-                    let (settings, extended_host_protocol) = current_qmk_settings(
+                    let (settings, live_host_capabilities) = current_qmk_settings(
+                        &json,
                         || dev_conn.query_qmk_settings(),
                         || {
                             qmk_cache_context.as_ref().and_then(|context| {
@@ -882,16 +904,16 @@ impl EntropyApp {
                     if let Some(context) = qmk_cache_context.as_ref() {
                         save_cached_qmk_settings(cache_key, context, &settings);
                     }
-                    (settings, extended_host_protocol)
+                    (settings, live_host_capabilities)
                 } else {
-                    (Vec::new(), false)
+                    (Vec::new(), LiveQmkHostCapabilities::default())
                 };
                 let has_qmk_setting = |qsid: u16| supported_qmk_settings.contains(&qsid);
 
                 progress("Parsing keyboard layout…")?;
                 let mut layout = KeyboardLayout::from_vial_json(&json)
                     .map_err(|e| format!("Layout parse failed: {e}"))?;
-                layout.live_features.extended_host_protocol = extended_host_protocol;
+                live_host_capabilities.apply(&mut layout);
                 use_device_name_for_unnamed_layout(&mut layout, &dev.name);
 
                 progress("Reading layer count…")?;
@@ -1536,36 +1558,108 @@ mod tests {
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
     fn live_capabilities_replace_cache_even_when_firmware_version_is_unchanged() {
-        let (settings, extended) = current_qmk_settings(
+        let (settings, host) = current_qmk_settings(
+            &serde_json::Value::Null,
             || Ok((333..=371).collect()),
             || panic!("A successful discovery must not reuse pre-date cached capabilities"),
         );
         assert!(DATE_QSIDS.iter().all(|qsid| settings.contains(qsid)));
-        assert!(extended);
-        let (older, extended) =
-            current_qmk_settings(|| Ok(vec![333]), || Some((333..=371).collect()));
+        assert!(host.extended_protocol);
+        let (older, host) = current_qmk_settings(
+            &serde_json::Value::Null,
+            || Ok(vec![333]),
+            || Some((333..=371).collect()),
+        );
         assert!(
             !older.contains(&357),
             "Downgrades must also remove stale capabilities"
         );
-        assert!(!extended);
+        assert!(!host.extended_protocol);
     }
 
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
     fn capability_query_failure_can_use_previous_cache() {
         assert_eq!(
-            current_qmk_settings(|| Err(anyhow::anyhow!("offline")), || Some(vec![333])),
-            (vec![333], false)
+            current_qmk_settings(
+                &serde_json::Value::Null,
+                || Err(anyhow::anyhow!("offline")),
+                || Some(vec![333]),
+            ),
+            (vec![333], LiveQmkHostCapabilities::default())
         );
-        let (cached, extended) = current_qmk_settings(
+        let (cached, host) = current_qmk_settings(
+            &serde_json::Value::Null,
             || Err(anyhow::anyhow!("timeout after firmware downgrade")),
             || Some((333..=371).collect()),
         );
         assert!(cached.contains(&357));
         assert!(
-            !extended,
+            !host.extended_protocol,
             "a cache must never authorize BA/AF on this connection"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn legacy_lcd_definition() -> serde_json::Value {
+        serde_json::json!({
+            "name": "Legacy LCD keyboard",
+            "matrix": { "rows": 1, "cols": 1 },
+            "layouts": { "keymap": [["0,0"]] },
+            "settings": [{
+                "name": "LCD settings",
+                "fields": [
+                    { "qsid": 318, "type": "integer" },
+                    { "qsid": 319, "type": "select" }
+                ]
+            }]
+        })
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn legacy_lcd_clock_is_applied_only_from_fresh_qmk_capabilities() {
+        let definition = legacy_lcd_definition();
+        let mut layout = KeyboardLayout::from_vial_json(&definition).unwrap();
+        assert!(!layout.live_features.time);
+        let (_, host) = current_qmk_settings(
+            &definition,
+            || Ok(vec![318, 319]),
+            || panic!("fresh capabilities must win"),
+        );
+        host.apply(&mut layout);
+        assert!(layout.live_features.time);
+        assert!(!layout.live_features.extended_host_protocol);
+
+        let (cached, host) = current_qmk_settings(
+            &definition,
+            || Err(anyhow::anyhow!("device unavailable")),
+            || Some([318, 319].into_iter().chain(333..=371).collect()),
+        );
+        assert!(cached.contains(&318));
+        let mut layout = KeyboardLayout::from_vial_json(&definition).unwrap();
+        host.apply(&mut layout);
+        assert!(!layout.live_features.time);
+        assert!(!layout.live_features.extended_host_protocol);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn legacy_lcd_inference_preserves_rmk_and_explicit_live_features() {
+        let mut definition = legacy_lcd_definition();
+        definition["firmware"] = serde_json::json!({ "name": "RMK" });
+        let (_, host) = current_qmk_settings(&definition, || Ok(vec![318, 319]), || None);
+        let mut layout = KeyboardLayout::from_vial_json(&definition).unwrap();
+        host.apply(&mut layout);
+        assert!(
+            !layout.live_features.time,
+            "QMK LCD inference is not an RMK capability"
+        );
+        layout.live_features.time = true;
+        LiveQmkHostCapabilities::default().apply(&mut layout);
+        assert!(
+            layout.live_features.time,
+            "retain explicit backend metadata"
         );
     }
 

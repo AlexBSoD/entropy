@@ -194,6 +194,27 @@ impl crate::hid::HidDevice {
         progress: &AtomicU32,
         cancel: &AtomicBool,
     ) -> Result<Option<BackgroundUploadResult>> {
+        self.upload_standby_background_with_cache(
+            path,
+            fallback,
+            scale_mode,
+            progress,
+            cancel,
+            cache_background_package,
+        )
+    }
+
+    // Keep preparation, capability selection and transfer identical when a
+    // constructor-free native test injects its own cache destination.
+    pub(crate) fn upload_standby_background_with_cache(
+        &self,
+        path: &Path,
+        fallback: [u8; 3],
+        scale_mode: super::StandbyBackgroundScale,
+        progress: &AtomicU32,
+        cancel: &AtomicBool,
+        cache: impl FnOnce(&[u8]) -> Result<()>,
+    ) -> Result<Option<BackgroundUploadResult>> {
         if cancel.load(Ordering::Relaxed) {
             return Ok(None);
         }
@@ -265,7 +286,7 @@ impl crate::hid::HidDevice {
         )? {
             return Ok(None);
         }
-        if let Err(error) = cache_background_package(&prepared.package) {
+        if let Err(error) = cache(&prepared.package) {
             log::warn!("background preview cache: {error:#}");
         }
         progress.store(1000, Ordering::Relaxed);
@@ -1606,6 +1627,34 @@ mod tests {
             .collect::<std::collections::HashSet<_>>();
         assert!(unique.len() <= 63);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_background_upload_responses(commit_status: u8) -> Vec<[u8; 32]> {
+    // One still frame on the legacy-sized channel: never enumerate fast HID.
+    let mut query = [0; 32];
+    query[0] = CMD_QUERY;
+    query[2] = FORMAT_VERSION;
+    query[5..9].copy_from_slice(&((HEADER_SIZE + IMAGE_FRAME_SIZE) as u32).to_le_bytes());
+    query[13] = 1;
+    query[14..16].copy_from_slice(&DEFAULT_SPEED_PERCENT.to_le_bytes());
+    let mut begin = [0; 32];
+    begin[0] = CMD_BEGIN;
+    let mut replies = vec![query, begin];
+    let packets = (HEADER_SIZE + IMAGE_FRAME_SIZE).div_ceil(29);
+    for sequence in 0..packets {
+        if (sequence + 1) % STREAM_ACK_INTERVAL == 0 || sequence + 1 == packets {
+            let mut reply = [0; 32];
+            reply[0] = CMD_DATA;
+            reply[2..4].copy_from_slice(&next_sequence(sequence).to_le_bytes());
+            replies.push(reply);
+        }
+    }
+    let mut commit = [0; 32];
+    commit[0] = CMD_COMMIT;
+    commit[1] = commit_status;
+    replies.push(commit);
+    replies
 }
 
 #[cfg(test)]

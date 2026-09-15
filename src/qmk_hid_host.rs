@@ -53,6 +53,8 @@ const VOLUME_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const VOLUME_POLL_INTERVAL: Duration = Duration::from_millis(40);
 #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 const VOLUME_POLL_INTERVAL: Duration = Duration::from_millis(250);
+#[cfg(test)]
+mod clock_tests;
 #[cfg(any(target_os = "macos", test))]
 mod macos_volume;
 #[cfg(target_os = "macos")]
@@ -347,6 +349,43 @@ pub(crate) fn supports_extended_host_protocol(settings: &[u16]) -> bool {
         .all(|id| settings.contains(id))
 }
 
+/// Original Ergohaven LCD definitions advertise brightness/timeout, not a
+/// `liveFeatures` clock or a clock layout preset. Their home screen consumes
+/// legacy AA hours/minutes. Both definition fields and a fresh QMK setting list
+/// are required: firmware also lists 318/319 on boards without that LCD.
+/// This authorizes time only, never BA/AF, and is not an RMK capability probe.
+pub(crate) fn supports_legacy_lcd_clock(
+    definition: &serde_json::Value,
+    live_settings: &[u16],
+) -> bool {
+    let fields = [
+        (crate::app::DISPLAY_BRIGHTNESS_QSID, "integer"),
+        (crate::app::DISPLAY_TIMEOUT_QSID, "select"),
+    ];
+    fields.iter().all(|(id, _)| live_settings.contains(id))
+        && definition
+            .get("settings")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|tabs| {
+                tabs.iter().any(|tab| {
+                    tab.get("name").and_then(serde_json::Value::as_str) == Some("LCD settings")
+                        && tab
+                            .get("fields")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|declared| {
+                                fields.iter().all(|(id, kind)| {
+                                    declared.iter().any(|field| {
+                                        field.get("qsid").and_then(serde_json::Value::as_u64)
+                                            == Some(u64::from(*id))
+                                            && field.get("type").and_then(serde_json::Value::as_str)
+                                                == Some(*kind)
+                                    })
+                                })
+                            })
+                })
+            })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HostProtocol {
     // The selected connection already queried capabilities through its HID owner.
@@ -482,6 +521,7 @@ impl HostOutputLease {
 }
 
 pub struct QmkHidHostBridge {
+    device: crate::device::Device,
     mode: HostDataMode,
     protocol: HostProtocol,
     shared_output: Option<crate::hid::SharedHidOutput>,
@@ -556,6 +596,7 @@ impl QmkHidHostBridge {
             )
         });
         Self {
+            device,
             mode,
             protocol,
             shared_output,
@@ -574,12 +615,30 @@ impl QmkHidHostBridge {
         self.protocol
     }
 
+    /// Original enumeration bound to this bridge, not a stable device cache.
+    /// Registry reconciliation must check it against the current enumeration
+    /// with `Device::permits_hid_target` before preserving mode or ownership.
+    pub(crate) fn device(&self) -> &crate::device::Device {
+        &self.device
+    }
+
     pub fn mode(&self) -> HostDataMode {
         self.mode
     }
 
     pub fn uses_shared_output(&self) -> bool {
         self.shared_output.is_some()
+    }
+
+    pub(crate) fn matches_shared_output(
+        &self,
+        output: Option<&crate::hid::SharedHidOutput>,
+    ) -> bool {
+        match (self.shared_output.as_ref(), output) {
+            (Some(current), Some(next)) => current.shares_owner_with(next),
+            (None, None) => true,
+            _ => false,
+        }
     }
 
     /// Keep the display contents intact while replacing this bridge with a
@@ -2527,6 +2586,17 @@ pub(crate) fn test_bridge_holding_transport(
     });
     (
         QmkHidHostBridge {
+            device: crate::device::Device {
+                name: "stalled transport fixture".into(),
+                vendor_id: 0,
+                product_id: 0,
+                manufacturer: String::new(),
+                serial_number: String::new(),
+                bus_type: "USB".into(),
+                path: String::new(),
+                instance_token: String::new(),
+                firmware: crate::firmware::FirmwareProtocol::Vial,
+            },
             mode: HostDataMode::default(),
             protocol: HostProtocol::Discover,
             send_shutdown_on_drop: Arc::new(AtomicBool::new(true)),

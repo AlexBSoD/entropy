@@ -312,6 +312,11 @@ pub struct DeviceManager {
 }
 
 impl DeviceManager {
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self { devices: vec![] }
+    }
+
     pub fn new() -> Self {
         #[cfg(not(target_os = "macos"))]
         {
