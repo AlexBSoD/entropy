@@ -784,7 +784,10 @@ impl EntropyApp {
 
                 progress("Reading firmware version…")?;
                 let runtime_firmware_version = match dev_conn.get_firmware_version() {
-                    Ok(Some(version)) => Some(version),
+                    Ok(Some(version)) => {
+                        log::info!("Runtime firmware version: {version}");
+                        Some(version)
+                    }
                     Ok(None) => {
                         log::info!("Runtime firmware version is not reported");
                         None

@@ -5,6 +5,14 @@ All notable public changes to Entropy are tracked here.
 Entropy uses public release versions for GitHub releases and internal build versions
 for development history. The first public beta is `v0.1.0-beta.1`.
 
+## v0.3.21-rc.4 - Test Candidate
+
+### Fixes
+
+- Distinguish Linux USB device parents when Vial keyboards report the same generic serial, preserving separate background display owners while keeping composite interfaces exclusively reserved
+- Reject USB fallback to another physical parent with the same model and serial
+- Add metadata-only diagnostics for pictogram transfers, unlock operations and per-device clock workers; the reported second-upload hardware failure remains under investigation
+
 ## v0.3.21-rc.2 - Test Candidate
 
 ### Fixes

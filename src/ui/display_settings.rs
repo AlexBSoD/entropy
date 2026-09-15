@@ -4407,6 +4407,45 @@ mod pictogram_confirmation_tests {
     }
 
     #[test]
+    fn two_actual_picker_assignments_replace_the_same_slot_without_reconnect() {
+        let ctx = egui::Context::default();
+        let mut app = EntropyApp::new_inert_for_test();
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        app.hid_device = Some(hid);
+        app.display_settings.pictograms.supported = Some(true);
+        app.display_settings.pictograms.loaded = true;
+        let generation = app.connection_generation;
+        for byte in [0xAA, 0x55] {
+            recorder.respond_with(test_pictogram_upload_responses(true, 0));
+            let before = app.display_settings.pictograms.library.clone();
+            let bitmap = [byte; PICTOGRAM_BYTES];
+            assert!(app.assign_selected_pictogram(&ctx, Some(&bitmap)));
+            assert_eq!(app.display_settings.pictograms.library, before);
+            poll(&mut app, &ctx);
+            assert_eq!(app.connection_generation, generation);
+            assert!(app.hid_device.is_some());
+            assert!(app.display_settings.pictograms.loaded);
+            assert!(!app.display_settings.pictograms.loading);
+            assert!(!app.vial_hid_task_blocks_user_action());
+            assert_eq!(
+                app.display_settings
+                    .pictograms
+                    .library
+                    .bitmap(PictogramKind::Macro, 0),
+                Some(bitmap.as_slice())
+            );
+        }
+        assert_eq!(
+            recorder
+                .requests()
+                .iter()
+                .filter(|request| request[0] == 0xC9)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn rejected_slot_assignment_save_reset_and_full_upload_never_confirm_pending_library() {
         for action in 0..4 {
             let ctx = egui::Context::default();

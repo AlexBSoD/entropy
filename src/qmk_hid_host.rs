@@ -532,6 +532,26 @@ pub struct QmkHidHostBridge {
 }
 
 impl QmkHidHostBridge {
+    /// Registry-only seam: no worker, filesystem probe, desktop service or HID.
+    #[cfg(test)]
+    pub(crate) fn test_inert(
+        device: crate::device::Device,
+        mode: HostDataMode,
+        shared_output: Option<crate::hid::SharedHidOutput>,
+        protocol: HostProtocol,
+    ) -> Self {
+        Self {
+            device,
+            mode,
+            protocol,
+            shared_output,
+            control: Arc::new(BridgeTransportControl::default()),
+            thread: None,
+            send_shutdown_on_drop: Arc::new(AtomicBool::new(true)),
+            layout_snapshot: Arc::new(AtomicU8::new(u8::MAX)),
+        }
+    }
+
     pub fn start(
         device: crate::device::Device,
         mode: HostDataMode,
@@ -709,18 +729,24 @@ fn run_bridge(
                     control.publish(retirement)?;
                     Ok(device)
                 })
-                .map_err(|e| log::warn!("qmk-hid-host open failed: {e}"))
+                .map_err(|e| {
+                    log::warn!(
+                        "qmk-hid-host open failed: target={:?} error={e:#}",
+                        target.path
+                    )
+                })
                 .ok();
             if let Some(dev) = device.as_ref() {
                 extended_protocol = mode.time && protocol.extended(dev);
                 reset_layout_sync_state(&mut last_layout, &mut last_layout_full_send);
                 log::info!(
-                    "qmk-hid-host bridge started ({})",
+                    "qmk-hid-host bridge started ({}) target={:?} protocol={protocol:?} extended={extended_protocol}",
                     if device.as_ref().is_some_and(HostDataHid::uses_shared_output) {
                         "shared HID owner"
                     } else {
                         "dedicated HID owner"
-                    }
+                    },
+                    target.path,
                 );
             }
         }
@@ -751,7 +777,14 @@ fn run_bridge(
         if mode.time && last_time_poll.elapsed() >= Duration::from_secs(1) {
             last_time_poll = Instant::now();
             if extended_protocol {
-                write_failed |= write_payload(dev, &[DATA_HOST_STATUS, 1]).is_err();
+                let started = Instant::now();
+                let heartbeat = write_payload(dev, &[DATA_HOST_STATUS, 1]);
+                log::debug!(
+                    "qmk-hid-host heartbeat: target={:?} online=1 elapsed_ms={} result={heartbeat:?}",
+                    target.path,
+                    started.elapsed().as_millis(),
+                );
+                write_failed |= heartbeat.is_err();
             }
             let now = current_time_payload();
             if last_time != Some(now) {
@@ -821,7 +854,13 @@ fn run_bridge(
 
         if mode.media && last_media_poll.elapsed() >= Duration::from_secs(3) {
             last_media_poll = Instant::now();
+            let media_started = Instant::now();
             let (artist, title) = media_source().unwrap_or_default();
+            log::debug!(
+                "qmk-hid-host media query: target={:?} elapsed_ms={}",
+                target.path,
+                media_started.elapsed().as_millis()
+            );
             if stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -848,7 +887,10 @@ fn run_bridge(
         }
 
         if write_failed {
-            log::warn!("qmk-hid-host bridge write failed; reconnecting");
+            log::warn!(
+                "qmk-hid-host bridge write failed; reconnecting target={:?}",
+                target.path
+            );
             layout_snapshot.store(u8::MAX, Ordering::Relaxed);
             device = None;
             extended_protocol = false;
@@ -882,7 +924,11 @@ fn run_bridge(
     {
         set_media_snapshot(None);
     }
-    log::info!("qmk-hid-host bridge stopped");
+    log::info!(
+        "qmk-hid-host bridge stopped target={:?} shutdown_requested={}",
+        target.path,
+        send_shutdown.load(Ordering::Relaxed)
+    );
 }
 
 // Preview state belongs to this device bridge and is published only after

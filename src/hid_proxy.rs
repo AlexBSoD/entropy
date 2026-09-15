@@ -1058,6 +1058,52 @@ mod tests {
         empty_registry();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_helper_generic_usb_serial_separates_parents_but_keeps_retiring_alias_reserved() {
+        let _guard = serial_test();
+        let a_device = crate::device::test_usb_device("3-3", 5, 0x42);
+        let b_device = crate::device::test_usb_device("3-2", 9, 0x42);
+        let a = HidProxy::start(
+            &a_device,
+            spec("echo", None, Some(&a_device)),
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        let b = HidProxy::start(
+            &b_device,
+            spec("echo", None, Some(&b_device)),
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        assert_eq!(a.usb_send(&[11]).unwrap()[0], 11);
+        assert_eq!(b.usb_send(&[22]).unwrap()[0], 22);
+        assert!(reserve_target(&a.slot, b_device).is_err());
+
+        let mut alias = crate::device::test_usb_device("3-3", 6, 0x42);
+        alias.instance_token = alias.instance_token.replace(":1.1/", ":1.2/");
+        reserve_target(&a.slot, alias.clone()).unwrap();
+        alias.serial_number = "different-interface-hint".into();
+        assert!(HidProxy::start(&alias, spec("echo", None, None), TEST_TIMEOUT).is_err());
+        let slot = a.slot.clone();
+        let held = slot.child.lock().unwrap();
+        drop(a);
+        assert!(HidProxy::start(&alias, spec("echo", None, None), TEST_TIMEOUT).is_err());
+        let c_device = crate::device::test_usb_device("3-4", 10, 0x42);
+        let c = HidProxy::start(
+            &c_device,
+            spec("echo", None, Some(&c_device)),
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        assert_eq!(c.usb_send(&[33]).unwrap()[0], 33);
+        assert_eq!(b.usb_send(&[44]).unwrap()[0], 44);
+        drop(held);
+        drop(b);
+        drop(c);
+        empty_registry();
+    }
+
     #[test]
     fn real_helper_four_concurrent_startups_wait_for_credit_not_a_device_quota() {
         let _guard = serial_test();

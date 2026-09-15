@@ -5,6 +5,67 @@ use crate::hid::{HidDevice, SharedHidOutput, TestHidRecorder};
 use crate::qmk_hid_host::{test_start_bridge, HostDataMode, HostProtocol, QmkHidHostBridge};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+#[test]
+fn generic_usb_serial_handoff_keeps_distinct_parents_and_excludes_composite_alias() {
+    let a = crate::device::test_usb_device("3-3", 5, 0x42);
+    let b = crate::device::test_usb_device("3-2", 9, 0xA1);
+    let mut app = EntropyApp::new_inert_for_test();
+    app.device_manager
+        .replace_devices(vec![a.clone(), b.clone()]);
+    let mut starts = 0;
+    let mut factory = |device, mode, shared, protocol| {
+        starts += 1;
+        QmkHidHostBridge::test_inert(device, mode, shared, protocol)
+    };
+    attach(&mut app, 0, true);
+    app.sync_qmk_hid_host_bridges_with(&mut factory);
+    assert!(app.qmk_hid_hosts[&a.path].uses_shared_output());
+    // Exact production automatic mode, without calling OS media/volume APIs.
+    let mode = app.qmk_hid_hosts[&a.path].mode();
+    assert!(mode.time && mode.volume && mode.media);
+    loading(&mut app, 1);
+    app.clear_qmk_hid_host_bridges_for_reconnect_with(&mut factory);
+    assert!(
+        app.qmk_hid_hosts.contains_key(&a.path),
+        "old clock owner was discarded as a serial alias"
+    );
+    assert!(!app.qmk_hid_hosts[&a.path].uses_shared_output());
+    assert_eq!(
+        app.qmk_hid_hosts[&a.path].protocol(),
+        HostProtocol::Discover
+    );
+    assert_eq!(app.qmk_hid_hosts[&a.path].mode(), mode);
+    for _ in 0..3 {
+        app.sync_qmk_hid_host_bridges_with(&mut factory);
+        assert_eq!(app.qmk_hid_hosts.len(), 1);
+    }
+    app.device_manager
+        .replace_devices(vec![b.clone(), a.clone()]);
+    app.selected_device = Some(0);
+    app.sync_qmk_hid_host_bridges_with(&mut factory);
+    attach(&mut app, 0, true);
+    app.sync_qmk_hid_host_bridges_with(&mut factory);
+    assert_eq!(app.qmk_hid_hosts.len(), 2);
+    assert!(!app.qmk_hid_hosts[&a.path].uses_shared_output());
+    assert!(app.qmk_hid_hosts[&b.path].uses_shared_output());
+
+    let mut alias = crate::device::test_usb_device("3-3", 6, 0x42);
+    alias.instance_token = alias.instance_token.replace(":1.1/", ":1.2/");
+    app.device_manager.replace_devices(vec![a.clone(), alias]);
+    loading(&mut app, 1);
+    app.clear_qmk_hid_host_bridges_for_reconnect_with(&mut factory);
+    app.sync_qmk_hid_host_bridges_with(&mut factory);
+    assert!(
+        app.qmk_hid_hosts.is_empty(),
+        "same composite device must remain exclusively owned by the connector"
+    );
+    assert_eq!(
+        starts, 3,
+        "one shared A, one dedicated A and one shared B only"
+    );
+}
+
 fn device(name: &str, source: &str) -> Device {
     Device {
         name: name.into(),

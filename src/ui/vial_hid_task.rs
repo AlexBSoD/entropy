@@ -82,6 +82,21 @@ pub(super) enum VialHidOperation {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+impl VialHidOperation {
+    fn display_diagnostic_label(&self) -> Option<&'static str> {
+        match self {
+            Self::UnlockStart => Some("unlock-start"),
+            Self::UnlockPoll => Some("unlock-poll"),
+            Self::Lock => Some("lock"),
+            Self::PictogramLoad { .. } => Some("pictogram-load"),
+            Self::PictogramUpload { .. } => Some("pictogram-upload"),
+            Self::PictogramSlotUpload { .. } => Some("pictogram-slot-upload"),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 enum VialHidOutcome {
     UnlockStarted {
         unlocked: bool,
@@ -379,7 +394,11 @@ impl EntropyApp {
         ctx: &egui::Context,
         operation: VialHidOperation,
     ) -> VialHidTaskStart {
-        self.start_vial_hid_operation_with_runner(ctx, operation, run_vial_hid_operation_with_progress)
+        self.start_vial_hid_operation_with_runner(
+            ctx,
+            operation,
+            run_vial_hid_operation_with_progress,
+        )
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -415,7 +434,18 @@ impl EntropyApp {
         let worker_progress = progress.clone();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_cancel = cancel.clone();
+        let diagnostic_label = operation.display_diagnostic_label();
+        if let Some(label) = diagnostic_label {
+            let target = self
+                .selected_device
+                .and_then(|index| self.device_manager.devices().get(index))
+                .map(|device| device.path.as_str());
+            log::debug!(
+                "Display operation started: {label} generation={generation} target={target:?}"
+            );
+        }
         std::thread::spawn(move || {
+            let started = std::time::Instant::now();
             #[cfg(target_os = "macos")]
             let _hid_lock = hid_device.macos_hid_operation_lock();
 
@@ -430,6 +460,18 @@ impl EntropyApp {
                 .err()
                 .map(crate::hid::is_disconnect_error)
                 .unwrap_or(false);
+            if let Some(label) = diagnostic_label {
+                match &outcome {
+                    Ok(_) => log::debug!(
+                        "Display operation completed: {label} generation={generation} elapsed_ms={}",
+                        started.elapsed().as_millis(),
+                    ),
+                    Err(error) => log::debug!(
+                        "Display operation failed: {label} generation={generation} elapsed_ms={} disconnected={disconnected} error={error:#}",
+                        started.elapsed().as_millis(),
+                    ),
+                }
+            }
             let hid_device = (!disconnected).then_some(hid_device);
             let outcome = outcome.map_err(|error| format!("{error:#}"));
             let _ = sender.send(VialHidTaskResult {
@@ -1444,7 +1486,10 @@ mod repeat_lifecycle_tests {
                     > 256
             );
             let package = std::fs::read(directory.path().join("cache.ehbg")).unwrap();
-            assert_ne!(package, previous_package, "second upload must replace different pixels");
+            assert_ne!(
+                package, previous_package,
+                "second upload must replace different pixels"
+            );
             previous_package = package;
         }
         assert_eq!(saved, 2);
