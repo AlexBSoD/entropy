@@ -953,7 +953,13 @@ fn usb_send_max_attempts(transport: HidTransport, data: &[u8]) -> usize {
         || crate::rmk_native::is_rmk_native_capabilities_request(data)
         || is_optional_dynamic_entry_count_request(data)
         || data.first().is_some_and(|command| {
-            (0xB0..=0xB7).contains(command) || (0xD0..=0xD5).contains(command)
+            // Pictogram BEGIN/DATA/COMMIT are not idempotent: replay can
+            // restart storage, fail sequence checks, or reject a committed upload.
+            // Safe QUERY/READ commands retain the normal retry budget.
+            // A missing write ACK is an uncertain result, never permission to resend.
+            (0xB0..=0xB7).contains(command)
+                || matches!(command, 0xC2 | 0xC3 | 0xC4 | 0xC7 | 0xC8 | 0xC9)
+                || (0xD0..=0xD5).contains(command)
         })
     {
         1
@@ -1555,6 +1561,9 @@ fn response_matches_command(command: &[u8], resp: &[u8; MSG_LEN]) -> bool {
         | CMD_VIA_LIGHTING_SAVE
         | CMD_VIA_MACRO_SET_BUFFER => resp[0] == cmd,
         CMD_VIA_VIAL_PREFIX => response_matches_vial_command(command, resp),
+        // Keep reading for this command within the original deadline when a
+        // delayed response from another pictogram command arrives. Never resend.
+        0xC0..=0xCB => resp[0] == cmd,
         _ => true,
     }
 }
@@ -2069,6 +2078,33 @@ mod tests {
             usb_send_max_attempts(HidTransport::Usb, &dynamic_entry_read),
             VIAL_GUI_USB_RETRIES
         );
+    }
+
+    #[test]
+    fn pictogram_writes_are_one_shot_but_safe_reads_keep_retries() {
+        for command in [0xC2, 0xC3, 0xC4, 0xC7, 0xC8, 0xC9] {
+            assert_eq!(
+                usb_send_max_attempts(HidTransport::Usb, &[command]),
+                1,
+                "non-idempotent pictogram opcode 0x{command:02X} retried"
+            );
+        }
+        for command in [0xC0, 0xC1, 0xCA, 0xCB] {
+            assert_eq!(
+                usb_send_max_attempts(HidTransport::Usb, &[command]),
+                VIAL_GUI_USB_RETRIES,
+                "safe pictogram opcode 0x{command:02X} lost its retry budget"
+            );
+        }
+    }
+
+    #[test]
+    fn pictogram_response_requires_the_current_opcode() {
+        let mut response = [0u8; MSG_LEN];
+        response[0] = 0xC4;
+        assert!(!response_matches_command(&[0xC9], &response));
+        response[0] = 0xC9;
+        assert!(response_matches_command(&[0xC9], &response));
     }
 
     #[test]

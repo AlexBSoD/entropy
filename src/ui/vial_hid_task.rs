@@ -161,11 +161,14 @@ fn run_vial_hid_operation_with_progress(
 ) -> anyhow::Result<VialHidOutcome> {
     match operation {
         VialHidOperation::UnlockStart => {
-            let (unlocked, keys) = hid.get_unlock_status()?;
-            if !unlocked {
+            let (unlocked, in_progress, keys) = hid.get_unlock_status_with_progress()?;
+            if !unlocked && !in_progress {
                 hid.unlock_start()?;
             }
-            Ok(VialHidOutcome::UnlockStarted { unlocked, keys })
+            Ok(VialHidOutcome::UnlockStarted {
+                unlocked: unlocked && !in_progress,
+                keys,
+            })
         }
         VialHidOperation::UnlockPoll => {
             let (unlocked, in_progress, counter) = hid.unlock_poll()?;
@@ -1614,6 +1617,67 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         panic!("Vial HID task did not finish");
+    }
+
+    #[test]
+    fn pending_unlock_is_not_ready_and_does_not_restart_physical_hold() {
+        // The firmware keeps the unlocked bit set if another unlock sequence
+        // starts on an unlocked board, but gates normal commands while pending.
+        for unlocked in [0, 1] {
+            let (hid, recorder) = crate::hid::HidDevice::test_device();
+            let mut status = [0xFF; 32];
+            status[..4].copy_from_slice(&[unlocked, 1, 0, 0]);
+            recorder.respond_with([status]);
+            let result = run_vial_hid_operation(&hid, VialHidOperation::UnlockStart).unwrap();
+            assert!(matches!(
+                result,
+                VialHidOutcome::UnlockStarted {
+                    unlocked: false,
+                    ..
+                }
+            ));
+            assert_eq!(
+                recorder.requests().len(),
+                1,
+                "an existing physical hold must not receive another FE06"
+            );
+            assert!(recorder.requests()[0].starts_with(&[0xFE, 5]));
+        }
+    }
+
+    #[test]
+    fn pending_unlock_status_is_not_exposed_as_available_for_normal_commands() {
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        let mut status = [0xFF; 32];
+        status[..4].copy_from_slice(&[1, 1, 0, 0]);
+        recorder.respond_with([status]);
+        let (ready, keys) = hid.get_unlock_status().unwrap();
+        assert!(!ready);
+        assert_eq!(keys, vec![(0, 0)]);
+    }
+
+    #[test]
+    fn pending_unlock_poll_does_not_complete_on_the_unlocked_bit_alone() {
+        let mut app = EntropyApp::new_inert_for_test();
+        app.unlock_open = true;
+        app.finish_vial_unlock_start(false, vec![(0, 0)]);
+        app.finish_vial_unlock_poll(true, true, 10);
+        assert!(app.unlock_open && app.vial_unlock_polling);
+        assert_eq!(app.vial_unlocked, Some(false));
+        app.finish_vial_unlock_poll(true, false, 0);
+        assert!(!app.unlock_open && !app.vial_unlock_polling);
+        assert_eq!(app.vial_unlocked, Some(true));
+    }
+
+    #[test]
+    fn stopped_unlock_poll_releases_ui_instead_of_polling_forever() {
+        let mut app = EntropyApp::new_inert_for_test();
+        app.unlock_open = true;
+        app.finish_vial_unlock_start(false, vec![(0, 0)]);
+        app.finish_vial_unlock_poll(false, false, 0);
+        assert!(!app.unlock_open && !app.vial_unlock_polling);
+        assert_eq!(app.vial_unlocked, Some(false));
+        assert!(app.macro_auto_unlock_cancelled);
     }
 
     #[test]

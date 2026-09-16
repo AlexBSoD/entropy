@@ -1,5 +1,9 @@
 use super::*;
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "display_settings/pipeline_tests.rs"]
+mod pipeline_tests;
+
 const DISPLAY_BUTTON_STYLE_MAX_ID: u8 = 32;
 const DISPLAY_BUTTON_STYLE_IDS: [u8; 5] = [0, 6, 4, 2, 5];
 
