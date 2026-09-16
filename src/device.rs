@@ -1,6 +1,7 @@
 use crate::firmware::FirmwareProtocol;
 
 const ERGOHAVEN_VENDOR_ID: u16 = 0xE126;
+const ERGOHAVEN_DISPLAY_MACROPAD_PRODUCT_IDS: [u16; 2] = [0x0041, 0x0042];
 const K04_QUBE_PRODUCT_ID_START: u16 = 0x0071;
 const K04_QUBE_PRODUCT_ID_END: u16 = 0x0073;
 
@@ -63,6 +64,20 @@ impl Device {
             || (!self.instance_token.is_empty() && self.instance_token == other.instance_token)
         {
             return true;
+        }
+        // USB serials and Bluetooth addresses are unrelated namespaces, but
+        // Ergohaven's assigned product families are shared across transports.
+        // A display macropad and a different Ergohaven product therefore are
+        // proven distinct even when one endpoint is Bluetooth. This lets the
+        // macropad's already-open clock owner coexist with the selected board
+        // without weakening the conservative fallback for unknown products.
+        if self.vendor_id == ERGOHAVEN_VENDOR_ID
+            && other.vendor_id == ERGOHAVEN_VENDOR_ID
+            && self.product_id != 0
+            && other.product_id != 0
+            && self.is_ergohaven_display_macropad() != other.is_ergohaven_display_macropad()
+        {
+            return false;
         }
         if let (Some(left), Some(right)) = (
             self.linux_usb_physical_parent(),
@@ -305,6 +320,11 @@ impl Device {
         } else {
             format!("{display_name} (USB)")
         }
+    }
+
+    pub(crate) fn is_ergohaven_display_macropad(&self) -> bool {
+        self.vendor_id == ERGOHAVEN_VENDOR_ID
+            && ERGOHAVEN_DISPLAY_MACROPAD_PRODUCT_IDS.contains(&self.product_id)
     }
 
     fn is_k04_qube(&self) -> bool {
@@ -695,6 +715,25 @@ mod tests {
         assert!(bluetooth.may_share_physical_device(&usb));
     }
 
+    #[test]
+    fn display_macropad_and_other_ergohaven_bluetooth_product_are_distinct() {
+        let mut macropad = test_device("Usb", "usb-macropad");
+        macropad.vendor_id = ERGOHAVEN_VENDOR_ID;
+        macropad.product_id = 0x0042;
+        macropad.serial_number = "vial:f64c2b3c".into();
+        let mut bluetooth = test_device("Bluetooth", "bluetooth-keyboard");
+        bluetooth.vendor_id = ERGOHAVEN_VENDOR_ID;
+        bluetooth.product_id = 0x00A1;
+        bluetooth.serial_number = "AA:BB:CC:DD:EE:FF".into();
+
+        assert!(!macropad.may_share_physical_device(&bluetooth));
+        assert!(!bluetooth.may_share_physical_device(&macropad));
+
+        bluetooth.product_id = 0x0041;
+        assert!(macropad.may_share_physical_device(&bluetooth));
+        assert!(bluetooth.may_share_physical_device(&macropad));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn missing_or_path_only_hidraw_instance_fails_closed() {
@@ -972,7 +1011,7 @@ mod usb_parent_tests {
 
     #[test]
     fn unknown_usb_parent_and_bluetooth_keep_conservative_reservations() {
-        let a = test_usb_device("3-3", 5, 0x42);
+        let a = test_usb_device("3-3", 5, 0x43);
         let original = test_usb_device("3-2", 9, 0xA1);
         for token in [
             "",

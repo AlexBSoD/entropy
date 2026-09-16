@@ -5,6 +5,12 @@ All notable public changes to Entropy are tracked here.
 Entropy uses public release versions for GitHub releases and internal build versions
 for development history. The first public beta is `v0.1.0-beta.1`.
 
+## v0.3.21-rc.7 - Test Candidate
+
+### Fixes
+
+- Keep the M4CR0Pad clock alive when Entropy switches to a different Ergohaven keyboard over Bluetooth by recognizing the devices as separate product families across transports
+
 ## v0.3.21-rc.6 - Test Candidate
 
 ### Fixes

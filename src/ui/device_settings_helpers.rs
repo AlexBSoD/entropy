@@ -480,8 +480,7 @@ impl EntropyApp {
         }
 
         let name = device.name.to_ascii_lowercase();
-        let ergohaven_macropad_display =
-            device.vendor_id == 0xE126 && matches!(device.product_id, 0x0041 | 0x0042);
+        let ergohaven_macropad_display = device.is_ergohaven_display_macropad();
 
         ergohaven_macropad_display || name.contains("m4cr0pad v2") || name.contains("m4cr0pad v3")
     }

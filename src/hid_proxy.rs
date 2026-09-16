@@ -1061,6 +1061,30 @@ mod tests {
         empty_registry();
     }
 
+    #[test]
+    fn real_helper_allows_display_macropad_with_other_ergohaven_bluetooth_product() {
+        let _guard = serial_test();
+        let mut macropad = device("macropad");
+        macropad.vendor_id = 0xE126;
+        macropad.product_id = 0x0042;
+        macropad.serial_number = "vial:f64c2b3c".into();
+        let mut bluetooth = device("bluetooth");
+        bluetooth.vendor_id = 0xE126;
+        bluetooth.product_id = 0x00A1;
+        bluetooth.serial_number = "AA:BB:CC:DD:EE:FF".into();
+        bluetooth.bus_type = "Bluetooth".into();
+
+        let macropad =
+            HidProxy::start(&macropad, spec("echo", None, None), Duration::from_secs(3)).unwrap();
+        let bluetooth =
+            HidProxy::start(&bluetooth, spec("echo", None, None), Duration::from_secs(3)).unwrap();
+
+        assert_eq!(macropad.usb_send(&[11]).unwrap()[0], 11);
+        assert_eq!(bluetooth.usb_send(&[22]).unwrap()[0], 22);
+        drop((macropad, bluetooth));
+        empty_registry();
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn real_helper_generic_usb_serial_separates_parents_but_keeps_retiring_alias_reserved() {

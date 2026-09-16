@@ -253,6 +253,46 @@ fn production_selection_moves_old_usb_owner_into_existing_background_bridge() {
 }
 
 #[test]
+fn production_selection_to_bluetooth_keeps_macropad_owner_in_background() {
+    let mut macropad = device("M4CR0Pad v3", "src/qmk_hid_host.rs");
+    macropad.vendor_id = 0xE126;
+    macropad.product_id = 0x0042;
+    macropad.manufacturer = "Ergohaven".into();
+    macropad.serial_number = "vial:f64c2b3c".into();
+
+    let mut bluetooth_keyboard = device("K:03 Pro", "src/hid.rs");
+    bluetooth_keyboard.vendor_id = 0xE126;
+    bluetooth_keyboard.product_id = 0x00A1;
+    bluetooth_keyboard.manufacturer = "Ergohaven".into();
+    bluetooth_keyboard.serial_number = "AA:BB:CC:DD:EE:FF".into();
+    bluetooth_keyboard.bus_type = "Bluetooth".into();
+
+    let mut app = EntropyApp::new_inert_for_test();
+    app.device_manager
+        .replace_devices(vec![macropad.clone(), bluetooth_keyboard.clone()]);
+    attach(&mut app, 0, true);
+    app.sync_qmk_hid_host_bridges_with(&mut |device, mode, shared, protocol| {
+        QmkHidHostBridge::test_inert(device, mode, shared, protocol)
+    });
+    assert!(app.qmk_hid_hosts[&macropad.path].uses_shared_output());
+
+    let (launch, requests) = std::sync::mpsc::channel();
+    app.test_connect_requests = Some(launch);
+    app.start_connect(1);
+    let (requested, _events) = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    assert_eq!(requested.path, bluetooth_keyboard.path);
+    assert!(app.hid_device.is_none());
+    assert!(app.shared_hid_output.is_none());
+    assert!(app.qmk_hid_hosts.contains_key(&macropad.path));
+    assert!(!app.qmk_hid_hosts[&macropad.path].uses_shared_output());
+    assert_eq!(
+        app.qmk_hid_hosts[&macropad.path].protocol(),
+        HostProtocol::Discover
+    );
+}
+
+#[test]
 fn pending_new_selection_cannot_open_cancelled_loading_endpoint_in_background() {
     let mut a = device("A", "src/qmk_hid_host.rs");
     a.name = "M4CR0Pad v3".into();
