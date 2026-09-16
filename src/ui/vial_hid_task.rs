@@ -834,6 +834,7 @@ impl EntropyApp {
                 self.display_settings.pictograms.supported = Some(true);
                 self.display_settings.pictograms.loaded = true;
                 self.display_settings.pictograms.loading = false;
+                self.display_settings.pictograms.saving = false;
                 self.display_settings.pictograms.library = library;
                 self.status_msg = crate::i18n::tr_catalog(
                     self.app_settings.language,
@@ -1008,6 +1009,7 @@ impl EntropyApp {
                 // storage read preserves that editor and confirms the actual bytes.
                 pictograms.loaded = false;
                 pictograms.loading = false;
+                pictograms.saving = false;
                 pictograms.load_failure = None;
                 pictograms.preserve_editor_on_load = true;
                 pictograms.library = PictogramLibrary::default();
@@ -1061,6 +1063,7 @@ impl EntropyApp {
                 draft.supported = None;
                 draft.loaded = false;
                 draft.loading = false;
+                draft.saving = false;
                 draft.library = PictogramLibrary::default();
                 draft
             });

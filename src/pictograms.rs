@@ -1214,7 +1214,10 @@ pub(crate) fn builtin_pictogram_index(bitmap: &[u8]) -> Option<usize> {
 pub(crate) struct PictogramSettingsState {
     pub(crate) supported: Option<bool>,
     pub(crate) loaded: bool,
+    /// The confirmed library is being read from the keyboard.
     pub(crate) loading: bool,
+    /// A confirmed library remains renderable while one slot is saved.
+    pub(crate) saving: bool,
     // Terminal read outcome for this connection. Keep the error separate from
     // firmware support: a failed recovery read must not become an automatic
     // per-render retry, nor make a supported device appear unsupported.
@@ -1246,6 +1249,7 @@ impl Default for PictogramSettingsState {
             supported: None,
             loaded: false,
             loading: false,
+            saving: false,
             load_failure: None,
             preserve_editor_on_load: false,
             library: PictogramLibrary::default(),
@@ -1269,6 +1273,10 @@ impl Default for PictogramSettingsState {
 }
 
 impl PictogramSettingsState {
+    pub(crate) fn busy(&self) -> bool {
+        self.loading || self.saving
+    }
+
     pub(crate) fn needs_automatic_load(&self, generation: u64) -> bool {
         !self.loaded
             && !self.loading

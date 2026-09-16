@@ -5,6 +5,14 @@ All notable public changes to Entropy are tracked here.
 Entropy uses public release versions for GitHub releases and internal build versions
 for development history. The first public beta is `v0.1.0-beta.1`.
 
+## v0.3.21-rc.6 - Test Candidate
+
+### Fixes
+
+- Keep pictogram slot commits on firmware 4.0.6 within their flash-write response window instead of treating them as a disconnect and reloading the whole keyboard
+- Keep macropad clocks alive when selecting another physical keyboard by transferring the existing HID owner directly to the background host-data bridge
+- Keep pictogram editing visible during a slot save and distinguish saving one slot from reading the full library
+
 ## v0.3.21-rc.4 - Test Candidate
 
 ### Fixes

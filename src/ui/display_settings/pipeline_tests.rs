@@ -76,6 +76,17 @@ fn frame(app: &mut EntropyApp, ctx: &egui::Context, events: Vec<egui::Event>) ->
         },
     )
 }
+fn rendered_texts(output: &egui::FullOutput) -> Vec<String> {
+    output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn text_position(output: &egui::FullOutput, label: &str) -> egui::Pos2 {
     output
         .shapes
@@ -134,6 +145,25 @@ fn finish(app: &mut EntropyApp, ctx: &egui::Context) {
 }
 
 #[test]
+fn slot_save_keeps_pictogram_page_visible_without_library_loading_message() {
+    let (mut app, ctx, _recorder) = app(true);
+    click_label(&mut app, &ctx, "Пиктограммы");
+    app.display_settings.pictograms.saving = true;
+
+    let output = frame(&mut app, &ctx, vec![]);
+    let texts = rendered_texts(&output);
+    assert!(
+        texts.iter().any(|text| text == "Редактор 35 × 35"),
+        "rendered texts: {texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|text| text == "Чтение пиктограмм…"),
+        "rendered texts: {texts:?}"
+    );
+    assert!(!matches!(app.connect_state, ConnectState::Loading { .. }));
+}
+
+#[test]
 fn full_ui_repeated_assignments_use_actual_popup_without_reunlock() {
     for initially_unlocked in [false, true] {
         let (mut app, ctx, recorder) = app(initially_unlocked);
@@ -172,10 +202,11 @@ fn full_ui_repeated_assignments_use_actual_popup_without_reunlock() {
                 app.vial_hid_task_active(),
                 "actual picker did not submit upload on assignment {index}"
             );
+            assert!(app.display_settings.pictograms.saving);
+            assert!(!app.display_settings.pictograms.loading);
             finish(&mut app, &ctx);
-            assert!(
-                app.display_settings.pictograms.loaded && !app.display_settings.pictograms.loading
-            );
+            assert!(app.display_settings.pictograms.loaded);
+            assert!(!app.display_settings.pictograms.busy());
             assert_eq!(app.connection_generation, generation);
             assert_eq!(app.vial_unlocked, Some(initially_unlocked));
             assert!(!app.unlock_open && !app.vial_unlock_polling);
@@ -188,12 +219,17 @@ fn full_ui_repeated_assignments_use_actual_popup_without_reunlock() {
             );
         }
         let requests = recorder.requests();
-        assert_eq!(
-            requests.iter().filter(|request| request[0] == 0xC9).count(),
-            3
-        );
-        assert!(requests
-            .iter()
-            .all(|request| !request.starts_with(&[0xFE, 6]) && !request.starts_with(&[0xFE, 8])));
+        assert_eq!(requests.len(), 27);
+        for transaction in requests.chunks_exact(9) {
+            assert_eq!(transaction[0][0], 0xC0);
+            assert_eq!(transaction[1][0], 0xC7);
+            assert!(transaction[2..8].iter().all(|request| request[0] == 0xC8));
+            assert_eq!(transaction[8][0], 0xC9);
+        }
+        assert!(requests.iter().all(|request| {
+            !matches!(request[0], 0xC1 | 0xC2 | 0xC3 | 0xC4 | 0xC6 | 0xCA | 0xCB)
+                && !request.starts_with(&[0xFE, 6])
+                && !request.starts_with(&[0xFE, 8])
+        }));
     }
 }

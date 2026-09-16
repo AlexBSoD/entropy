@@ -541,9 +541,36 @@ fn command_exists(program: &str) -> bool {
 struct BridgeTransportControl {
     stop: AtomicBool,
     retirement: std::sync::Mutex<Option<crate::hid::HidRetirement>>,
+    selected_handoff: std::sync::Mutex<Option<(crate::hid::HidDevice, bool)>>,
 }
 
 impl BridgeTransportControl {
+    fn handoff_selected(
+        &self,
+        hid: crate::hid::HidDevice,
+        extended: bool,
+    ) -> Result<(), crate::hid::HidDevice> {
+        if self.stop.load(Ordering::Acquire) {
+            return Err(hid);
+        }
+        let mut handoff = self
+            .selected_handoff
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.stop.load(Ordering::Acquire) || handoff.is_some() {
+            return Err(hid);
+        }
+        *handoff = Some((hid, extended));
+        Ok(())
+    }
+
+    fn take_selected_handoff(&self) -> Option<(crate::hid::HidDevice, bool)> {
+        self.selected_handoff
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
+
     fn publish(&self, token: Option<crate::hid::HidRetirement>) -> anyhow::Result<()> {
         if self.stop.load(Ordering::Acquire) {
             if let Some(token) = token {
@@ -569,6 +596,10 @@ impl BridgeTransportControl {
 
     fn retire(&self) {
         self.stop.store(true, Ordering::Release);
+        self.selected_handoff
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
         if let Ok(mut token) = self.retirement.try_lock() {
             if let Some(token) = token.take() {
                 token.retire();
@@ -931,6 +962,25 @@ impl QmkHidHostBridge {
         }
     }
 
+    /// Move the selected connection's exact HID owner into this background
+    /// bridge. This avoids dropping and reopening the macropad during a switch
+    /// to a different physical keyboard, so its host-status lease never gaps.
+    pub(crate) fn adopt_selected_hid(
+        &mut self,
+        hid: crate::hid::HidDevice,
+    ) -> Result<(), crate::hid::HidDevice> {
+        let extended = matches!(self.protocol, HostProtocol::Selected(true));
+        if self.shared_output.is_none() {
+            return Err(hid);
+        }
+        self.control.handoff_selected(hid, extended)?;
+        self.shared_output = None;
+        // The transferred handle keeps its selected capability below. Any
+        // later reopen must discover capabilities from the replacement owner.
+        self.protocol = HostProtocol::Discover;
+        Ok(())
+    }
+
     /// Keep the display contents intact while replacing this bridge with a
     /// different HID owner for the same, still-connected device.
     pub fn suppress_shutdown(&mut self) {
@@ -955,7 +1005,7 @@ impl Drop for QmkHidHostBridge {
 fn run_bridge(
     target: crate::device::Device,
     mode: HostDataMode,
-    shared_output: Option<crate::hid::SharedHidOutput>,
+    mut shared_output: Option<crate::hid::SharedHidOutput>,
     control: Arc<BridgeTransportControl>,
     layout_snapshot: Arc<AtomicU8>,
     mut protocol: HostProtocol,
@@ -984,6 +1034,35 @@ fn run_bridge(
     let mut desktop_subscription = None;
 
     while !stop.load(Ordering::Relaxed) {
+        if let Some((hid, selected_extended)) = control.take_selected_handoff() {
+            // This worker now owns a dedicated transport. Never fall back to
+            // the old selected connection's weak shared output after a later
+            // write failure; reopen a fresh dedicated owner for this target.
+            shared_output = None;
+            let retirement = hid.retirement_handle();
+            if control.publish(retirement).is_err() {
+                break;
+            }
+            device = Some(HostDataHid::Dedicated(hid));
+            extended_protocol = mode.time && selected_extended;
+            protocol = HostProtocol::Discover;
+            last_time = None;
+            last_volume = None;
+            last_layout = None;
+            last_artist.clear();
+            last_title.clear();
+            last_time_poll = Instant::now() - Duration::from_secs(60);
+            last_volume_poll = Instant::now() - Duration::from_secs(60);
+            last_layout_poll = Instant::now() - Duration::from_secs(60);
+            last_media_poll = Instant::now() - Duration::from_secs(60);
+            last_media_full_send = Instant::now() - Duration::from_secs(60);
+            reset_layout_sync_state(&mut last_layout, &mut last_layout_full_send);
+            log::info!(
+                "qmk-hid-host bridge adopted selected HID owner target={:?} extended={extended_protocol}",
+                target.path,
+            );
+        }
+
         if device.is_none() && last_open_attempt.elapsed() >= Duration::from_secs(2) {
             if stop.load(Ordering::Relaxed) {
                 break;

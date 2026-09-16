@@ -197,6 +197,62 @@ fn loading(app: &mut EntropyApp, index: usize) {
 }
 
 #[test]
+fn selected_clock_bridge_adopts_exact_hid_owner_without_a_lease_gap() {
+    let target = device("A", "src/qmk_hid_host.rs");
+    let (hid, recorder) = HidDevice::test_device();
+    let shared = hid.shared_output().unwrap();
+    let mut bridge = test_start_bridge(
+        target,
+        time_mode(),
+        Some(shared),
+        None,
+        HostProtocol::Selected(true),
+        || None,
+    );
+    wait(&recorder, 0, 0xba, Some(1));
+
+    let before = recorder.requests().len();
+    bridge
+        .adopt_selected_hid(hid)
+        .unwrap_or_else(|_| panic!("selected HID owner was not adopted"));
+
+    assert!(!bridge.uses_shared_output());
+    assert_eq!(bridge.protocol(), HostProtocol::Discover);
+    wait(&recorder, before, 0xba, Some(1));
+    no_clear(&recorder);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn production_selection_moves_old_usb_owner_into_existing_background_bridge() {
+    let a = crate::device::test_usb_device("3-3", 5, 0x42);
+    let b = crate::device::test_usb_device("3-2", 9, 0xA1);
+    let mut app = EntropyApp::new_inert_for_test();
+    app.device_manager
+        .replace_devices(vec![a.clone(), b.clone()]);
+    attach(&mut app, 0, true);
+    app.sync_qmk_hid_host_bridges_with(&mut |device, mode, shared, protocol| {
+        QmkHidHostBridge::test_inert(device, mode, shared, protocol)
+    });
+    assert!(app.qmk_hid_hosts[&a.path].uses_shared_output());
+
+    let (launch, requests) = std::sync::mpsc::channel();
+    app.test_connect_requests = Some(launch);
+    app.start_connect(1);
+    let (requested, _events) = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    assert_eq!(requested.path, b.path);
+    assert!(app.hid_device.is_none());
+    assert!(app.shared_hid_output.is_none());
+    assert!(app.qmk_hid_hosts.contains_key(&a.path));
+    assert!(!app.qmk_hid_hosts[&a.path].uses_shared_output());
+    assert_eq!(
+        app.qmk_hid_hosts[&a.path].protocol(),
+        HostProtocol::Discover
+    );
+}
+
+#[test]
 fn pending_new_selection_cannot_open_cancelled_loading_endpoint_in_background() {
     let mut a = device("A", "src/qmk_hid_host.rs");
     a.name = "M4CR0Pad v3".into();

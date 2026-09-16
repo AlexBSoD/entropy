@@ -14,7 +14,10 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(12);
-const USB_COMMAND_TIMEOUT: Duration = Duration::from_millis(1_500);
+// Must exceed the longest helper-side USB command. Pictogram SLOT_COMMIT may
+// synchronously program flash for up to 2.5 s; queued host-data writes share the
+// same ordered owner and must not retire it while that commit is still active.
+const USB_COMMAND_TIMEOUT: Duration = Duration::from_secs(4);
 const BLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
 const REAPER_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_FRAME: usize = 4_096;

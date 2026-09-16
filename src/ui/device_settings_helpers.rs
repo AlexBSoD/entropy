@@ -1999,6 +1999,39 @@ impl EntropyApp {
         }
     }
 
+    /// Transfer the exact selected HID owner to its existing clock bridge when
+    /// the UI moves to a different physical keyboard. Reopening is both slower
+    /// and creates a gap in the firmware's five-second host-status lease.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn handoff_selected_qmk_hid_host_bridge(
+        &mut self,
+        previous: &Device,
+        next: &Device,
+    ) -> bool {
+        if previous.may_share_physical_device(next) {
+            return false;
+        }
+        let Some(bridge) = self.qmk_hid_hosts.get_mut(&previous.path) else {
+            return false;
+        };
+        if !bridge.uses_shared_output() || !qmk_bridge_matches_device(bridge, previous) {
+            return false;
+        }
+        let Some(hid) = self.hid_device.take() else {
+            return false;
+        };
+        match bridge.adopt_selected_hid(hid) {
+            Ok(()) => {
+                self.shared_hid_output = None;
+                true
+            }
+            Err(hid) => {
+                self.hid_device = Some(hid);
+                false
+            }
+        }
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn clear_qmk_hid_host_bridges_for_reconnect(&mut self) {
         self.clear_qmk_hid_host_bridges_for_reconnect_with(

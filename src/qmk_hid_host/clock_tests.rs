@@ -465,3 +465,62 @@ fn selected_to_dedicated_clock_handoff_keeps_heartbeat_during_same_stalled_query
     release.send(()).unwrap();
     done.recv_timeout(Duration::from_secs(5)).unwrap();
 }
+
+#[test]
+fn adopted_clock_bridge_reopens_dedicated_after_transport_loss() {
+    let mode = HostDataMode {
+        time: true,
+        ..Default::default()
+    };
+    let (selected, selected_reports) = crate::hid::HidDevice::test_device();
+    let (adopted, adopted_reports) = crate::hid::HidDevice::test_device();
+    let (replacement, replacement_reports) = crate::hid::HidDevice::test_device();
+    let mut capability = [0xff; 32];
+    for (slot, id) in (357u16..=371).enumerate() {
+        capability[slot * 2..slot * 2 + 2].copy_from_slice(&id.to_le_bytes());
+    }
+    replacement_reports.respond_with([capability]);
+
+    let path = std::env::temp_dir().join(format!(
+        "entropy-adopted-reopen-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(&path, []).unwrap();
+    let mut bridge_target = target("adopted-reopen");
+    bridge_target.path = path.to_string_lossy().into_owned();
+
+    let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+    let mut replacement = Some(replacement);
+    let mut bridge = QmkHidHostBridge::start_with_sources(
+        bridge_target,
+        mode,
+        selected.shared_output(),
+        HostProtocol::Selected(true),
+        || None,
+        move |_, shared| {
+            opened_tx.send(shared.is_some()).unwrap();
+            match shared {
+                Some(output) => Ok(HostDataHid::Shared(output.clone())),
+                None => Ok(HostDataHid::Dedicated(
+                    replacement.take().expect("replacement owner exhausted"),
+                )),
+            }
+        },
+    );
+
+    assert!(opened_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+    await_report(&selected_reports, 0, DATA_DATE);
+    assert!(bridge.adopt_selected_hid(adopted).is_ok());
+    await_report(&adopted_reports, 0, DATA_HOST_STATUS);
+    std::fs::remove_file(&path).unwrap();
+
+    assert!(
+        !opened_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "worker retried the expired selected shared owner after handoff"
+    );
+    stop_and_join(&mut bridge);
+}

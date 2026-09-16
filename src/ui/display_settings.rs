@@ -1756,7 +1756,7 @@ impl EntropyApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn apply_current_pictogram(&mut self, ctx: &egui::Context) -> bool {
-        if !self.display_settings.pictograms.loaded || self.display_settings.pictograms.loading {
+        if !self.display_settings.pictograms.loaded || self.display_settings.pictograms.busy() {
             return false;
         }
         let accent = self.display_settings.color;
@@ -1788,7 +1788,7 @@ impl EntropyApp {
             ),
             super::vial_hid_task::VialHidTaskStart::Started
         ) {
-            self.display_settings.pictograms.loading = true;
+            self.display_settings.pictograms.saving = true;
             self.display_settings.pictograms.upload_due = None;
             true
         } else {
@@ -1798,7 +1798,7 @@ impl EntropyApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn assign_selected_pictogram(&mut self, ctx: &egui::Context, bitmap: Option<&[u8]>) -> bool {
-        if !self.display_settings.pictograms.loaded || self.display_settings.pictograms.loading {
+        if !self.display_settings.pictograms.loaded || self.display_settings.pictograms.busy() {
             return false;
         }
         let pictograms = &self.display_settings.pictograms;
@@ -1822,7 +1822,7 @@ impl EntropyApp {
             ),
             super::vial_hid_task::VialHidTaskStart::Started
         ) {
-            self.display_settings.pictograms.loading = true;
+            self.display_settings.pictograms.saving = true;
             true
         } else {
             false
@@ -1899,7 +1899,7 @@ impl EntropyApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn reset_current_pictogram(&mut self, ctx: &egui::Context) -> bool {
-        if !self.display_settings.pictograms.loaded || self.display_settings.pictograms.loading {
+        if !self.display_settings.pictograms.loaded || self.display_settings.pictograms.busy() {
             return false;
         }
         let pictograms = &self.display_settings.pictograms;
@@ -1918,7 +1918,7 @@ impl EntropyApp {
             super::vial_hid_task::VialHidTaskStart::Started
         ) {
             let pictograms = &mut self.display_settings.pictograms;
-            pictograms.loading = true;
+            pictograms.saving = true;
             pictograms.source_levels.clear();
             pictograms.source_file_name.clear();
             pictograms.selected_builtin = None;
@@ -2060,7 +2060,7 @@ impl EntropyApp {
     ) {
         let lang = self.app_settings.language;
         let busy =
-            self.display_settings.pictograms.loading || self.vial_hid_task_blocks_user_action();
+            self.display_settings.pictograms.busy() || self.vial_hid_task_blocks_user_action();
         let supported = self.display_settings.pictograms.supported != Some(false);
         let kind_labels = vec![
             crate::i18n::tr_catalog(lang, "display_settings.pictogram_macros").to_owned(),
@@ -2444,7 +2444,7 @@ impl EntropyApp {
     fn draw_pictogram_footer(&mut self, ui: &mut egui::Ui, scale: f32) {
         let lang = self.app_settings.language;
         let busy =
-            self.display_settings.pictograms.loading || self.vial_hid_task_blocks_user_action();
+            self.display_settings.pictograms.busy() || self.vial_hid_task_blocks_user_action();
         let names: Vec<String> = BUILTIN_PICTOGRAM_KEYS
             .iter()
             .map(|k| crate::i18n::tr_catalog(lang, k).to_owned())
@@ -2565,7 +2565,7 @@ impl EntropyApp {
     ) {
         let lang = self.app_settings.language;
         let busy =
-            self.display_settings.pictograms.loading || self.vial_hid_task_blocks_user_action();
+            self.display_settings.pictograms.busy() || self.vial_hid_task_blocks_user_action();
         let supported = self.display_settings.pictograms.supported != Some(false);
         ui.set_min_width(list.row_content_width);
 
@@ -2863,8 +2863,10 @@ impl EntropyApp {
             }
         });
         ui.label(
-            RichText::new(if busy {
+            RichText::new(if self.display_settings.pictograms.loading {
                 crate::i18n::tr_catalog(lang, "display_settings.pictograms_loading")
+            } else if self.display_settings.pictograms.saving {
+                crate::i18n::tr_catalog(lang, "display_settings.pictograms_saving")
             } else {
                 crate::i18n::tr_catalog(lang, "display_settings.pictogram_auto_apply")
             })
@@ -2884,7 +2886,7 @@ impl EntropyApp {
     ) {
         let lang = self.app_settings.language;
         let busy =
-            self.display_settings.pictograms.loading || self.vial_hid_task_blocks_user_action();
+            self.display_settings.pictograms.busy() || self.vial_hid_task_blocks_user_action();
         let supported = self.display_settings.pictograms.supported != Some(false);
         let kind = self.display_settings.pictograms.selected_kind;
         let slot_count = match kind {
@@ -2900,8 +2902,10 @@ impl EntropyApp {
 
         let status = if !supported {
             crate::i18n::tr_catalog(lang, "display_settings.pictograms_firmware_required")
-        } else if busy {
+        } else if self.display_settings.pictograms.loading {
             crate::i18n::tr_catalog(lang, "display_settings.pictograms_loading")
+        } else if self.display_settings.pictograms.saving {
+            crate::i18n::tr_catalog(lang, "display_settings.pictograms_saving")
         } else {
             crate::i18n::tr_catalog(lang, "display_settings.pictograms_loaded")
         };

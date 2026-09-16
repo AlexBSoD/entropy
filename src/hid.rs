@@ -94,6 +94,10 @@ fn macos_running_under_rosetta() -> bool {
 
 const VIAL_GUI_USB_RETRIES: usize = 20;
 const VIAL_GUI_READ_TIMEOUT_MS: i32 = 500;
+// Firmware 4.0.6 performs the flash update synchronously before acknowledging
+// SLOT_COMMIT. It remains enumerated, but regularly exceeds the generic USB
+// response window; timing out here incorrectly tears down the whole connection.
+const PICTOGRAM_SLOT_COMMIT_READ_TIMEOUT_MS: i32 = 2_500;
 const WINDOWS_BLE_READ_TIMEOUT_MS: i32 = 2_500;
 const WINDOWS_BLE_READ_SLICE_MS: i32 = 250;
 const WINDOWS_BLE_SETTLE_DELAY: Duration = Duration::from_millis(12);
@@ -941,6 +945,17 @@ fn is_optional_dynamic_entry_count_request(data: &[u8]) -> bool {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn usb_read_timeout_ms(transport: HidTransport, data: &[u8]) -> i32 {
+    if transport.is_bluetooth() {
+        WINDOWS_BLE_READ_TIMEOUT_MS
+    } else if data.first() == Some(&0xC9) {
+        PICTOGRAM_SLOT_COMMIT_READ_TIMEOUT_MS
+    } else {
+        VIAL_GUI_READ_TIMEOUT_MS
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn usb_send_max_attempts(transport: HidTransport, data: &[u8]) -> usize {
     // Runtime firmware metadata and optional QMK-settings discovery both have
     // safe fallbacks, so an unsupported probe must not hold up the whole
@@ -1040,11 +1055,7 @@ fn usb_send_local(
     write_buf[1..1 + data.len()].copy_from_slice(data);
     let write_frame = local_hid_write_frame(&mut write_buf, write_framing);
 
-    let read_timeout_ms = if transport.is_bluetooth() {
-        WINDOWS_BLE_READ_TIMEOUT_MS
-    } else {
-        VIAL_GUI_READ_TIMEOUT_MS
-    };
+    let read_timeout_ms = usb_read_timeout_ms(transport, data);
 
     let max_retries = usb_send_max_attempts(transport, data);
 
@@ -2077,6 +2088,25 @@ mod tests {
         assert_eq!(
             usb_send_max_attempts(HidTransport::Usb, &dynamic_entry_read),
             VIAL_GUI_USB_RETRIES
+        );
+    }
+
+    #[test]
+    fn only_pictogram_slot_commit_gets_the_extended_usb_response_window() {
+        assert_eq!(
+            usb_read_timeout_ms(HidTransport::Usb, &[0xC9]),
+            PICTOGRAM_SLOT_COMMIT_READ_TIMEOUT_MS
+        );
+        for command in [0xC0, 0xC7, 0xC8, 0xCA, 0xCB] {
+            assert_eq!(
+                usb_read_timeout_ms(HidTransport::Usb, &[command]),
+                VIAL_GUI_READ_TIMEOUT_MS,
+                "unexpected extended timeout for opcode 0x{command:02X}"
+            );
+        }
+        assert_eq!(
+            usb_read_timeout_ms(HidTransport::Bluetooth, &[0xC9]),
+            WINDOWS_BLE_READ_TIMEOUT_MS
         );
     }
 
