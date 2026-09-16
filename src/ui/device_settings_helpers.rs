@@ -6,11 +6,12 @@ mod clock_lifecycle_tests;
 
 #[cfg(not(target_arch = "wasm32"))]
 type QmkBridgeFactory<'a> = dyn FnMut(
-    Device,
-    crate::qmk_hid_host::HostDataMode,
-    Option<crate::hid::SharedHidOutput>,
-    crate::qmk_hid_host::HostProtocol,
-) -> crate::qmk_hid_host::QmkHidHostBridge + 'a;
+        Device,
+        crate::qmk_hid_host::HostDataMode,
+        Option<crate::hid::SharedHidOutput>,
+        crate::qmk_hid_host::HostProtocol,
+    ) -> crate::qmk_hid_host::QmkHidHostBridge
+    + 'a;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn qmk_bridge_device_still_connected(devices: &[Device], path: &str) -> bool {
@@ -1921,7 +1922,8 @@ impl EntropyApp {
 
             let selected = Some(device.path.as_str()) == selected_path;
             if !selected
-                && selected_device.is_some_and(|selected| device.may_share_physical_device(selected))
+                && selected_device
+                    .is_some_and(|selected| device.may_share_physical_device(selected))
             {
                 // An alias must not race the selected connector, even while
                 // that connector has not published its shared output yet.
@@ -1954,9 +1956,7 @@ impl EntropyApp {
             }
 
             if !mode.is_empty() {
-                let shared_output = selected
-                    .then(|| self.shared_hid_output.clone())
-                    .flatten();
+                let shared_output = selected.then(|| self.shared_hid_output.clone()).flatten();
                 let protocol = if selected {
                     crate::qmk_hid_host::HostProtocol::Selected(
                         self.layout
@@ -1992,9 +1992,9 @@ impl EntropyApp {
         });
 
         for (path, (device, mode, shared_output, protocol)) in desired {
-            self.qmk_hid_hosts.entry(path).or_insert_with(|| {
-                start(device, mode, shared_output, protocol)
-            });
+            self.qmk_hid_hosts
+                .entry(path)
+                .or_insert_with(|| start(device, mode, shared_output, protocol));
         }
     }
 
@@ -2049,7 +2049,8 @@ impl EntropyApp {
             else {
                 return false;
             };
-            if selected.is_some_and(|selected| bridge.device().may_share_physical_device(selected)) {
+            if selected.is_some_and(|selected| bridge.device().may_share_physical_device(selected))
+            {
                 // Free only this selection's physical endpoint, including aliases.
                 bridge.suppress_shutdown();
                 return false;
@@ -2090,11 +2091,14 @@ impl EntropyApp {
         self.retain_connected_qmk_hid_host_bridges();
         let selected = match &self.connect_state {
             ConnectState::Loading { device, .. } => Some(device),
-            _ => self.selected_device.and_then(|index| self.device_manager.devices().get(index)),
+            _ => self
+                .selected_device
+                .and_then(|index| self.device_manager.devices().get(index)),
         };
         self.qmk_hid_hosts.retain(|_, bridge| {
             !bridge.uses_shared_output()
-                && !selected.is_some_and(|selected| bridge.device().may_share_physical_device(selected))
+                && !selected
+                    .is_some_and(|selected| bridge.device().may_share_physical_device(selected))
         });
     }
 

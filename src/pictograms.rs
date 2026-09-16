@@ -1745,8 +1745,14 @@ mod tests {
             assert_eq!(hid.load_pictograms(&progress).unwrap(), library);
         }
         let requests = recorder.requests();
-        assert_eq!(requests.iter().filter(|r| r[0] == CMD_SLOT_BEGIN).count(), 2);
-        assert_eq!(requests.iter().filter(|r| r[0] == CMD_SLOT_COMMIT).count(), 2);
+        assert_eq!(
+            requests.iter().filter(|r| r[0] == CMD_SLOT_BEGIN).count(),
+            2
+        );
+        assert_eq!(
+            requests.iter().filter(|r| r[0] == CMD_SLOT_COMMIT).count(),
+            2
+        );
         // Both replacements start at packet zero without opening another owner.
         assert_eq!(
             requests

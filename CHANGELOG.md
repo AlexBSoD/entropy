@@ -5,6 +5,41 @@ All notable public changes to Entropy are tracked here.
 Entropy uses public release versions for GitHub releases and internal build versions
 for development history. The first public beta is `v0.1.0-beta.1`.
 
+## v0.4.0 - Public Beta
+
+### Main Features
+
+- Added full M4CR0Pad firmware 4.0.6 display customization: standby images and animations, startup images, clocks and dates, 32×32 pictograms, macro and Tap Dance assignments, and synchronized host previews
+- Added an adaptive symbol typing trainer that follows the active layout and prioritizes characters with more errors
+- Added a Nix flake with declarative NixOS and Home Manager modules
+
+### Improvements
+
+- Added GUI chords to Mod-Tap choices and readable labels for Layer Lock
+- Added a dedicated label for firmware auto-layer deactivation on key press
+- Kept Matrix Tester geometry below the header, honored active layout options, and decoded firmware rows consistently
+- Allowed Layer-Tap and Mod-Tap keys as Key Override and RMK Fork triggers while continuing to reject invalid trigger values
+- Added bounded, serialized HID ownership for background display updates across keyboard switches and reconnects
+
+### Fixes
+
+- Restored wired QMK/Vial loading for legacy VIA responses and made unsupported compatibility probes fail fast
+- Restored update checks after transient GitHub API failures and kept the pinned Layout Indicator visible
+- Kept wired keyboards discoverable after unplugging and reconnecting them
+- Preserved M4CR0Pad clocks when switching Entropy to another Ergohaven keyboard over USB or Bluetooth
+- Kept pictogram saves on the active editor page, waited for firmware 4.0.6 flash commits, and prevented stale or failed transfers from corrupting confirmed state
+- Strengthened USB/Bluetooth device identity, HID owner fencing, reconnect drafts, secure Vial unlock handling, and shutdown ordering
+
+### Contributors
+
+- Special thanks to @AlexBSoD for Nix packaging and modules in #115
+- Special thanks to @St1ggy for GUI-chord Mod-Tap support in #131
+- Special thanks to @IgorArkhipov for update recovery, Layout Indicator, Layer Lock, and CI improvements in #142, #145, #155, and #157
+- Special thanks to @av-leschinskiy for the adaptive symbol typing trainer in #144
+- Special thanks to @techmech-keeb for Matrix Tester fixes in #160 and #161
+- Special thanks to @iakunin for the auto-layer setting label in #162
+- Special thanks to @Yurii-Q for wired reconnect recovery and M4CR0Pad display customization in #165 and #166
+
 ## v0.3.21-rc.7 - Test Candidate
 
 ### Fixes
