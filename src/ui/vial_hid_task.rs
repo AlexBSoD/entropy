@@ -1736,6 +1736,52 @@ mod tests {
     }
 
     #[test]
+    fn rmk_finished_unlock_poll_is_confirmed_without_restarting_it() {
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        let mut poll = [0u8; 32];
+        poll[..3].copy_from_slice(&[0, 1, 0]);
+        let mut status = [0xFFu8; 32];
+        status[..4].copy_from_slice(&[1, 0, 0, 0]);
+        recorder.respond_with([poll, status]);
+
+        let outcome = run_vial_hid_operation(&hid, VialHidOperation::UnlockPoll).unwrap();
+
+        assert!(matches!(
+            outcome,
+            VialHidOutcome::UnlockPolled {
+                unlocked: true,
+                in_progress: false,
+                counter: 0,
+            }
+        ));
+        let requests = recorder.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(&requests[0][..2], &[0xFE, 0x07]);
+        assert_eq!(&requests[1][..2], &[0xFE, 0x05]);
+    }
+
+    #[test]
+    fn still_pending_unlock_remains_pending_after_confirmation() {
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        let mut poll = [0u8; 32];
+        poll[..3].copy_from_slice(&[1, 1, 0]);
+        let mut status = [0xFFu8; 32];
+        status[..4].copy_from_slice(&[1, 1, 0, 0]);
+        recorder.respond_with([poll, status]);
+
+        let outcome = run_vial_hid_operation(&hid, VialHidOperation::UnlockPoll).unwrap();
+
+        assert!(matches!(
+            outcome,
+            VialHidOutcome::UnlockPolled {
+                unlocked: true,
+                in_progress: true,
+                counter: 0,
+            }
+        ));
+    }
+
+    #[test]
     fn battery_refresh_uses_the_existing_vial_transport() {
         let (hid, recorder) = crate::hid::HidDevice::test_device();
 

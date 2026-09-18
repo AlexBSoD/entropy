@@ -127,7 +127,23 @@ impl HidDevice {
             .usb_send(&[CMD_VIA_VIAL_PREFIX, CMD_VIAL_UNLOCK_POLL])
             .context("failed to poll Vial unlock status")?;
         // resp[0] = unlocked, resp[1] = in_progress, resp[2] = counter
-        Ok((resp[0] == 1, resp[1] == 1, resp[2]))
+        let mut unlocked = resp[0] == 1;
+        let mut in_progress = resp[1] == 1;
+        let counter = resp[2];
+
+        // RMK 0.8.x samples `unlocked` and `in_progress` before checking the
+        // physical keys. Its successful poll can therefore return (0, 1, 0),
+        // even though the lock transitions while producing that reply.
+        // Confirm the resulting state without issuing another UNLOCK_POLL,
+        // which would restart RMK's in-progress flag.
+        if in_progress && counter == 0 {
+            let (confirmed_unlocked, confirmed_in_progress, _) =
+                self.get_unlock_status_with_progress()?;
+            unlocked = confirmed_unlocked;
+            in_progress = confirmed_in_progress;
+        }
+
+        Ok((unlocked, in_progress, counter))
     }
 
     /// Lock the keyboard
