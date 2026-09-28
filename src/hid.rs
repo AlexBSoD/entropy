@@ -196,6 +196,7 @@ pub(crate) struct TestHidRecorder {
     pictogram_backup_directory: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
     requests: std::sync::Arc<std::sync::Mutex<Vec<[u8; MSG_LEN]>>>,
     responses: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<[u8; MSG_LEN]>>>,
+    output_connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[cfg(test)]
@@ -207,6 +208,21 @@ impl TestHidRecorder {
 
     pub(crate) fn respond_with(&self, responses: impl IntoIterator<Item = [u8; MSG_LEN]>) {
         self.responses.lock().unwrap().extend(responses);
+    }
+
+    pub(crate) fn disconnect_output(&self) {
+        self.output_connected
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    fn ensure_output_connected(&self) -> Result<()> {
+        if !self
+            .output_connected
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            bail!("HID device disconnected");
+        }
+        Ok(())
     }
 
     pub(crate) fn requests(&self) -> Vec<[u8; MSG_LEN]> {
@@ -425,10 +441,7 @@ impl SharedHidOutput {
                 .context("Shared HID output owner is no longer available")?
                 .write_output_report(data),
             #[cfg(test)]
-            SharedHidOutputBackend::Test(recorder) => {
-                record_test_output_report(recorder, data);
-                Ok(())
-            }
+            SharedHidOutputBackend::Test(recorder) => record_test_output_report(recorder, data),
         }
     }
 }
@@ -508,6 +521,7 @@ impl HidDevice {
             pictogram_backup_directory: Default::default(),
             requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             responses: Default::default(),
+            output_connected: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let device = Self {
             backend: HidBackend::Test {
@@ -684,10 +698,7 @@ impl HidDevice {
             #[cfg(target_os = "linux")]
             HidBackend::LinuxBle(device) => device.write_output_report(data),
             #[cfg(test)]
-            HidBackend::Test { recorder, .. } => {
-                record_test_output_report(recorder, data);
-                Ok(())
-            }
+            HidBackend::Test { recorder, .. } => record_test_output_report(recorder, data),
         }
     }
 
@@ -877,7 +888,8 @@ fn ensure_output_report_len(data: &[u8]) -> Result<()> {
 }
 
 #[cfg(test)]
-fn record_test_output_report(recorder: &TestHidRecorder, data: &[u8]) {
+fn record_test_output_report(recorder: &TestHidRecorder, data: &[u8]) -> Result<()> {
+    recorder.ensure_output_connected()?;
     let mut report = [0; MSG_LEN];
     report[..data.len()].copy_from_slice(data);
     recorder
@@ -885,6 +897,7 @@ fn record_test_output_report(recorder: &TestHidRecorder, data: &[u8]) {
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .push(report);
+    Ok(())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1786,6 +1799,17 @@ mod tests {
         let requests = recorder.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(&requests[0][..4], &[0xAC, 1, 0, 0]);
+    }
+
+    #[test]
+    fn disconnected_test_hid_rejects_dedicated_and_shared_output_reports() {
+        let (device, recorder) = HidDevice::test_device();
+        let shared = device.shared_output().unwrap();
+        recorder.disconnect_output();
+
+        assert!(device.write_output_report(&[0xAC, 1]).is_err());
+        assert!(shared.write_output_report(&[0xAC, 1]).is_err());
+        assert!(recorder.requests().is_empty());
     }
 
     #[test]
