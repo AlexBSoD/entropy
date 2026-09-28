@@ -140,6 +140,13 @@ impl std::fmt::Display for MacosHidInputMonitoringRequired {
 #[cfg(target_os = "macos")]
 impl std::error::Error for MacosHidInputMonitoringRequired {}
 
+#[cfg(target_os = "macos")]
+fn is_macos_hid_input_monitoring_required(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<MacosHidInputMonitoringRequired>())
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[derive(Debug)]
 struct UnsafeBluetoothReportMap;
@@ -599,13 +606,29 @@ impl HidDevice {
 
     fn open_fresh_for_local(device: &crate::device::Device) -> Result<Self> {
         #[cfg(target_os = "macos")]
-        prepare_macos_bluetooth_hid_access(device)?;
+        let open_result = with_macos_bluetooth_hid_access(
+            device.is_bluetooth_transport(),
+            crate::smart_input::input_monitoring_access_granted,
+            crate::smart_input::request_input_monitoring_access,
+            || Self::open_fresh_for_local_after_access_request(device),
+        );
 
+        #[cfg(not(target_os = "macos"))]
+        let open_result = Self::open_fresh_for_local_after_access_request(device);
+
+        open_result
+    }
+
+    fn open_fresh_for_local_after_access_request(device: &crate::device::Device) -> Result<Self> {
         let mut last_error = None;
         for attempt in 0..HID_OPEN_RETRIES {
             match Self::try_open_fresh_for(device) {
                 Ok(device) => return Ok(device),
                 Err(e) => {
+                    #[cfg(target_os = "macos")]
+                    if is_macos_hid_input_monitoring_required(&e) {
+                        return Err(e);
+                    }
                     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
                     if is_unsafe_bluetooth_report_map(&e) {
                         return Err(e);
@@ -1710,16 +1733,19 @@ fn drain_pending_reports(device: &hidapi::HidDevice) {
 }
 
 #[cfg(target_os = "macos")]
-fn prepare_macos_bluetooth_hid_access(device: &crate::device::Device) -> Result<()> {
-    if !device.is_bluetooth_transport() || crate::smart_input::input_monitoring_access_granted() {
-        return Ok(());
+fn with_macos_bluetooth_hid_access<T>(
+    is_bluetooth: bool,
+    input_monitoring_access_granted: impl FnOnce() -> bool,
+    request_input_monitoring_access: impl FnOnce() -> bool,
+    open_hid: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if is_bluetooth && !input_monitoring_access_granted() {
+        // These APIs can remain false after System Settings shows access as enabled.
+        // Let the real HID open decide whether macOS permits the device.
+        let _ = request_input_monitoring_access();
     }
 
-    if crate::smart_input::request_input_monitoring_access() {
-        return Ok(());
-    }
-
-    Err(MacosHidInputMonitoringRequired.into())
+    open_hid()
 }
 
 #[cfg(target_os = "macos")]
@@ -1731,6 +1757,68 @@ fn macos_hid_open_not_permitted(error: &hidapi::HidError) -> bool {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stale_input_monitoring_preflight_does_not_block_bluetooth_hid_open() {
+        let requested = std::cell::Cell::new(false);
+        let opened = std::cell::Cell::new(false);
+
+        let result = with_macos_bluetooth_hid_access(
+            true,
+            || false,
+            || {
+                requested.set(true);
+                false
+            },
+            || {
+                opened.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(requested.get());
+        assert!(opened.get());
+        assert!(result.is_ok());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn input_monitoring_request_only_runs_for_ungranted_bluetooth() {
+        let requested = std::cell::Cell::new(false);
+
+        let result = with_macos_bluetooth_hid_access(
+            false,
+            || panic!("non-Bluetooth devices must skip the permission preflight"),
+            || {
+                requested.set(true);
+                false
+            },
+            || Ok(()),
+        );
+        assert!(result.is_ok());
+        assert!(!requested.get());
+
+        let result = with_macos_bluetooth_hid_access(
+            true,
+            || true,
+            || {
+                requested.set(true);
+                false
+            },
+            || Ok(()),
+        );
+        assert!(result.is_ok());
+        assert!(!requested.get());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn input_monitoring_denial_is_a_terminal_hid_open_error() {
+        let error: anyhow::Error = MacosHidInputMonitoringRequired.into();
+
+        assert!(is_macos_hid_input_monitoring_required(&error));
+    }
 
     #[test]
     fn display_diagnostics_exclude_keymaps_macros_and_pixel_payloads() {
