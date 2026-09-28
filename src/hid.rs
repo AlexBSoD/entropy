@@ -140,6 +140,13 @@ impl std::fmt::Display for MacosHidInputMonitoringRequired {
 #[cfg(target_os = "macos")]
 impl std::error::Error for MacosHidInputMonitoringRequired {}
 
+#[cfg(target_os = "macos")]
+fn is_macos_hid_input_monitoring_required(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<MacosHidInputMonitoringRequired>())
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[derive(Debug)]
 struct UnsafeBluetoothReportMap;
@@ -196,6 +203,7 @@ pub(crate) struct TestHidRecorder {
     pictogram_backup_directory: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
     requests: std::sync::Arc<std::sync::Mutex<Vec<[u8; MSG_LEN]>>>,
     responses: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<[u8; MSG_LEN]>>>,
+    output_connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[cfg(test)]
@@ -207,6 +215,21 @@ impl TestHidRecorder {
 
     pub(crate) fn respond_with(&self, responses: impl IntoIterator<Item = [u8; MSG_LEN]>) {
         self.responses.lock().unwrap().extend(responses);
+    }
+
+    pub(crate) fn disconnect_output(&self) {
+        self.output_connected
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    fn ensure_output_connected(&self) -> Result<()> {
+        if !self
+            .output_connected
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            bail!("HID device disconnected");
+        }
+        Ok(())
     }
 
     pub(crate) fn requests(&self) -> Vec<[u8; MSG_LEN]> {
@@ -425,10 +448,7 @@ impl SharedHidOutput {
                 .context("Shared HID output owner is no longer available")?
                 .write_output_report(data),
             #[cfg(test)]
-            SharedHidOutputBackend::Test(recorder) => {
-                record_test_output_report(recorder, data);
-                Ok(())
-            }
+            SharedHidOutputBackend::Test(recorder) => record_test_output_report(recorder, data),
         }
     }
 }
@@ -508,6 +528,7 @@ impl HidDevice {
             pictogram_backup_directory: Default::default(),
             requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             responses: Default::default(),
+            output_connected: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let device = Self {
             backend: HidBackend::Test {
@@ -585,13 +606,29 @@ impl HidDevice {
 
     fn open_fresh_for_local(device: &crate::device::Device) -> Result<Self> {
         #[cfg(target_os = "macos")]
-        prepare_macos_bluetooth_hid_access(device)?;
+        let open_result = with_macos_bluetooth_hid_access(
+            device.is_bluetooth_transport(),
+            crate::smart_input::input_monitoring_access_granted,
+            crate::smart_input::request_input_monitoring_access,
+            || Self::open_fresh_for_local_after_access_request(device),
+        );
 
+        #[cfg(not(target_os = "macos"))]
+        let open_result = Self::open_fresh_for_local_after_access_request(device);
+
+        open_result
+    }
+
+    fn open_fresh_for_local_after_access_request(device: &crate::device::Device) -> Result<Self> {
         let mut last_error = None;
         for attempt in 0..HID_OPEN_RETRIES {
             match Self::try_open_fresh_for(device) {
                 Ok(device) => return Ok(device),
                 Err(e) => {
+                    #[cfg(target_os = "macos")]
+                    if is_macos_hid_input_monitoring_required(&e) {
+                        return Err(e);
+                    }
                     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
                     if is_unsafe_bluetooth_report_map(&e) {
                         return Err(e);
@@ -684,10 +721,7 @@ impl HidDevice {
             #[cfg(target_os = "linux")]
             HidBackend::LinuxBle(device) => device.write_output_report(data),
             #[cfg(test)]
-            HidBackend::Test { recorder, .. } => {
-                record_test_output_report(recorder, data);
-                Ok(())
-            }
+            HidBackend::Test { recorder, .. } => record_test_output_report(recorder, data),
         }
     }
 
@@ -877,7 +911,8 @@ fn ensure_output_report_len(data: &[u8]) -> Result<()> {
 }
 
 #[cfg(test)]
-fn record_test_output_report(recorder: &TestHidRecorder, data: &[u8]) {
+fn record_test_output_report(recorder: &TestHidRecorder, data: &[u8]) -> Result<()> {
+    recorder.ensure_output_connected()?;
     let mut report = [0; MSG_LEN];
     report[..data.len()].copy_from_slice(data);
     recorder
@@ -885,6 +920,7 @@ fn record_test_output_report(recorder: &TestHidRecorder, data: &[u8]) {
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .push(report);
+    Ok(())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1697,16 +1733,19 @@ fn drain_pending_reports(device: &hidapi::HidDevice) {
 }
 
 #[cfg(target_os = "macos")]
-fn prepare_macos_bluetooth_hid_access(device: &crate::device::Device) -> Result<()> {
-    if !device.is_bluetooth_transport() || crate::smart_input::input_monitoring_access_granted() {
-        return Ok(());
+fn with_macos_bluetooth_hid_access<T>(
+    is_bluetooth: bool,
+    input_monitoring_access_granted: impl FnOnce() -> bool,
+    request_input_monitoring_access: impl FnOnce() -> bool,
+    open_hid: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if is_bluetooth && !input_monitoring_access_granted() {
+        // These APIs can remain false after System Settings shows access as enabled.
+        // Let the real HID open decide whether macOS permits the device.
+        let _ = request_input_monitoring_access();
     }
 
-    if crate::smart_input::request_input_monitoring_access() {
-        return Ok(());
-    }
-
-    Err(MacosHidInputMonitoringRequired.into())
+    open_hid()
 }
 
 #[cfg(target_os = "macos")]
@@ -1718,6 +1757,68 @@ fn macos_hid_open_not_permitted(error: &hidapi::HidError) -> bool {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stale_input_monitoring_preflight_does_not_block_bluetooth_hid_open() {
+        let requested = std::cell::Cell::new(false);
+        let opened = std::cell::Cell::new(false);
+
+        let result = with_macos_bluetooth_hid_access(
+            true,
+            || false,
+            || {
+                requested.set(true);
+                false
+            },
+            || {
+                opened.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(requested.get());
+        assert!(opened.get());
+        assert!(result.is_ok());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn input_monitoring_request_only_runs_for_ungranted_bluetooth() {
+        let requested = std::cell::Cell::new(false);
+
+        let result = with_macos_bluetooth_hid_access(
+            false,
+            || panic!("non-Bluetooth devices must skip the permission preflight"),
+            || {
+                requested.set(true);
+                false
+            },
+            || Ok(()),
+        );
+        assert!(result.is_ok());
+        assert!(!requested.get());
+
+        let result = with_macos_bluetooth_hid_access(
+            true,
+            || true,
+            || {
+                requested.set(true);
+                false
+            },
+            || Ok(()),
+        );
+        assert!(result.is_ok());
+        assert!(!requested.get());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn input_monitoring_denial_is_a_terminal_hid_open_error() {
+        let error: anyhow::Error = MacosHidInputMonitoringRequired.into();
+
+        assert!(is_macos_hid_input_monitoring_required(&error));
+    }
 
     #[test]
     fn display_diagnostics_exclude_keymaps_macros_and_pixel_payloads() {
@@ -1786,6 +1887,17 @@ mod tests {
         let requests = recorder.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(&requests[0][..4], &[0xAC, 1, 0, 0]);
+    }
+
+    #[test]
+    fn disconnected_test_hid_rejects_dedicated_and_shared_output_reports() {
+        let (device, recorder) = HidDevice::test_device();
+        let shared = device.shared_output().unwrap();
+        recorder.disconnect_output();
+
+        assert!(device.write_output_report(&[0xAC, 1]).is_err());
+        assert!(shared.write_output_report(&[0xAC, 1]).is_err());
+        assert!(recorder.requests().is_empty());
     }
 
     #[test]
