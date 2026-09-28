@@ -111,7 +111,7 @@ impl EntropyApp {
             let show_update_indicator = crate::app::update_available(&self.update_check);
             let show_matrix_item = self.firmware == FirmwareProtocol::Vial;
             let is_unlocked = self.vial_unlocked == Some(true);
-            let vial_feature_menu_enabled = vial_feature_menu_items_enabled(self.is_vial_locked());
+            let matrix_enabled = self.vial_lock_allows_settings_tab(SettingsTab::MatrixTester);
             #[cfg(not(target_arch = "wasm32"))]
             let vial_hid_idle = vial_lock_control_idle(
                 self.hid_user_action_busy(),
@@ -256,7 +256,7 @@ impl EntropyApp {
                                         ui,
                                         item_width,
                                         crate::i18n::tr(lang, TrKey::MatrixTesterTitle),
-                                        vial_feature_menu_enabled,
+                                        matrix_enabled,
                                         self.main_menu_tab == MainMenuTab::Settings
                                             && self.settings_tab == SettingsTab::MatrixTester,
                                     )
@@ -394,7 +394,7 @@ impl EntropyApp {
                                         && self.settings_tab == SettingsTab::AboutEntropy,
                                     show_update_indicator,
                                 );
-                                if !vial_feature_menu_enabled {
+                                if !matrix_enabled {
                                     if let Some(response) =
                                         matrix_resp.as_ref().filter(|response| response.hovered())
                                     {

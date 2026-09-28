@@ -583,6 +583,53 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
+    fn locked_vial_retains_pending_tap_dance_write_until_unlock() {
+        let ctx = egui::Context::default();
+        let creation_context = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = EntropyApp::new(&creation_context);
+        let (hid_device, recorder) = crate::hid::HidDevice::test_device();
+        app.firmware = FirmwareProtocol::Vial;
+        app.layout = Some(
+            KeyboardLayout::from_vial_json(&serde_json::json!({
+                "name": "Test keyboard",
+                "matrix": { "rows": 1, "cols": 1 },
+                "layouts": { "keymap": [["0,0"]] }
+            }))
+            .unwrap(),
+        );
+        app.hid_device = Some(hid_device);
+        app.vial_unlocked = Some(false);
+        let entry = crate::keycode_picker::TapDanceEntry {
+            on_tap: 0x0004.into(),
+            tapping_term: 175,
+            ..Default::default()
+        };
+        app.keycode_picker.tap_dance_entries = vec![entry.clone()];
+        app.keycode_picker.tap_dance_synced_entries = vec![Default::default()];
+        app.keycode_picker.tap_dance_dirty = true;
+        let mut frame = eframe::Frame::_new_kittest();
+
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            eframe::App::ui(&mut app, ui, &mut frame);
+        });
+        assert!(app.keycode_picker.tap_dance_dirty);
+        assert!(recorder.requests().is_empty());
+
+        let mut readback = [0; 32];
+        readback[1..3].copy_from_slice(&entry.on_tap.vial_keycode().to_le_bytes());
+        readback[9..11].copy_from_slice(&entry.tapping_term.to_le_bytes());
+        recorder.respond_with([[0; 32], readback]);
+        app.vial_unlocked = Some(true);
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            eframe::App::ui(&mut app, ui, &mut frame);
+        });
+        assert!(!app.keycode_picker.tap_dance_dirty);
+        assert_eq!(app.keycode_picker.tap_dance_synced_entries[0], entry);
+        assert!(!recorder.requests().is_empty());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
     fn settings_task_defers_and_drains_hid_writes_before_exit() {
         let ctx = egui::Context::default();
         let creation_context = eframe::CreationContext::_new_kittest(ctx.clone());
@@ -1800,12 +1847,15 @@ impl eframe::App for EntropyApp {
         }
 
         // Write tap dance to device if changed
-        if should_write_dynamic_entries(
-            self.keycode_picker.tap_dance_dirty,
-            self.keycode_picker.open,
-            active_hid_is_bluetooth,
-            hid_write_task_active,
-        ) {
+        if !self.is_vial_locked()
+            && !self.vial_unlock_polling
+            && should_write_dynamic_entries(
+                self.keycode_picker.tap_dance_dirty,
+                self.keycode_picker.open,
+                active_hid_is_bluetooth,
+                hid_write_task_active,
+            )
+        {
             let entries_to_write = tap_dance_entries_to_write(
                 &self.keycode_picker.tap_dance_entries,
                 &self.keycode_picker.tap_dance_synced_entries,

@@ -27,7 +27,9 @@ impl EntropyApp {
             let key_override_supported = !self.key_override_entries.is_empty();
             let auto_shift_supported =
                 self.auto_shift_timeout.is_some() || self.supported_qmk_settings.contains(&4);
-            let vial_feature_menu_enabled = vial_feature_menu_items_enabled(self.is_vial_locked());
+            let macros_enabled = self.vial_lock_allows_settings_tab(SettingsTab::Macros);
+            let tap_dance_enabled = self.vial_lock_allows_settings_tab(SettingsTab::TapDance);
+            let auto_shift_enabled = self.vial_lock_allows_settings_tab(SettingsTab::AutoShift);
             let advanced_item_count = 2
                 + macro_supported as usize
                 + tap_dance_supported as usize
@@ -115,7 +117,7 @@ impl EntropyApp {
                                         ui,
                                         item_width,
                                         crate::i18n::tr_catalog(lang, "macro_editor.title"),
-                                        vial_feature_menu_enabled,
+                                        macros_enabled,
                                         self.main_menu_tab == MainMenuTab::Advanced
                                             && self.settings_tab == SettingsTab::Macros,
                                     )
@@ -125,7 +127,7 @@ impl EntropyApp {
                                         ui,
                                         item_width,
                                         crate::i18n::tr_catalog(lang, "tap_dance_editor.title"),
-                                        vial_feature_menu_enabled,
+                                        tap_dance_enabled,
                                         self.main_menu_tab == MainMenuTab::Advanced
                                             && self.settings_tab == SettingsTab::TapDance,
                                     )
@@ -145,7 +147,7 @@ impl EntropyApp {
                                         ui,
                                         item_width,
                                         crate::i18n::tr(lang, TrKey::AutoShiftTitle),
-                                        vial_feature_menu_enabled,
+                                        auto_shift_enabled,
                                         self.main_menu_tab == MainMenuTab::Advanced
                                             && self.settings_tab == SettingsTab::AutoShift,
                                     )
@@ -160,7 +162,7 @@ impl EntropyApp {
                                             && self.settings_tab == SettingsTab::KeyOverrides,
                                     )
                                 });
-                                if !vial_feature_menu_enabled {
+                                if !macros_enabled {
                                     if let Some(response) =
                                         macro_resp.as_ref().filter(|response| response.hovered())
                                     {
@@ -169,6 +171,8 @@ impl EntropyApp {
                                             "connection.keyboard_locked_edit_macros",
                                         ));
                                     }
+                                }
+                                if !tap_dance_enabled {
                                     if let Some(response) = tap_dance_resp
                                         .as_ref()
                                         .filter(|response| response.hovered())
@@ -178,6 +182,8 @@ impl EntropyApp {
                                             "connection.keyboard_locked_edit_tap_dance",
                                         ));
                                     }
+                                }
+                                if !auto_shift_enabled {
                                     if let Some(response) = auto_shift_resp
                                         .as_ref()
                                         .filter(|response| response.hovered())

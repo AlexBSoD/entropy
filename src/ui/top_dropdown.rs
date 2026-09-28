@@ -16,10 +16,6 @@ pub(super) fn settings_dropdown_open_id() -> egui::Id {
     egui::Id::new("settings_dropdown_open")
 }
 
-pub(super) fn vial_feature_menu_items_enabled(vial_locked: bool) -> bool {
-    !vial_locked
-}
-
 pub(super) fn top_dropdown_frame(dark: bool) -> egui::Frame {
     egui::Frame::new()
         .fill(app_surface_fill(dark))
@@ -245,11 +241,5 @@ mod tests {
 
         app.close_top_dropdowns(&ctx);
         assert!(!app.top_dropdown_open(&ctx));
-    }
-
-    #[test]
-    fn vial_feature_menu_items_require_an_unlocked_keyboard() {
-        assert!(!vial_feature_menu_items_enabled(true));
-        assert!(vial_feature_menu_items_enabled(false));
     }
 }
