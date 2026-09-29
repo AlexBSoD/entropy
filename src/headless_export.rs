@@ -208,6 +208,9 @@ pub(crate) fn run_headless_export(request: HeadlessExportRequest) -> i32 {
     #[cfg(target_os = "macos")]
     crate::hid::initialize_macos_hid_on_main_thread();
 
+    // Before any HID handle exists: everything this process opens from here
+    // on refuses writes at the transport, whatever pipeline asks for them.
+    let session = crate::hid::enforce_read_only_hid();
     let mut app = EntropyApp::new_headless();
     // `DeviceManager::new` cannot scan on macOS (see there); the main-thread
     // HID setup above makes a direct scan safe.
@@ -277,6 +280,10 @@ pub(crate) fn run_headless_export(request: HeadlessExportRequest) -> i32 {
         std::thread::sleep(POLL_INTERVAL);
     }
 
+    let refused = session.refused_requests().len();
+    if refused > 0 {
+        log::info!("Refused {refused} keyboard write(s) during the export");
+    }
     let json = match app.entlayout_export_json() {
         Some(Ok(json)) => json,
         Some(Err(error)) => {

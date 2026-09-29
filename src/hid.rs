@@ -195,7 +195,94 @@ mod hid_vial;
 pub struct HidDevice {
     backend: HidBackend,
     unlock_confirmation_pending: std::sync::atomic::AtomicBool,
+    read_only: Option<ReadOnlyHidSession>,
 }
+
+/// A read-only HID session (`--export-layout`): every handle opened while it
+/// is active refuses anything but a known read before it reaches the
+/// transport, and keeps the reads that failed so an export can tell which of
+/// its data is missing.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Default)]
+pub(crate) struct ReadOnlyHidSession {
+    ledger: std::sync::Arc<std::sync::Mutex<ReadOnlyHidLedger>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct ReadOnlyHidLedger {
+    refused: Vec<[u8; MSG_LEN]>,
+    failed_reads: Vec<[u8; MSG_LEN]>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+static READ_ONLY_HID_SESSION: std::sync::OnceLock<ReadOnlyHidSession> = std::sync::OnceLock::new();
+
+/// Makes every HID handle this process opens from now on read-only. There is
+/// no way back: the process is expected to exit when its read is done.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn enforce_read_only_hid() -> ReadOnlyHidSession {
+    READ_ONLY_HID_SESSION.get_or_init(Default::default).clone()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_only_hid_session() -> Option<ReadOnlyHidSession> {
+    READ_ONLY_HID_SESSION.get().cloned()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ReadOnlyHidSession {
+    fn ledger(&self) -> std::sync::MutexGuard<'_, ReadOnlyHidLedger> {
+        self.ledger
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn refuse(&self, data: &[u8]) -> anyhow::Error {
+        self.ledger().refused.push(padded_request(data));
+        anyhow::anyhow!(
+            "Read-only HID session refused request {:#04x}",
+            data.first().copied().unwrap_or_default()
+        )
+    }
+
+    fn send(
+        &self,
+        data: &[u8],
+        send: impl FnOnce() -> Result<[u8; MSG_LEN]>,
+    ) -> Result<[u8; MSG_LEN]> {
+        if !is_read_request(data) {
+            return Err(self.refuse(data));
+        }
+        let result = send();
+        if result.is_err() {
+            self.ledger().failed_reads.push(padded_request(data));
+        }
+        result
+    }
+
+    /// Requests refused as writes (or as unknown commands).
+    pub(crate) fn refused_requests(&self) -> Vec<[u8; MSG_LEN]> {
+        self.ledger().refused.clone()
+    }
+
+    /// Reads that reached the transport and failed there.
+    pub(crate) fn failed_reads(&self) -> Vec<[u8; MSG_LEN]> {
+        self.ledger().failed_reads.clone()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn padded_request(data: &[u8]) -> [u8; MSG_LEN] {
+    let mut request = [0; MSG_LEN];
+    let len = data.len().min(MSG_LEN);
+    request[..len].copy_from_slice(&data[..len]);
+    request
+}
+
+#[cfg(test)]
+type TestHidResponder =
+    Box<dyn FnMut(&[u8; MSG_LEN]) -> Option<Result<[u8; MSG_LEN], String>> + Send>;
 
 #[cfg(test)]
 #[derive(Clone)]
@@ -204,6 +291,7 @@ pub(crate) struct TestHidRecorder {
     pictogram_backup_directory: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
     requests: std::sync::Arc<std::sync::Mutex<Vec<[u8; MSG_LEN]>>>,
     responses: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<[u8; MSG_LEN]>>>,
+    responder: std::sync::Arc<std::sync::Mutex<Option<TestHidResponder>>>,
     output_connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -216,6 +304,15 @@ impl TestHidRecorder {
 
     pub(crate) fn respond_with(&self, responses: impl IntoIterator<Item = [u8; MSG_LEN]>) {
         self.responses.lock().unwrap().extend(responses);
+    }
+
+    /// Scripts a whole keyboard: the responder answers (or fails) any request
+    /// it returns `Some` for; the rest fall back to the built-in replies.
+    pub(crate) fn respond_by(
+        &self,
+        responder: impl FnMut(&[u8; MSG_LEN]) -> Option<Result<[u8; MSG_LEN], String>> + Send + 'static,
+    ) {
+        *self.responder.lock().unwrap() = Some(Box::new(responder));
     }
 
     pub(crate) fn disconnect_output(&self) {
@@ -529,10 +626,12 @@ impl HidDevice {
             pictogram_backup_directory: Default::default(),
             requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             responses: Default::default(),
+            responder: Default::default(),
             output_connected: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let device = Self {
             unlock_confirmation_pending: std::sync::atomic::AtomicBool::new(false),
+            read_only: None,
             backend: HidBackend::Test {
                 recorder: recorder.clone(),
                 combo: std::sync::Mutex::new(([0; 4], 0)),
@@ -540,6 +639,15 @@ impl HidDevice {
                 fault_after_requests: std::sync::Mutex::new(fault_after_requests),
             },
         };
+        (device, recorder)
+    }
+
+    /// A scripted device inside `session`, as `enforce_read_only_hid` would
+    /// open it, without switching the whole test process to read-only.
+    #[cfg(test)]
+    pub(crate) fn test_read_only_device(session: ReadOnlyHidSession) -> (Self, TestHidRecorder) {
+        let (mut device, recorder) = Self::test_device();
+        device.read_only = Some(session);
         (device, recorder)
     }
 
@@ -570,6 +678,7 @@ impl HidDevice {
                 Ok(bluez_device) => {
                     return Ok(Self {
                         unlock_confirmation_pending: std::sync::atomic::AtomicBool::new(false),
+                        read_only: read_only_hid_session(),
                         backend: HidBackend::LinuxBle(bluez_device),
                     })
                 }
@@ -591,6 +700,10 @@ impl HidDevice {
     }
 
     pub(crate) fn shared_output(&self) -> Option<SharedHidOutput> {
+        // The shared path is write-only; a read-only handle has none to share.
+        if self.read_only.is_some() {
+            return None;
+        }
         match &self.backend {
             HidBackend::Proxy(proxy) => Some(SharedHidOutput {
                 host_output: proxy.host_output.clone(),
@@ -649,6 +762,7 @@ impl HidDevice {
     fn open_proxy_for(device: &crate::device::Device) -> Result<Self> {
         Ok(Self {
             unlock_confirmation_pending: std::sync::atomic::AtomicBool::new(false),
+            read_only: read_only_hid_session(),
             backend: HidBackend::Proxy(std::sync::Arc::new(HidProxy::open(device)?)),
         })
     }
@@ -696,6 +810,7 @@ impl HidDevice {
             let write_framing = detect_hid_write_framing(&hid_device, transport)?;
             return Ok(Self {
                 unlock_confirmation_pending: std::sync::atomic::AtomicBool::new(false),
+                read_only: read_only_hid_session(),
                 backend: HidBackend::Local {
                     device: hid_device,
                     transport,
@@ -713,6 +828,9 @@ impl HidDevice {
     /// Live host data is write-only, but it must use the same transport-specific
     /// report framing as normal Vial commands (notably report ID 5 over RMK BLE).
     pub(crate) fn write_output_report(&self, data: &[u8]) -> Result<()> {
+        if let Some(session) = &self.read_only {
+            return Err(session.refuse(data));
+        }
         ensure_output_report_len(data)?;
 
         match &self.backend {
@@ -732,6 +850,13 @@ impl HidDevice {
 
     /// Send exactly MSG_LEN bytes (with 0x00 report ID prepended), receive MSG_LEN bytes back.
     pub(crate) fn usb_send(&self, data: &[u8]) -> Result<[u8; MSG_LEN]> {
+        match &self.read_only {
+            Some(session) => session.send(data, || self.usb_send_traced(data)),
+            None => self.usb_send_traced(data),
+        }
+    }
+
+    fn usb_send_traced(&self, data: &[u8]) -> Result<[u8; MSG_LEN]> {
         let trace = log::log_enabled!(log::Level::Debug)
             .then(|| display_diagnostic_request(data))
             .flatten();
@@ -821,6 +946,11 @@ impl HidDevice {
                     }
                 }
 
+                if let Some(responder) = recorder.responder.lock().unwrap().as_mut() {
+                    if let Some(response) = responder(&request) {
+                        return response.map_err(anyhow::Error::msg);
+                    }
+                }
                 if let Some(response) = recorder.responses.lock().unwrap().pop_front() {
                     return Ok(response);
                 }
@@ -2498,5 +2628,89 @@ mod tests {
         let (hid, _) = HidDevice::test_device();
 
         assert!(hid.macos_hid_operation_lock().is_none());
+    }
+
+    #[test]
+    fn read_only_session_refuses_every_write_before_the_transport() {
+        let session = ReadOnlyHidSession::default();
+        let (hid, recorder) = HidDevice::test_read_only_device(session.clone());
+        let writes: &[&[u8]] = &[
+            &[CMD_VIA_SET_KEYBOARD_VALUE, VIA_LAYOUT_OPTIONS, 0, 0, 0, 1],
+            &[CMD_VIA_SET_KEYCODE, 0, 0, 0, 0, 4],
+            &[0x06], // VIA dynamic keymap reset
+            &[CMD_VIA_CUSTOM_SET_VALUE, ERGOHAVEN_CUSTOM_NAMESPACE, 0x03],
+            &[CMD_VIA_LIGHTING_SET_VALUE, QMK_RGBLIGHT_BRIGHTNESS, 10],
+            &[CMD_VIA_LIGHTING_SAVE],
+            &[0x0B], // VIA bootloader jump
+            &[CMD_VIA_MACRO_SET_BUFFER, 0, 0, 1, 0],
+            &[0x10], // VIA macro reset
+            &[CMD_VIA_VIAL_PREFIX, CMD_VIAL_SET_ENCODER, 0, 0, 0, 0, 4],
+            &[CMD_VIA_VIAL_PREFIX, CMD_VIAL_UNLOCK_START],
+            &[CMD_VIA_VIAL_PREFIX, CMD_VIAL_UNLOCK_POLL],
+            &[CMD_VIA_VIAL_PREFIX, CMD_VIAL_LOCK],
+            &[CMD_VIA_VIAL_PREFIX, CMD_VIAL_QMK_SETTINGS_SET, 200, 0, b'A'],
+            &[CMD_VIA_VIAL_PREFIX, 0x0C], // Vial QMK settings reset
+            &[
+                CMD_VIA_VIAL_PREFIX,
+                CMD_VIAL_DYNAMIC_ENTRY_OP,
+                DYNAMIC_VIAL_TAP_DANCE_SET,
+            ],
+            &[
+                CMD_VIA_VIAL_PREFIX,
+                CMD_VIAL_DYNAMIC_ENTRY_OP,
+                DYNAMIC_VIAL_COMBO_SET,
+            ],
+            &[
+                CMD_VIA_VIAL_PREFIX,
+                CMD_VIAL_DYNAMIC_ENTRY_OP,
+                DYNAMIC_VIAL_KEY_OVERRIDE_SET,
+            ],
+            &[
+                CMD_VIA_VIAL_PREFIX,
+                CMD_VIAL_DYNAMIC_ENTRY_OP,
+                DYNAMIC_VIAL_ALT_REPEAT_KEY_SET,
+            ],
+            &[0xB6, 1],      // standby animation session
+            &[0xC2],         // pictogram upload
+            &[0xD4],         // startup image clear
+            &[0xAA, 12, 34], // host clock
+            &[],
+        ];
+
+        for write in writes {
+            assert!(hid.usb_send(write).is_err(), "{write:02x?} was not refused");
+        }
+        assert!(hid.write_output_report(&[0xAA, 12, 34]).is_err());
+        assert!(hid.shared_output().is_none());
+
+        assert!(
+            recorder.requests().is_empty(),
+            "{:02x?}",
+            recorder.requests()
+        );
+        assert_eq!(session.refused_requests().len(), writes.len() + 1);
+        assert!(session.failed_reads().is_empty());
+    }
+
+    #[test]
+    fn read_only_session_passes_reads_and_keeps_the_failed_ones() {
+        let session = ReadOnlyHidSession::default();
+        let (hid, recorder) = HidDevice::test_read_only_device(session.clone());
+        recorder.respond_by(|request| {
+            (request[0] == CMD_VIA_MACRO_GET_BUFFER).then(|| Err("HID timeout".to_owned()))
+        });
+
+        hid.get_protocol_version().unwrap();
+        hid.get_keyboard_id().unwrap();
+        hid.get_keymap_buffer(1, 1, 1).unwrap();
+        hid.get_combo(0).unwrap();
+        hid.get_qmk_setting_u16(2).unwrap();
+        assert!(hid.get_macro_buffer(4, 1).is_err());
+
+        assert_eq!(recorder.requests().len(), 6);
+        assert!(session.refused_requests().is_empty());
+        let failed = session.failed_reads();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0][..4], [CMD_VIA_MACRO_GET_BUFFER, 0, 0, 4]);
     }
 }
