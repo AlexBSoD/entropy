@@ -739,6 +739,8 @@ impl EntropyApp {
                 .expect("test connect worker receiver");
             return;
         }
+        #[cfg(test)]
+        let test_hid = self.test_connect_hid.take();
 
         std::thread::spawn(move || {
             let progress = |message: &str| -> Result<(), String> {
@@ -758,8 +760,14 @@ impl EntropyApp {
                     dev.vendor_id,
                     dev.product_id
                 );
-                let dev_conn =
-                    HidDevice::open_fresh_for(&dev).map_err(|e| format!("Open failed: {e:#}"))?;
+                #[cfg(test)]
+                let opened = match test_hid {
+                    Some(hid) => Ok(hid),
+                    None => HidDevice::open_fresh_for(&dev),
+                };
+                #[cfg(not(test))]
+                let opened = HidDevice::open_fresh_for(&dev);
+                let dev_conn = opened.map_err(|e| format!("Open failed: {e:#}"))?;
                 let standby_animation_load = Self::device_uses_automatic_display_host_data(&dev)
                     .then(|| dev_conn.pause_standby_animation_for_load());
                 let staged_bluetooth_load = dev_conn.is_bluetooth_transport();

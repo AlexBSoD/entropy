@@ -717,6 +717,22 @@ impl EntropyApp {
         deferred_full_layout_data_ready(&self.deferred_device_load, action)
     }
 
+    /// The layers and `.entlayout` sections not loaded yet (or failed to load)
+    /// on the current connection, with their status.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn entlayout_export_gaps(&self) -> Vec<(String, DeferredLoadStatus)> {
+        let state = &self.deferred_device_load;
+        let layers = (0..self.layer_count.max(1))
+            .map(|layer| (format!("Layer{layer}"), state.layer_status(layer)));
+        let sections = ENTLAYOUT_EXPORT_SECTIONS
+            .into_iter()
+            .map(|section| (format!("{section:?}"), state.section_status(section)));
+        layers
+            .chain(sections)
+            .filter(|(_, status)| !status.ready())
+            .collect()
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn maybe_start_deferred_device_load(
         &mut self,
