@@ -1736,6 +1736,76 @@ mod tests {
     }
 
     #[test]
+    fn stale_rmk_confirmation_timeout_retries_status_only() {
+        let (hid, recorder) = crate::hid::HidDevice::test_device_with_fault_after_requests(Some((
+            1,
+            crate::hid::TestHidFault::Timeout,
+        )));
+        let mut stale_poll = [0u8; 32];
+        stale_poll[..3].copy_from_slice(&[0, 1, 0]);
+        recorder.respond_with([stale_poll]);
+
+        let error = hid.unlock_poll().unwrap_err();
+        assert!(format!("{error:#}").contains("failed to read Vial unlock status"));
+
+        let requests = recorder.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(&requests[0][..2], &[0xFE, 0x07]);
+        assert_eq!(&requests[1][..2], &[0xFE, 0x05]);
+
+        // The physical keys are now released; firmware reports the latched
+        // result. The retry must not send another poll and re-arm old RMK.
+        let mut released_status = [0xFFu8; 32];
+        released_status[..2].copy_from_slice(&[1, 0]);
+        recorder.respond_with([released_status]);
+
+        assert_eq!(hid.unlock_poll().unwrap(), (true, false, 0));
+        let requests = recorder.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(&requests[2][..2], &[0xFE, 0x05]);
+    }
+
+    #[test]
+    fn still_pending_unlock_remains_pending_after_confirmation() {
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        let mut poll = [0u8; 32];
+        poll[..3].copy_from_slice(&[1, 1, 0]);
+        let mut status = [0xFFu8; 32];
+        status[..4].copy_from_slice(&[1, 1, 0, 0]);
+        recorder.respond_with([poll, status]);
+
+        let outcome = run_vial_hid_operation(&hid, VialHidOperation::UnlockPoll).unwrap();
+
+        assert!(matches!(
+            outcome,
+            VialHidOutcome::UnlockPolled {
+                unlocked: true,
+                in_progress: true,
+                counter: 0,
+            }
+        ));
+
+        let mut completed_status = [0xFFu8; 32];
+        completed_status[..2].copy_from_slice(&[1, 0]);
+        recorder.respond_with([completed_status]);
+
+        let outcome = run_vial_hid_operation(&hid, VialHidOperation::UnlockPoll).unwrap();
+        assert!(matches!(
+            outcome,
+            VialHidOutcome::UnlockPolled {
+                unlocked: true,
+                in_progress: false,
+                counter: 0,
+            }
+        ));
+        let requests = recorder.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(&requests[0][..2], &[0xFE, 0x07]);
+        assert_eq!(&requests[1][..2], &[0xFE, 0x05]);
+        assert_eq!(&requests[2][..2], &[0xFE, 0x05]);
+    }
+
+    #[test]
     fn battery_refresh_uses_the_existing_vial_transport() {
         let (hid, recorder) = crate::hid::HidDevice::test_device();
 

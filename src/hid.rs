@@ -194,6 +194,7 @@ mod hid_vial;
 #[cfg(not(target_arch = "wasm32"))]
 pub struct HidDevice {
     backend: HidBackend,
+    unlock_confirmation_pending: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
@@ -531,6 +532,7 @@ impl HidDevice {
             output_connected: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let device = Self {
+            unlock_confirmation_pending: std::sync::atomic::AtomicBool::new(false),
             backend: HidBackend::Test {
                 recorder: recorder.clone(),
                 combo: std::sync::Mutex::new(([0; 4], 0)),
@@ -567,6 +569,7 @@ impl HidDevice {
             match crate::linux_ble::LinuxBleDevice::open(device) {
                 Ok(bluez_device) => {
                     return Ok(Self {
+                        unlock_confirmation_pending: std::sync::atomic::AtomicBool::new(false),
                         backend: HidBackend::LinuxBle(bluez_device),
                     })
                 }
@@ -645,6 +648,7 @@ impl HidDevice {
 
     fn open_proxy_for(device: &crate::device::Device) -> Result<Self> {
         Ok(Self {
+            unlock_confirmation_pending: std::sync::atomic::AtomicBool::new(false),
             backend: HidBackend::Proxy(std::sync::Arc::new(HidProxy::open(device)?)),
         })
     }
@@ -691,6 +695,7 @@ impl HidDevice {
             let transport = device_transport(device);
             let write_framing = detect_hid_write_framing(&hid_device, transport)?;
             return Ok(Self {
+                unlock_confirmation_pending: std::sync::atomic::AtomicBool::new(false),
                 backend: HidBackend::Local {
                     device: hid_device,
                     transport,
