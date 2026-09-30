@@ -267,6 +267,7 @@ impl EntropyApp {
             unlock_open: false,
             vial_unlocked: None,
             vial_unlock_keys: vec![],
+            vial_unlock_session_started: false,
             vial_unlock_polling: false,
             vial_unlock_counter: 0,
             vial_unlock_best: 50,
@@ -338,40 +339,6 @@ impl EntropyApp {
                     &[("error", &e.to_string())],
                 );
             }
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn cancel_vial_unlock(&mut self, suppress_macro_auto_unlock: bool) {
-        if let Some(hid) = &self.hid_device {
-            match hid.lock() {
-                Ok(()) => {
-                    self.vial_unlocked = Some(false);
-                    self.status_msg = crate::i18n::tr_catalog(
-                        self.app_settings.language,
-                        "status_messages.device_unlock_cancelled",
-                    )
-                    .into();
-                }
-                Err(e) => {
-                    self.status_msg = crate::i18n::tr_catalog_format(
-                        self.app_settings.language,
-                        "status_messages.cancel_unlock_failed",
-                        &[("error", &e.to_string())],
-                    );
-                }
-            }
-        }
-        self.unlock_open = false;
-        self.vial_unlock_polling = false;
-        self.vial_unlock_last_poll = None;
-        self.pending_layout_indicator_open_after_unlock = false;
-        self.vial_unlock_counter = 0;
-        self.vial_unlock_best = 50;
-        self.matrix_tester_unlock_prompted = false;
-        self.matrix_tester_lock_checked = false;
-        if suppress_macro_auto_unlock {
-            self.macro_auto_unlock_cancelled = true;
         }
     }
 }

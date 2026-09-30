@@ -105,6 +105,27 @@ fn connection_replaces_layout_canvas(connect_state: &ConnectState, layout_loaded
 }
 
 impl EntropyApp {
+    fn maybe_open_macro_unlock_preflight(&mut self) {
+        if !self.keycode_picker.open || self.keycode_picker.selected_tab != KeycodeTab::Macro {
+            self.macro_auto_unlock_cancelled = false;
+            return;
+        }
+        if self.firmware == FirmwareProtocol::Vial
+            && !self.unlock_open
+            && !self.vial_unlock_session_started
+            && !self.vial_unlock_polling
+            && !self.macro_auto_unlock_cancelled
+            && self.is_vial_locked()
+        {
+            self.unlock_open = true;
+            self.status_msg = crate::i18n::tr_catalog(
+                self.app_settings.language,
+                "connection.keyboard_locked_edit_macros",
+            )
+            .into();
+        }
+    }
+
     fn main_window_hidden_to_tray(&self) -> bool {
         #[cfg(target_os = "windows")]
         {
@@ -466,6 +487,40 @@ mod tests {
     use super::super::settings_write_queue::SettingsWriteStatus;
     use super::*;
     use crate::keyboard::{KeyboardLayout, LayoutOption, PhysicalKey};
+
+    #[test]
+    fn macro_tab_preflight_does_not_reopen_after_cancel_until_tab_changes() {
+        let mut app = EntropyApp::new_inert_for_test();
+        app.firmware = FirmwareProtocol::Vial;
+        app.layout = Some(
+            KeyboardLayout::from_vial_json(&serde_json::json!({
+                "name": "Test keyboard",
+                "matrix": { "rows": 1, "cols": 1 },
+                "layouts": { "keymap": [["0,0"]] }
+            }))
+            .unwrap(),
+        );
+        app.vial_unlocked = Some(false);
+        app.keycode_picker.open = true;
+        app.keycode_picker.selected_tab = KeycodeTab::Macro;
+
+        app.maybe_open_macro_unlock_preflight();
+        assert!(app.unlock_open);
+        assert!(!app.vial_unlock_session_started);
+        app.dismiss_vial_unlock_preflight();
+        app.maybe_open_macro_unlock_preflight();
+        assert!(!app.unlock_open);
+
+        app.keycode_picker.open = false;
+        app.maybe_open_macro_unlock_preflight();
+        app.keycode_picker.macros_dirty = true;
+        app.maybe_start_macro_write(&egui::Context::default());
+        assert!(!app.unlock_open);
+        assert!(app.keycode_picker.macros_dirty);
+        app.keycode_picker.open = true;
+        app.maybe_open_macro_unlock_preflight();
+        assert!(app.unlock_open);
+    }
 
     #[test]
     fn logic_never_paints_the_layout_indicator_viewport() {
@@ -1331,25 +1386,7 @@ impl eframe::App for EntropyApp {
             self.selected_encoder = None;
         }
 
-        if !self.keycode_picker.open || self.keycode_picker.selected_tab != KeycodeTab::Macro {
-            self.macro_auto_unlock_cancelled = false;
-        }
-
-        if self.firmware == FirmwareProtocol::Vial
-            && self.keycode_picker.open
-            && self.keycode_picker.selected_tab == KeycodeTab::Macro
-            && !self.unlock_open
-            && !self.vial_unlock_polling
-            && !self.macro_auto_unlock_cancelled
-            && self.is_vial_locked()
-        {
-            self.unlock_open = true;
-            self.status_msg = crate::i18n::tr_catalog(
-                self.app_settings.language,
-                "connection.keyboard_locked_edit_macros",
-            )
-            .into();
-        }
+        self.maybe_open_macro_unlock_preflight();
 
         // Arrow keys Left/Right switch layers (when picker is closed and no text field is focused)
         if !self.tour_state.active
