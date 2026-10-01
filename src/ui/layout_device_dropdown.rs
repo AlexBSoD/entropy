@@ -363,24 +363,7 @@ impl EntropyApp {
                                 )
                                 .clicked()
                                 {
-                                    if self.app_settings.sticky_layout_window {
-                                        self.app_settings.sticky_layout_window = false;
-                                        self.pending_layout_indicator_open_after_unlock = false;
-                                        self.sticky_layout_last_size = None;
-                                        save_app_settings(&self.app_settings);
-                                    } else if self.is_vial_locked() {
-                                        self.pending_layout_indicator_open_after_unlock = true;
-                                        self.unlock_open = true;
-                                        self.status_msg = crate::i18n::tr_catalog(
-                                            self.app_settings.language,
-                                            "matrix_tester.keyboard_is_locked_unlock_it_to_use_matrix_tester",
-                                        )
-                                        .into();
-                                    } else {
-                                        self.app_settings.sticky_layout_window = true;
-                                        self.sticky_layout_last_size = None;
-                                        save_app_settings(&self.app_settings);
-                                    }
+                                    self.toggle_sticky_layout_window();
                                     ctx.request_repaint();
                                     device_clicked = true;
                                 }

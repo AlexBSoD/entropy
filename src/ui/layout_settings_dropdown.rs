@@ -111,6 +111,7 @@ impl EntropyApp {
             let show_update_indicator = crate::app::update_available(&self.update_check);
             let show_matrix_item = self.firmware == FirmwareProtocol::Vial;
             let is_unlocked = self.vial_unlocked == Some(true);
+            let matrix_enabled = self.vial_lock_allows_settings_tab(SettingsTab::MatrixTester);
             #[cfg(not(target_arch = "wasm32"))]
             let vial_hid_idle = vial_lock_control_idle(
                 self.hid_user_action_busy(),
@@ -255,7 +256,7 @@ impl EntropyApp {
                                         ui,
                                         item_width,
                                         crate::i18n::tr(lang, TrKey::MatrixTesterTitle),
-                                        true,
+                                        matrix_enabled,
                                         self.main_menu_tab == MainMenuTab::Settings
                                             && self.settings_tab == SettingsTab::MatrixTester,
                                     )
@@ -393,6 +394,16 @@ impl EntropyApp {
                                         && self.settings_tab == SettingsTab::AboutEntropy,
                                     show_update_indicator,
                                 );
+                                if !matrix_enabled {
+                                    if let Some(response) =
+                                        matrix_resp.as_ref().filter(|response| response.hovered())
+                                    {
+                                        response.clone().on_hover_text(crate::i18n::tr_catalog(
+                                            lang,
+                                            "matrix_tester.keyboard_is_locked_unlock_it_to_use_matrix_tester",
+                                        ));
+                                    }
+                                }
                                 if app_resp.clicked() {
                                     self.close_top_dropdowns(ui.ctx());
                                     self.open_app_settings_page();

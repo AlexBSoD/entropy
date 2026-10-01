@@ -53,6 +53,7 @@ impl EntropyApp {
         layout: &KeyboardLayout,
         ctx: &egui::Context,
     ) {
+        self.leave_locked_vial_settings_tab();
         let viewport = ui.max_rect();
         let avail = viewport.size();
         let layout_top_reserved_h = LAYOUT_TOP_RESERVED_H
