@@ -5346,6 +5346,8 @@ pub struct EntropyApp {
     /// Cached Vial lock state. `None` means the device has not answered yet.
     pub(crate) vial_unlocked: Option<bool>,
     pub(crate) vial_unlock_keys: Vec<(u8, u8)>,
+    /// An unlock-start task has been submitted; the HID command may already be in flight.
+    pub(crate) vial_unlock_session_started: bool,
     pub(crate) vial_unlock_polling: bool,
     pub(crate) vial_unlock_counter: u8,
     pub(crate) vial_unlock_best: u8,

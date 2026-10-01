@@ -543,12 +543,8 @@ impl EntropyApp {
             return;
         }
         if self.is_vial_locked() {
-            self.unlock_open = true;
-            self.status_msg = crate::i18n::tr_catalog(
-                self.app_settings.language,
-                "connection.keyboard_locked_edit_macros",
-            )
-            .into();
+            // Preserve the dirty edit for an explicit unlock; do not reopen a
+            // cancelled preflight just because the picker closed.
             return;
         }
 
