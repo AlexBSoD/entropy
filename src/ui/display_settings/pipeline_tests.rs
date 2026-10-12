@@ -8,6 +8,7 @@ mod tap_dance_tests;
 
 #[test]
 fn translated_catalog_reuses_storage_per_language() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     let english = pictogram_catalog(crate::i18n::Language::English);
     let russian = pictogram_catalog(crate::i18n::Language::Russian);
     let english_again = pictogram_catalog(crate::i18n::Language::English);
@@ -21,6 +22,7 @@ fn translated_catalog_reuses_storage_per_language() {
 
 #[test]
 fn saved_filter_does_not_retranslate_legacy_names_for_each_record() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     let icon = SavedPictogram {
         origin: PictogramOrigin::Legacy,
         name: "User artwork".into(),
@@ -264,6 +266,7 @@ fn full_ui_supplied_library_replay_hides_known_stock_preserves_unknown_artwork()
 
 #[test]
 fn full_ui_library_reader_hides_legacy_stock_independently_of_display_rgb() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     for language in crate::i18n::Language::ALL {
         for color in [[84, 189, 191], [255, 255, 255], [210, 180, 140], [1, 2, 3]] {
             let directory = tempfile::tempdir().unwrap();
@@ -297,6 +300,7 @@ fn full_ui_library_reader_hides_legacy_stock_independently_of_display_rgb() {
 
 #[test]
 fn confirmed_agent_layer_masks_are_stock_but_authored_and_pixel_edits_survive() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     let masks = include_bytes!("../../../assets/legacy-layer-navigation-agent-confirmed.bin");
     let start = 38 + crate::action_icons::ACTION_ICON_COUNT + 20;
     for language in crate::i18n::Language::ALL {
@@ -321,6 +325,7 @@ fn confirmed_agent_layer_masks_are_stock_but_authored_and_pixel_edits_survive() 
 
 #[test]
 fn full_ui_legacy_32px_library_reader_keeps_same_name_pixel_edits() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     for language in crate::i18n::Language::ALL {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("legacy.json");
@@ -379,6 +384,7 @@ fn full_ui_legacy_32px_library_reader_keeps_same_name_pixel_edits() {
 
 #[test]
 fn actual_import_preserves_explicit_user_authorship_over_a_hidden_stock_duplicate() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("authored.json");
     let mut records = historical_promoted_stock_snapshot(crate::i18n::Language::English);
@@ -410,6 +416,7 @@ fn actual_import_preserves_explicit_user_authorship_over_a_hidden_stock_duplicat
 
 #[test]
 fn library_reader_marks_recognized_legacy_stock_before_import_can_rename_it() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("icons.json");
     let mut records = historical_promoted_stock_snapshot(crate::i18n::Language::English);
@@ -427,6 +434,7 @@ fn library_reader_marks_recognized_legacy_stock_before_import_can_rename_it() {
 
 #[test]
 fn full_ui_library_reader_preserves_explicit_user_origin_even_for_exact_stock_pixels() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("pictograms.json");
     let mut records = historical_promoted_stock_snapshot(crate::i18n::Language::English);
@@ -460,6 +468,7 @@ fn full_ui_library_reader_preserves_explicit_user_origin_even_for_exact_stock_pi
 
 #[test]
 fn full_ui_historical_promoted_stock_does_not_create_my_pictograms_group() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     for language in crate::i18n::Language::ALL {
         let (mut app, ctx, recorder) = app(true);
         click_label(&mut app, &ctx, "Пиктограммы");
@@ -489,6 +498,7 @@ fn full_ui_historical_promoted_stock_does_not_create_my_pictograms_group() {
 
 #[test]
 fn full_ui_saved_picker_deduplicates_exact_records_but_preserves_edited_variants() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     let (mut app, ctx, recorder) = app(true);
     click_label(&mut app, &ctx, "Пиктограммы");
     let stock_index = 38;
@@ -557,6 +567,7 @@ fn full_ui_saved_picker_deduplicates_exact_records_but_preserves_edited_variants
 
 #[test]
 fn full_ui_closed_picker_skips_saved_filter_and_repeated_name_translation() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     let (mut app, ctx, recorder) = app(true);
     click_label(&mut app, &ctx, "Пиктограммы");
     app.app_settings.saved_pictograms = (0..512)
@@ -584,6 +595,7 @@ fn full_ui_closed_picker_skips_saved_filter_and_repeated_name_translation() {
 
 #[test]
 fn cached_stock_records_keep_exact_legacy_matching_for_every_language_and_bitmap() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     for language in crate::i18n::Language::ALL {
         for index in 0..BUILTIN_PICTOGRAM_KEYS.len() {
             let mut variants = vec![builtin_pictogram_bitmap(index)];
@@ -622,6 +634,7 @@ fn cached_stock_records_keep_exact_legacy_matching_for_every_language_and_bitmap
 
 #[test]
 fn saved_filter_tracks_in_place_name_color_bitmap_and_collection_edits() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     let index = 0;
     let original = SavedPictogram {
         origin: PictogramOrigin::Legacy,
@@ -667,6 +680,7 @@ fn saved_filter_tracks_in_place_name_color_bitmap_and_collection_edits() {
 
 #[test]
 fn full_ui_open_picker_refreshes_language_and_custom_artwork_without_stale_filter() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     let (mut app, ctx, recorder) = app(true);
     click_label(&mut app, &ctx, "Пиктограммы");
     let original = SavedPictogram {
@@ -737,6 +751,7 @@ fn full_ui_open_picker_refreshes_language_and_custom_artwork_without_stale_filte
 
 #[test]
 fn slot_save_keeps_pictogram_page_visible_without_library_loading_message() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     let (mut app, ctx, _recorder) = app(true);
     click_label(&mut app, &ctx, "Пиктограммы");
     app.display_settings.pictograms.saving = true;
@@ -756,6 +771,7 @@ fn slot_save_keeps_pictogram_page_visible_without_library_loading_message() {
 
 #[test]
 fn full_ui_repeated_assignments_use_actual_popup_without_reunlock() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     let catalog = pictogram_catalog(crate::i18n::Language::Russian);
     for initially_unlocked in [false, true] {
         let (mut app, ctx, recorder) = app(initially_unlocked);

@@ -1,5 +1,5 @@
 //! Real layout/menu/file-dispatch code; only native picker and HID are replaced.
-//! Run with XDG_CONFIG_HOME in scratch: imports persist local metadata.
+//! Each test owns an isolated output root, including settings and auto-backups.
 use super::*;
 use crate::application_layouts::{
     DetectedApplication, DeviceApplicationLayouts, DEFAULT_APPLICATION_LAYOUT_ID,
@@ -97,6 +97,7 @@ fn fixture() -> (EntropyApp, crate::hid::TestHidRecorder, String) {
 
 #[test]
 fn macropad_application_file_round_trip_targets_only_explicit_profile() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     let (mut app, recorder, application) = fixture();
     app.application_layout_settings_mut()
         .unwrap()
@@ -152,7 +153,60 @@ fn macropad_application_file_round_trip_targets_only_explicit_profile() {
 }
 
 #[test]
+fn macropad_application_persistence_failure_keeps_memory_library_and_existing_destination() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
+    let (mut app, recorder, application) = fixture();
+    let input = _storage.path().join("application.entapp");
+    app.write_application_layout_export(&input, &application)
+        .unwrap();
+    app.application_layout_settings_mut()
+        .unwrap()
+        .layouts
+        .get_mut(&application)
+        .unwrap()
+        .set_keycode(0, 0, 42);
+    let before = serde_json::to_value(&app.app_settings).unwrap();
+    write_pictogram_file(
+        &pictogram_library_path(),
+        &app.app_settings.saved_pictograms,
+    )
+    .unwrap();
+    let library_before = std::fs::read(pictogram_library_path()).unwrap();
+    // A directory at the destination makes atomic persist fail even as root.
+    let destination = app_settings_path();
+    std::fs::create_dir(&destination).unwrap();
+    let sentinel = destination.join("keep");
+    std::fs::write(&sentinel, b"untouched").unwrap();
+    let error = app
+        .import_application_layout_from_path(&input, &application)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Failed to save application layout"),
+        "{error:#}"
+    );
+    assert_eq!(serde_json::to_value(&app.app_settings).unwrap(), before);
+    assert_eq!(
+        std::fs::read(pictogram_library_path()).unwrap(),
+        library_before
+    );
+    assert_eq!(std::fs::read(sentinel).unwrap(), b"untouched");
+    assert!(recorder.requests().is_empty());
+    // PersistError owns the temporary file until the reported error is dropped.
+    drop(error);
+    assert!(std::fs::read_dir(destination.parent().unwrap())
+        .unwrap()
+        .all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".tmp")));
+}
+
+#[test]
 fn macropad_application_menu_shows_explicit_copy_target() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     let (mut app, _, application) = fixture();
     app.application_layout_settings_mut()
         .unwrap()
@@ -206,6 +260,7 @@ fn macropad_application_menu_shows_explicit_copy_target() {
 
 #[test]
 fn macropad_application_menu_clicks_reach_async_picker_and_profile_file_dispatch() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     for export in [true, false] {
         let (mut app, recorder, application) = fixture();
         app.application_layout_settings_mut()
@@ -304,6 +359,7 @@ fn macropad_application_menu_clicks_reach_async_picker_and_profile_file_dispatch
 
 #[test]
 fn macropad_application_picker_dispatch_keeps_captured_target_when_selection_changes() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     use crate::app::file_dialog::FileDialogAction;
     let (mut app, recorder, application) = fixture();
     let other = app
@@ -396,6 +452,7 @@ fn macropad_application_picker_dispatch_keeps_captured_target_when_selection_cha
 
 #[test]
 fn macropad_application_import_rejects_shared_resource_ids_without_partial_changes() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     let (mut app, recorder, application) = fixture();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("resource.entapp");
@@ -421,6 +478,7 @@ fn macropad_application_import_rejects_shared_resource_ids_without_partial_chang
 
 #[test]
 fn macropad_application_picker_rejects_stale_connection_and_deleted_target() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     let (mut app, _, application) = fixture();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("stale.entapp");
@@ -452,6 +510,7 @@ fn macropad_application_picker_rejects_stale_connection_and_deleted_target() {
 
 #[test]
 fn macropad_default_universal_reordered_mapping_imports_encoders_losslessly_and_keeps_stacks() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     let (mut app, _, application) = fixture();
     let stacks = app.application_layout_settings().unwrap().layouts[DEFAULT_APPLICATION_LAYOUT_ID]
         .encoder_stacks
@@ -494,6 +553,7 @@ fn macropad_default_universal_reordered_mapping_imports_encoders_losslessly_and_
 
 #[test]
 fn macropad_default_export_uses_default_storage_not_device_or_active_application() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     let (mut app, _, application) = fixture();
     let settings = app.application_layout_settings_mut().unwrap();
     settings.active_layout_id = application.clone();
@@ -537,6 +597,7 @@ fn macropad_default_export_uses_default_storage_not_device_or_active_application
 
 #[test]
 fn macropad_default_import_updates_rendered_default_and_preserves_application_profiles() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     let (mut app, recorder, application) = fixture();
     let profile_before =
         serde_json::to_value(&app.application_layout_settings().unwrap().layouts[&application])
@@ -561,7 +622,27 @@ fn macropad_default_import_updates_rendered_default_and_preserves_application_pr
         .take()
         .expect("picker result queues import");
     assert_eq!(generation, app.connection_generation);
+    let before_import = app.entlayout_snapshot().unwrap();
     app.import_entlayout_from_path(&path).unwrap();
+    let backup_dir = _storage.path().join("entropy/backups");
+    let backups: Vec<_> = std::fs::read_dir(&backup_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(backups.len(), 1, "import must persist its real auto-backup");
+    let backup: EntLayoutFile =
+        serde_json::from_slice(&std::fs::read(&backups[0]).unwrap()).unwrap();
+    assert_eq!(backup.data.keymap, before_import.data.keymap);
+    let persisted: AppSettings =
+        serde_json::from_slice(&std::fs::read(app_settings_path()).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::to_value(&persisted.application_layouts).unwrap(),
+        serde_json::to_value(&app.app_settings.application_layouts).unwrap()
+    );
+    assert_eq!(
+        read_pictogram_file(&pictogram_library_path()).unwrap(),
+        app.app_settings.saved_pictograms
+    );
     assert!(
         recorder
             .requests()
@@ -589,6 +670,7 @@ fn macropad_default_import_updates_rendered_default_and_preserves_application_pr
 
 #[test]
 fn macropad_import_while_application_active_preserves_profiles_and_unmapped_default_controls() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     let (mut app, _, application) = fixture();
     {
         let settings = app.application_layout_settings_mut().unwrap();
@@ -664,6 +746,7 @@ fn macropad_import_while_application_active_preserves_profiles_and_unmapped_defa
 
 #[test]
 fn k04_standard_layout_round_trip_does_not_touch_saved_macropad_profiles() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     let (mut app, _, _) = fixture();
     let mut keyboard = app.device_manager.devices()[0].clone();
     keyboard.name = "K:04".into();
@@ -685,6 +768,7 @@ fn k04_standard_layout_round_trip_does_not_touch_saved_macropad_profiles() {
 
 #[test]
 fn macropad_menu_clicks_queue_standard_import_export_without_application_gating() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
     for (label_key, expected) in [
         ("Import layout", DeferredFullLayoutAction::ImportEntlayout),
         ("Export layout", DeferredFullLayoutAction::ExportEntlayout),

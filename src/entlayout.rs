@@ -966,7 +966,7 @@ impl EntropyApp {
             self.app_settings.language,
             "entlayout.cannot_create_backup_without_keyboard",
         ))?;
-        let dir = dirs::config_dir()
+        let dir = storage_config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("entropy")
             .join("backups");
