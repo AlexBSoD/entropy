@@ -28,11 +28,29 @@ use super::typing_trainer_symbols::{
 };
 use super::*;
 
+/// Legacy files did not record authorship. Never infer it from display RGB.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PictogramOrigin {
+    #[default]
+    Legacy,
+    User,
+    Stock,
+}
+
+impl PictogramOrigin {
+    fn is_legacy(&self) -> bool {
+        *self == Self::Legacy
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SavedPictogram {
     pub(crate) name: String,
     pub(crate) color: [u8; 3],
     pub(crate) bitmap: Vec<u8>,
+    #[serde(default, skip_serializing_if = "PictogramOrigin::is_legacy")]
+    pub(crate) origin: PictogramOrigin,
 }
 
 /// Entropy-only visibility of physical positions, independent of the firmware keymap.

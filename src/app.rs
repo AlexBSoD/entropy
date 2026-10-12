@@ -29,7 +29,14 @@ pub(crate) use pictograms::*;
 
 #[path = "app_state.rs"]
 mod app_state;
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "pictogram_origin.rs"]
+mod pictogram_origin;
 pub use app_state::*;
+#[cfg(not(target_arch = "wasm32"))]
+use pictogram_origin::is_known_migrated_stock_pictogram;
+#[cfg(test)]
+use pictogram_origin::LEGACY_NAME_LOOKUPS;
 
 #[path = "app_init.rs"]
 mod app_init;
@@ -44,6 +51,9 @@ use app_update::*;
 mod app_repaint;
 #[cfg(not(target_arch = "wasm32"))]
 use app_repaint::*;
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "application_layout_portable.rs"]
+mod application_layout_portable;
 #[path = "entlayout.rs"]
 mod entlayout;
 #[cfg(not(target_arch = "wasm32"))]

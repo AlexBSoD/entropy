@@ -738,6 +738,48 @@ impl EntropyApp {
 
     fn entlayout_snapshot(&self) -> Option<EntLayoutFile> {
         let layout = self.layout.as_ref()?;
+        // The ordinary layout file is always Default, never the foreground
+        // application's host overlay. Include local Default edits even while
+        // their standalone firmware write is still pending.
+        let default_profile = self.selected_device.and_then(|_| {
+            self.application_layout_settings().and_then(|settings| {
+                settings
+                    .layouts
+                    .get(crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID)
+            })
+        });
+        let default_layout = default_profile.map(|profile| {
+            let mut rendered =
+                Self::application_layout_rendered_copy_for_profile(layout, Some(profile));
+            rendered.layers.truncate(layout.layers.len());
+            rendered
+                .encoder_layers
+                .truncate(layout.encoder_layers.len());
+            // Fresh/migrated profiles use UNSET as an inheritance marker.
+            // It is not a portable keycode and must never replace firmware data.
+            for (target, source) in rendered.layers.iter_mut().zip(&layout.layers) {
+                for (target, source) in target.iter_mut().zip(source) {
+                    if target.vial_keycode()
+                        == crate::application_layouts::APPLICATION_LAYOUT_UNSET_KEYCODE
+                    {
+                        *target = *source;
+                    }
+                }
+            }
+            for (target, source) in rendered
+                .encoder_layers
+                .iter_mut()
+                .zip(&layout.encoder_layers)
+            {
+                for (target, source) in target.iter_mut().zip(source) {
+                    if *target == crate::application_layouts::APPLICATION_LAYOUT_UNSET_KEYCODE {
+                        *target = *source;
+                    }
+                }
+            }
+            rendered
+        });
+        let layout = default_layout.as_ref().unwrap_or(layout);
         let keyboard = EntLayoutKeyboard {
             name: self.current_device_name_if_known(layout),
             firmware: self.firmware,
@@ -780,7 +822,16 @@ impl EntropyApp {
                         .unwrap_or_default(),
                 ),
                 layout_options: self.layout_options_value,
-                layer_names: self.layer_names.clone(),
+                layer_names: default_profile
+                    .map(|profile| {
+                        profile
+                            .layer_names
+                            .iter()
+                            .take(layout.layers.len())
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_else(|| self.layer_names.clone()),
                 text_expander: self.text_expander_entlayout_snapshot(),
                 macros: EntMacroData {
                     bytecode_base64: self
@@ -1974,6 +2025,61 @@ impl EntropyApp {
             }
         }
 
+        // Macropad renders Default from host profile storage, not self.layout.
+        // Update only imported positions in that profile; other applications,
+        // encoder stacks and unmapped controls must remain untouched.
+        if let (Some(layout), Some(device_key)) = (
+            self.layout.as_ref(),
+            self.selected_device
+                .and_then(|_| self.application_layout_device_key()),
+        ) {
+            if let Some(profile) = self
+                .app_settings
+                .application_layouts
+                .get_mut(&device_key)
+                .and_then(|settings| {
+                    settings
+                        .layouts
+                        .get_mut(crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID)
+                })
+            {
+                for source_layer in 0..bundle.data.keymap.len() {
+                    let Some(layer) = map_layer_index(source_layer, self.layer_count) else {
+                        continue;
+                    };
+                    for target in mapping.key_mapping.iter().flatten().copied() {
+                        if let Some(control) = Self::application_control_for_key(layout, target) {
+                            profile.set_keycode(layer, control, layout.get_keycode(layer, target));
+                        }
+                    }
+                }
+                for source_layer in 0..bundle.data.encoder_keymap.len() {
+                    let Some(layer) = map_layer_index(source_layer, self.layer_count) else {
+                        continue;
+                    };
+                    for target in mapping.encoder_mapping.iter().flatten().copied() {
+                        if let Some(control) = Self::application_control_for_encoder(layout, target)
+                        {
+                            profile.set_keycode(
+                                layer,
+                                control,
+                                layout.get_encoder_keycode(layer, target),
+                            );
+                        }
+                    }
+                }
+                for (layer, name) in bundle
+                    .data
+                    .layer_names
+                    .iter()
+                    .take(self.layer_count)
+                    .enumerate()
+                {
+                    profile.set_layer_name(layer, name.clone());
+                }
+            }
+        }
+
         self.app_settings.text_expander_enabled = bundle.data.text_expander.enabled;
         self.app_settings.text_expander_app_blacklist =
             bundle.data.text_expander.app_blacklist.clone();
@@ -2951,6 +3057,10 @@ fn entlayout_hash(layout: &KeyboardLayout) -> String {
     }
     format!("fnv1a64:{hash:016x}")
 }
+
+#[cfg(test)]
+#[path = "entlayout_macropad_tests.rs"]
+mod macropad_tests;
 
 #[cfg(test)]
 mod tests {

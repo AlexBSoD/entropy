@@ -994,8 +994,16 @@ impl EntropyApp {
                 self.display_settings.pictograms.loading = false;
                 self.display_settings.pictograms.load_failure =
                     Some((self.connection_generation, error.clone()));
-                // A failed read is not proof that the firmware lacks storage.
-                if self.display_settings.pictograms.supported != Some(true) {
+                // Only the QUERY's explicit command/format rejection establishes
+                // unsupported storage (these errors originate in load_pictograms).
+                // Status/transport/read failures leave capability unconfirmed so
+                // Choose can retry, but loaded=false still prevents assignments.
+                if self.display_settings.pictograms.supported != Some(true)
+                    && matches!(
+                        error.as_str(),
+                        "pictogram command 0xC0 is unsupported" | "unsupported pictogram format"
+                    )
+                {
                     self.display_settings.pictograms.supported = Some(false);
                 }
             }

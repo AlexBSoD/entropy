@@ -209,7 +209,40 @@ struct CatalogIcon {
 // The indices are persistent identifiers in pictograms.json. Only the view is
 // deduplicated and reordered; old references and saved user artwork stay valid.
 #[cfg(not(target_arch = "wasm32"))]
-fn pictogram_catalog(lang: crate::i18n::Language) -> Vec<CatalogIcon> {
+fn pictogram_catalog(lang: crate::i18n::Language) -> &'static [CatalogIcon] {
+    use std::sync::OnceLock;
+    static ENGLISH: OnceLock<Vec<CatalogIcon>> = OnceLock::new();
+    static RUSSIAN: OnceLock<Vec<CatalogIcon>> = OnceLock::new();
+    let cache = match lang {
+        crate::i18n::Language::English => &ENGLISH,
+        crate::i18n::Language::Russian => &RUSSIAN,
+    };
+    cache.get_or_init(|| build_pictogram_catalog(lang))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn pictogram_builtin_names(lang: crate::i18n::Language) -> &'static [String] {
+    use std::sync::OnceLock;
+    static ENGLISH: OnceLock<Vec<String>> = OnceLock::new();
+    static RUSSIAN: OnceLock<Vec<String>> = OnceLock::new();
+    let cache = match lang {
+        crate::i18n::Language::English => &ENGLISH,
+        crate::i18n::Language::Russian => &RUSSIAN,
+    };
+    cache.get_or_init(|| {
+        BUILTIN_PICTOGRAM_KEYS
+            .iter()
+            .map(|key| {
+                #[cfg(test)]
+                NAME_LIST_LOOKUPS.with(|count| count.set(count.get() + 1));
+                crate::i18n::tr_catalog(lang, key).to_owned()
+            })
+            .collect()
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn build_pictogram_catalog(lang: crate::i18n::Language) -> Vec<CatalogIcon> {
     use std::collections::HashSet;
     let mut names = HashSet::new();
     let mut bitmaps = HashSet::new();
@@ -263,21 +296,14 @@ fn is_superseded_stock_pictogram(key: &str) -> bool {
 }
 
 // Older Entropy releases could put a stock snapshot in `user`. Recognize only
-// an exact legacy stock record; a user drawing may legitimately reuse a stock
-// name, bitmap, or color independently.
-#[cfg(not(target_arch = "wasm32"))]
-fn is_known_migrated_stock_pictogram(icon: &SavedPictogram) -> bool {
-    if icon.color != [84, 189, 191] {
-        return false;
-    }
-    (0..38).any(|index| {
-        let name_matches = crate::i18n::Language::ALL.iter().any(|language| {
-            icon.name.trim() == crate::i18n::tr_catalog(*language, BUILTIN_PICTOGRAM_KEYS[index])
-        });
-        name_matches
-            && (icon.bitmap == legacy_builtin_pictogram_bitmap(index)
-                || icon.bitmap == builtin_pictogram_bitmap(index))
-    })
+// an exact legacy stock name/bitmap revision, independent of display RGB.
+// Explicit authorship wins; unknown pixels/names stay visible. Legacy files
+// cannot distinguish an intentional identical copy from a promoted snapshot.
+// Filtering never deletes data, so this ambiguity is reversible.
+#[cfg(test)]
+thread_local! {
+    static NAME_LIST_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SAVED_FILTER_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -285,10 +311,17 @@ fn visible_saved_pictograms<'a>(
     saved: &'a [SavedPictogram],
     _catalog: &[CatalogIcon],
 ) -> Vec<&'a SavedPictogram> {
+    #[cfg(test)]
+    SAVED_FILTER_RUNS.with(|count| count.set(count.get() + 1));
+    let mut seen = std::collections::HashSet::new();
     saved
         .iter()
         .filter(|icon| {
-            icon.bitmap.len() == PICTOGRAM_BYTES && !is_known_migrated_stock_pictogram(icon)
+            icon.bitmap.len() == PICTOGRAM_BYTES
+                && !is_known_migrated_stock_pictogram(icon)
+                // Only exact repeated records collapse. Matching a name or an
+                // image alone must not hide custom drawings/colors/names.
+                && seen.insert((icon.name.as_str(), icon.color, icon.bitmap.as_slice()))
         })
         .collect()
 }
@@ -2494,12 +2527,9 @@ impl EntropyApp {
             .library
             .bitmap(kind, self.display_settings.pictograms.selected_slot)
             .map(ToOwned::to_owned);
-        let picker_builtins = pictogram_catalog(lang);
-        let picker_saved: Vec<(String, Vec<u8>)> =
-            visible_saved_pictograms(&self.app_settings.saved_pictograms, &picker_builtins)
-                .into_iter()
-                .map(|p| (p.name.clone(), p.bitmap.clone()))
-                .collect();
+        // Catalog/filter work belongs to the open popup, not every editor frame.
+        // Saved records are read afresh there: edits/imports to name, RGB or bitmap
+        // need no revision bookkeeping and can never leave stale filtered entries.
         let picker_color = self.display_settings.color;
         let picker_background = self.display_settings.background_color;
         let mut assignment_choice: Option<Option<Vec<u8>>> = None;
@@ -2535,6 +2565,11 @@ impl EntropyApp {
                     egui::PopupCloseBehavior::CloseOnClickOutside,
                     popup_width,
                     |ui| {
+                        let picker_builtins = pictogram_catalog(lang);
+                        let picker_saved = visible_saved_pictograms(
+                            &self.app_settings.saved_pictograms,
+                            picker_builtins,
+                        );
                         ui.style_mut().interaction.tooltip_delay = 1.0;
                         ui.label(
                             RichText::new(crate::i18n::tr_catalog(
@@ -2606,7 +2641,9 @@ impl EntropyApp {
                                         .spacing(egui::vec2(7.0 * scale, 7.0 * scale))
                                         .show(ui, |ui| {
                                             let mut position = 0;
-                                            for (name, bitmap) in &picker_saved {
+                                            for icon in &picker_saved {
+                                                let name = &icon.name;
+                                                let bitmap = &icon.bitmap;
                                                 if !search.is_empty()
                                                     && !name.to_lowercase().contains(&search)
                                                 {
@@ -2656,10 +2693,7 @@ impl EntropyApp {
             ),
             egui::vec2(196.0 * scale, 34.0 * scale),
         );
-        let builtin_names: Vec<String> = BUILTIN_PICTOGRAM_KEYS
-            .iter()
-            .map(|key| crate::i18n::tr_catalog(lang, key).to_owned())
-            .collect();
+        let builtin_names = pictogram_builtin_names(lang);
         let p = &self.display_settings.pictograms;
         let duplicate =
             !pictogram_is_builtin_selection(&p.editor_name, p.selected_builtin, &builtin_names)
@@ -2800,10 +2834,7 @@ impl EntropyApp {
         let lang = self.app_settings.language;
         let busy =
             self.display_settings.pictograms.busy() || self.vial_hid_task_blocks_user_action();
-        let names: Vec<String> = BUILTIN_PICTOGRAM_KEYS
-            .iter()
-            .map(|k| crate::i18n::tr_catalog(lang, k).to_owned())
-            .collect();
+        let names = pictogram_builtin_names(lang);
         let name_error = pictogram_name_error(
             &self.display_settings.pictograms.editor_name,
             &self.app_settings.saved_pictograms,
@@ -2878,6 +2909,7 @@ impl EntropyApp {
         }
         if save_clicked {
             let preset = SavedPictogram {
+                origin: PictogramOrigin::User,
                 name: self
                     .display_settings
                     .pictograms
@@ -3168,6 +3200,7 @@ impl EntropyApp {
                     self.display_settings.pictograms.inverted,
                 );
                 let preset = SavedPictogram {
+                    origin: PictogramOrigin::User,
                     name: name.clone(),
                     color: self.display_settings.pictograms.editor_color,
                     bitmap: bitmap.to_vec(),
@@ -4672,6 +4705,7 @@ mod tests {
     #[test]
     fn pictogram_names_require_a_letter_safe_characters_and_uniqueness() {
         let saved = vec![SavedPictogram {
+            origin: PictogramOrigin::Legacy,
             name: "Мой пресет_1".to_owned(),
             color: [1, 2, 3],
             bitmap: vec![0; PICTOGRAM_BYTES],
@@ -4952,11 +4986,13 @@ mod icon_catalog_tests {
         );
         let saved = vec![
             SavedPictogram {
+                origin: PictogramOrigin::Legacy,
                 name: stock_name.to_owned(),
                 color: [84, 189, 191],
                 bitmap: legacy_builtin_pictogram_bitmap(stock_index).to_vec(),
             },
             SavedPictogram {
+                origin: PictogramOrigin::Legacy,
                 name: "My drawing".to_owned(),
                 color: [255, 255, 255],
                 bitmap: vec![0x5A; PICTOGRAM_BYTES],
@@ -4974,16 +5010,19 @@ mod icon_catalog_tests {
             crate::i18n::tr_catalog(crate::i18n::Language::English, BUILTIN_PICTOGRAM_KEYS[0]);
         let saved = vec![
             SavedPictogram {
+                origin: PictogramOrigin::Legacy,
                 name: stock_name.to_owned(),
                 color: [84, 189, 191],
                 bitmap: vec![0xA5; PICTOGRAM_BYTES],
             },
             SavedPictogram {
+                origin: PictogramOrigin::Legacy,
                 name: "My stock shape".to_owned(),
                 color: [84, 189, 191],
                 bitmap: builtin_pictogram_bitmap(0).to_vec(),
             },
             SavedPictogram {
+                origin: PictogramOrigin::User,
                 name: stock_name.to_owned(),
                 color: [255, 0, 0],
                 bitmap: legacy_builtin_pictogram_bitmap(0).to_vec(),
@@ -5128,7 +5167,7 @@ mod icon_catalog_tests {
     fn every_picker_icon_has_an_explicit_order_within_its_existing_group() {
         for language in crate::i18n::Language::ALL {
             let catalog = pictogram_catalog(language);
-            for icon in &catalog {
+            for icon in catalog {
                 let key = BUILTIN_PICTOGRAM_KEYS[icon.index];
                 assert!(
                     !pictogram_sort_key(key).starts_with("999_"),

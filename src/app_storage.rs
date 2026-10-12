@@ -396,6 +396,11 @@ pub(super) fn read_pictogram_file(path: &std::path::Path) -> anyhow::Result<Vec<
             "Invalid pictogram"
         );
         p.bitmap = normalize_pictogram_bitmap(&p.bitmap)?;
+        // Carry proven stock provenance through import renaming and re-export.
+        // Unknown/edited records and explicit user authorship are never relabeled.
+        if p.origin == PictogramOrigin::Legacy && is_known_migrated_stock_pictogram(p) {
+            p.origin = PictogramOrigin::Stock;
+        }
     }
     // `builtin` is an exported snapshot of the application's stock catalog.
     // Its bitmaps change between releases, so an unfamiliar bitmap is not a
@@ -417,6 +422,7 @@ pub(super) fn write_pictogram_file(
             .iter()
             .enumerate()
             .map(|(i, key)| SavedPictogram {
+                origin: PictogramOrigin::Stock,
                 name: crate::i18n::tr_catalog(crate::i18n::Language::English, key).to_owned(),
                 color: [84, 189, 191],
                 bitmap: builtin_pictogram_bitmap(i).to_vec(),
@@ -1122,6 +1128,7 @@ mod pictogram_portability_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("icons.json");
         let icon = SavedPictogram {
+            origin: PictogramOrigin::Legacy,
             name: "My icon".into(),
             color: [1, 2, 3],
             bitmap: vec![0xA5; PICTOGRAM_BYTES],

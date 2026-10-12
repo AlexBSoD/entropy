@@ -335,7 +335,10 @@ impl EntropyApp {
         self.editing_layer_layout_id = None;
     }
 
-    fn application_control_for_key(layout: &KeyboardLayout, key_index: usize) -> Option<usize> {
+    pub(super) fn application_control_for_key(
+        layout: &KeyboardLayout,
+        key_index: usize,
+    ) -> Option<usize> {
         let key = layout.keys.get(key_index)?;
         match (key.row, key.col) {
             (0, 2) => Some(12),
@@ -344,7 +347,7 @@ impl EntropyApp {
         }
     }
 
-    fn application_control_for_encoder(
+    pub(super) fn application_control_for_encoder(
         layout: &KeyboardLayout,
         visual_index: usize,
     ) -> Option<usize> {
@@ -377,7 +380,7 @@ impl EntropyApp {
         layers
     }
 
-    fn application_layout_rendered_copy_for_profile(
+    pub(super) fn application_layout_rendered_copy_for_profile(
         layout: &KeyboardLayout,
         profile: Option<&crate::application_layouts::ApplicationLayout>,
     ) -> KeyboardLayout {
