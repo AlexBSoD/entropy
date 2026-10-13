@@ -819,6 +819,9 @@ impl EntropyApp {
                 bridge.application_layout_publication_generation().map(|generation| (path.clone(), generation))
             }).collect();
         let selected_key = self.application_layout_device_key();
+        // The editor can retain an offline key; only a connected selection may
+        // publish cached Default through its live reconciliation/sync path.
+        let connected_selected_key = self.connected_application_layout_device_key();
         let mut device_keys = std::collections::BTreeSet::new();
         if let Some(key) = selected_key.as_ref() {
             device_keys.insert(key.clone());
@@ -897,7 +900,8 @@ impl EntropyApp {
                 let active_layout_changed = settings.active_layout_id != previous_active_layout_id;
                 let snapshot = settings
                     .active_layout()
-                    .filter(|layout| selected || layout.id != crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID)
+                    .filter(|layout| connected_selected_key.as_ref() == Some(&device_key)
+                        || layout.id != crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID)
                     // A background Default belongs to that device's live firmware,
                     // not its saved cache and never the selected keyboard's map.
                     // Selected Default keeps its editor reconciliation/sync path.
@@ -1703,6 +1707,148 @@ mod tests {
             assert_eq!(app.selected_layer, 3);
             assert_eq!(app.selected_key, Some((1, 0)));
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn offline_editor_background_default_preserves_external_firmware_edit() {
+        offline_editor_background_default_control(0x0005);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn offline_editor_background_default_preserves_unchanged_firmware() {
+        offline_editor_background_default_control(0x0004);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn offline_editor_background_default_control(firmware_code: u16) {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let mut app = EntropyApp::new_inert_for_test();
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let mut macropad = m4cr0pad_v3_device();
+        macropad.path = path.path().to_string_lossy().into_owned();
+        app.device_manager.replace_devices(vec![macropad.clone()]);
+        let key = "vial-0000000000000042";
+        app.app_settings.last_application_layout_device_key = Some(key.into());
+        app.app_settings.application_layouts.entry(key.into()).or_default()
+            .layouts.get_mut(crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID)
+            .unwrap().set_keycode(0, 0, 0x0004);
+        app.app_settings.application_layout_bindings.insert(key.into(),
+            (macropad.vendor_id, macropad.product_id, macropad.serial_number.clone()));
+        save_app_settings(&app.app_settings);
+        app.app_settings = crate::app::app_storage::load_app_settings();
+        assert!(app.selected_device.is_none());
+        assert!(app.layout.is_none());
+        assert!(app.hid_device.is_none());
+        assert!(app.shared_hid_output.is_none());
+        assert!(app.application_layouts_supported());
+        assert_eq!(app.application_layout_device_key().as_deref(), Some(key));
+
+        let (hid, packets) = crate::hid::HidDevice::test_device();
+        // Only the OS and firmware boundary are synthetic. Decode real worker
+        // packets to determine whether Default exposes firmware or cached keys.
+        let overlay_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let overlay_code = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(u16::MAX));
+        let active = overlay_active.clone();
+        let code = overlay_code.clone();
+        let protocol = crate::application_layouts::ApplicationLayoutSnapshot::inactive().packets();
+        let commit_type = protocol.last().unwrap()[0];
+        let keycodes_type = protocol[1][0];
+        packets.on_output(move |packet| {
+            if packet[0] == keycodes_type && packet[2..4] == [0, 0] {
+                code.store(u16::from_le_bytes([packet[5], packet[6]]), std::sync::atomic::Ordering::Release);
+            } else if packet[0] == commit_type {
+                active.store(packet[2] != 0, std::sync::atomic::Ordering::Release);
+            }
+        });
+        packets.respond_by(|request| {
+            if request[..2] == [0xfe, 0] {
+                let mut response = [0; 32];
+                response[..4].copy_from_slice(&6u32.to_le_bytes());
+                response[4..12].copy_from_slice(&0x42u64.to_le_bytes());
+                Some(Ok(response))
+            } else if request[0] == 0xe6 {
+                let mut response = [0; 32];
+                response[..3].copy_from_slice(&[0xe6,
+                    crate::application_layouts::APPLICATION_LAYOUT_PROTOCOL_VERSION, 0x5a]);
+                Some(Ok(response))
+            } else { None }
+        });
+        app.qmk_hid_hosts.insert(macropad.path.clone(), crate::qmk_hid_host::test_start_bridge(
+            macropad.clone(), Default::default(), None, Some(hid),
+            crate::qmk_hid_host::HostProtocol::Discover, || None));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.qmk_hid_hosts[&macropad.path].application_layout_publication_generation().is_none() {
+            app.update_application_layout_runtime_with(Default::default());
+            assert!(std::time::Instant::now() < deadline, "cold UID binding never restored");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(app.qmk_hid_hosts[&macropad.path].application_layout_device_key(), Some(key));
+        let published = app.qmk_hid_hosts[&macropad.path].test_application_layout_snapshot();
+        let start = packets.requests().len();
+        app.qmk_hid_hosts[&macropad.path].force_application_layout_resend();
+        while !packets.requests()[start..].contains(published.packets().last().unwrap()) {
+            assert!(std::time::Instant::now() < deadline, "Default not committed by real worker");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let effective_code = if overlay_active.load(std::sync::atomic::Ordering::Acquire) {
+            overlay_code.load(std::sync::atomic::Ordering::Acquire)
+        } else { firmware_code };
+        assert_eq!(effective_code, firmware_code, "offline cached Default masked the live firmware keymap");
+        assert_eq!(published, crate::application_layouts::ApplicationLayoutSnapshot::inactive());
+        assert!(!packets.requests().iter().any(|p| p[0] == commit_type && p[2] != 0),
+            "offline editor authorized an active cached Default");
+
+        // Offline editing still addresses the saved profile, and configured
+        // foreground overlays must remain active on the validated background owner.
+        let foreground = crate::application_layouts::DetectedApplication {
+            executable: "offline-editor-overlay-control".into(),
+            display_name: "Offline editor overlay control".into(),
+            ..Default::default()
+        };
+        let settings = app.application_layout_settings_mut().unwrap();
+        let profile = settings.create_for_application(&foreground);
+        settings.layouts.get_mut(&profile).unwrap().set_keycode(0, 0, 7);
+        app.update_application_layout_runtime_with(crate::app_discovery::ApplicationDiscoverySnapshot {
+            foreground: Some(foreground.clone()),
+            foreground_status: crate::app_discovery::ForegroundStatus {
+                backend: "synthetic OS".into(),
+                state: crate::app_discovery::ForegroundState::Focused(foreground),
+            },
+            ..Default::default()
+        });
+        let application = app.qmk_hid_hosts[&macropad.path].test_application_layout_snapshot();
+        assert!(application.active);
+        while !packets.requests().contains(application.packets().last().unwrap()) {
+            assert!(std::time::Instant::now() < deadline, "offline application overlay not committed");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(overlay_active.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(overlay_code.load(std::sync::atomic::Ordering::Acquire), 7);
+        let start = packets.requests().len();
+        app.update_application_layout_runtime_with(crate::app_discovery::ApplicationDiscoverySnapshot {
+            foreground_status: crate::app_discovery::ForegroundStatus {
+                backend: "synthetic OS".into(),
+                state: crate::app_discovery::ForegroundState::NoFocusedWindow,
+            },
+            ..Default::default()
+        });
+        let inactive = crate::application_layouts::ApplicationLayoutSnapshot::inactive();
+        assert_eq!(app.qmk_hid_hosts[&macropad.path].test_application_layout_snapshot(), inactive);
+        while !packets.requests()[start..].contains(inactive.packets().last().unwrap()) {
+            assert!(std::time::Instant::now() < deadline, "offline return to Default not committed");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!overlay_active.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(app.application_layout_device_key().as_deref(), Some(key));
+        assert_eq!(app.application_layout_settings().unwrap().layouts[&profile].layers[0][0], 7);
+        assert_eq!(app.application_layout_settings().unwrap().layouts[
+            crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID].layers[0][0], 4);
+        assert!(app.selected_device.is_none());
+        assert!(app.layout.is_none());
+        assert!(app.hid_device.is_none());
+        assert!(app.shared_hid_output.is_none());
     }
 
     fn m4cr0pad_v3_device() -> crate::device::Device {
