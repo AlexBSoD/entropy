@@ -897,6 +897,10 @@ impl EntropyApp {
                 let active_layout_changed = settings.active_layout_id != previous_active_layout_id;
                 let snapshot = settings
                     .active_layout()
+                    .filter(|layout| selected || layout.id != crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID)
+                    // A background Default belongs to that device's live firmware,
+                    // not its saved cache and never the selected keyboard's map.
+                    // Selected Default keeps its editor reconciliation/sync path.
                     .map(crate::application_layouts::ApplicationLayoutSnapshot::from_layout)
                     .unwrap_or_else(
                         crate::application_layouts::ApplicationLayoutSnapshot::inactive,
@@ -1549,6 +1553,155 @@ mod tests {
             }
             assert_eq!(app.selected_device, Some(1));
             assert_eq!(app.layout.as_ref().unwrap().layers, original);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn cold_background_default_preserves_external_firmware_edit_and_unchanged_control() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        for firmware_code in [0x0005u16, 0x0004] {
+            let mut app = EntropyApp::new_inert_for_test();
+            let path = tempfile::NamedTempFile::new().unwrap();
+            let mut macropad = m4cr0pad_v3_device();
+            macropad.path = path.path().to_string_lossy().into_owned();
+            let mut k04 = macropad.clone();
+            k04.product_id = 0x0004;
+            k04.name = "K:04".into();
+            k04.path = format!("{}/src/app.rs", env!("CARGO_MANIFEST_DIR"));
+            k04.serial_number = "k04-control".into();
+            k04.instance_token = "k04-control".into();
+            app.device_manager.replace_devices(vec![macropad.clone(), k04.clone()]);
+            app.selected_device = Some(1);
+            app.current_keyboard_id = Some(4);
+            app.layout = Some(indicator_test_layout());
+            app.layout.as_mut().unwrap().layers[0][0] = crate::keyboard::KeyBinding::Vial(0x0006); // never Macropad Default
+            let original = app.layout.as_ref().unwrap().layers.clone();
+            app.selected_layer = 3;
+            app.selected_key = Some((1, 0));
+            let key = "vial-0000000000000042";
+            let settings = app.app_settings.application_layouts.entry(key.into()).or_default();
+            settings.layouts.get_mut(crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID)
+                .unwrap().set_keycode(0, 0, 0x0004);
+            app.app_settings.application_layout_bindings.insert(key.into(),
+                (macropad.vendor_id, macropad.product_id, macropad.serial_number.clone()));
+            save_app_settings(&app.app_settings);
+            app.app_settings = crate::app::app_storage::load_app_settings(); // cold restore
+            let (hid, packets) = crate::hid::HidDevice::test_device();
+            // Synthetic firmware state only: production runtime, UID/capability
+            // discovery and transfer remain real. An external Vial edit changes
+            // the firmware-owned map, not Entropy's saved Default or K04 editor.
+            let firmware = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(4));
+            firmware.store(firmware_code, std::sync::atomic::Ordering::Release);
+            let overlay_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let overlay_code = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(u16::MAX));
+            let active = overlay_active.clone();
+            let code = overlay_code.clone();
+            let protocol = crate::application_layouts::ApplicationLayoutSnapshot::inactive().packets();
+            let commit_type = protocol.last().unwrap()[0];
+            let keycodes_type = protocol[1][0];
+            packets.on_output(move |packet| {
+                if packet[0] == keycodes_type && packet[2..4] == [0, 0] {
+                    code.store(u16::from_le_bytes([packet[5], packet[6]]), std::sync::atomic::Ordering::Release);
+                } else if packet[0] == commit_type {
+                    active.store(packet[2] != 0, std::sync::atomic::Ordering::Release);
+                }
+            });
+            packets.respond_by(move |request| {
+                if request[..2] == [0xfe, 0] {
+                    let mut response = [0; 32];
+                    response[..4].copy_from_slice(&6u32.to_le_bytes());
+                    response[4..12].copy_from_slice(&0x42u64.to_le_bytes());
+                    Some(Ok(response))
+                } else if request[0] == 0xe6 {
+                    let mut response = [0; 32];
+                    response[..3].copy_from_slice(&[0xe6,
+                        crate::application_layouts::APPLICATION_LAYOUT_PROTOCOL_VERSION, 0x5a]);
+                    Some(Ok(response))
+                } else { None }
+            });
+            let (k04_hid, k04_packets) = crate::hid::HidDevice::test_device();
+            app.qmk_hid_hosts.insert(k04.path.clone(), crate::qmk_hid_host::test_start_bridge(
+                k04, Default::default(), k04_hid.shared_output(), None,
+                crate::qmk_hid_host::HostProtocol::Selected(false), || None));
+            app.qmk_hid_hosts.insert(macropad.path.clone(), crate::qmk_hid_host::test_start_bridge(
+                macropad.clone(), Default::default(), None, Some(hid),
+                crate::qmk_hid_host::HostProtocol::Discover, || None));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while app.qmk_hid_hosts[&macropad.path].application_layout_publication_generation().is_none() {
+                app.update_application_layout_runtime_with(Default::default());
+                assert!(std::time::Instant::now() < deadline, "cold UID binding never restored");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // External Vial edited persistent firmware to firmware_code, while
+            // Entropy's saved Default is 4. The synthetic firmware boundary uses
+            // its own keymap iff the production worker commits an inactive overlay.
+            let expected = crate::application_layouts::ApplicationLayoutSnapshot::inactive();
+            assert_eq!(app.qmk_hid_hosts[&macropad.path].test_application_layout_snapshot(), expected,
+                "background Default replayed saved code 4 over firmware code {firmware_code}");
+            let sent_before_resend = packets.requests().len();
+            let worker = app.qmk_hid_hosts.get_mut(&macropad.path).unwrap();
+            worker.force_application_layout_resend();
+            while !packets.requests()[sent_before_resend..].iter().any(|p| p == expected.packets().last().unwrap()) {
+                assert!(std::time::Instant::now() < deadline, "inactive Default not committed");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let effective_code = if overlay_active.load(std::sync::atomic::Ordering::Acquire) {
+                overlay_code.load(std::sync::atomic::Ordering::Acquire)
+            } else {
+                firmware.load(std::sync::atomic::Ordering::Acquire)
+            };
+            assert_eq!(effective_code, firmware_code, "Default masked the live firmware keymap");
+            assert!(!packets.requests().iter().any(|p| p[0] == expected.packets()[0][0] && p[2] != 0),
+                "cold worker activated a stale Default overlay");
+            // A normal application overlay must still work, and returning from
+            // it to Default must again expose the same live firmware map.
+            let foreground = crate::application_layouts::DetectedApplication {
+                executable: "default-return-control".into(),
+                display_name: "Default return control".into(),
+                ..Default::default()
+            };
+            let settings = app.app_settings.application_layouts.get_mut(key).unwrap();
+            let profile = settings.create_for_application(&foreground);
+            settings.layouts.get_mut(&profile).unwrap().set_keycode(0, 0, 7);
+            let focused = crate::app_discovery::ApplicationDiscoverySnapshot {
+                foreground: Some(foreground.clone()),
+                foreground_status: crate::app_discovery::ForegroundStatus {
+                    backend: "synthetic OS".into(),
+                    state: crate::app_discovery::ForegroundState::Focused(foreground),
+                },
+                ..Default::default()
+            };
+            app.update_application_layout_runtime_with(focused);
+            let application = app.qmk_hid_hosts[&macropad.path].test_application_layout_snapshot();
+            assert!(application.active);
+            let application_commit = *application.packets().last().unwrap();
+            while !packets.requests().contains(&application_commit) {
+                assert!(std::time::Instant::now() < deadline, "application control not committed");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(overlay_active.load(std::sync::atomic::Ordering::Acquire));
+            assert_eq!(overlay_code.load(std::sync::atomic::Ordering::Acquire), 7);
+            let return_start = packets.requests().len();
+            app.update_application_layout_runtime_with(crate::app_discovery::ApplicationDiscoverySnapshot {
+                foreground_status: crate::app_discovery::ForegroundStatus {
+                    backend: "synthetic OS".into(),
+                    state: crate::app_discovery::ForegroundState::NoFocusedWindow,
+                },
+                ..Default::default()
+            });
+            assert_eq!(app.qmk_hid_hosts[&macropad.path].test_application_layout_snapshot(), expected);
+            while !packets.requests()[return_start..].contains(expected.packets().last().unwrap()) {
+                assert!(std::time::Instant::now() < deadline, "return to Default not committed");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(!overlay_active.load(std::sync::atomic::Ordering::Acquire));
+            assert_eq!(firmware.load(std::sync::atomic::Ordering::Acquire), firmware_code);
+            assert!(k04_packets.requests().is_empty());
+            assert_eq!(app.layout.as_ref().unwrap().layers, original);
+            assert_eq!(app.selected_device, Some(1));
+            assert_eq!(app.selected_layer, 3);
+            assert_eq!(app.selected_key, Some((1, 0)));
         }
     }
 

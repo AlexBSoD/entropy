@@ -787,8 +787,13 @@ impl HostOutputLease {
     }
 }
 
-// Identity grants and payload publication share the owner's revocation lock.
+// Identity, revocation and send admission share a short-held state lock.
+// Only workers take output_order. An admitted write precedes a concurrent
+// revocation; it cannot be cancelled inside the native transport. Successor
+// writes wait behind it and revalidate after acquiring output_order, so an old
+// queued packet can never follow a successor's deactivate/new-profile packet.
 struct ApplicationLayoutOwnerState {
+    output_order: Arc<Mutex<()>>,
     generation: u64,
     selected: bool,
     discovered_key: Option<String>,
@@ -799,7 +804,7 @@ struct ApplicationLayoutOwnerState {
 
 impl Default for ApplicationLayoutOwnerState {
     fn default() -> Self {
-        Self { generation: 0, selected: false, discovered_key: None, verified_key: None,
+        Self { output_order: Arc::new(Mutex::new(())), generation: 0, selected: false, discovered_key: None, verified_key: None,
             snapshot_generation: 0,
             snapshot: crate::application_layouts::ApplicationLayoutSnapshot::inactive() }
     }
@@ -814,6 +819,27 @@ impl ApplicationLayoutOwnerState {
         self.snapshot_generation = self.generation;
         self.snapshot = crate::application_layouts::ApplicationLayoutSnapshot::inactive();
     }
+}
+
+fn write_application_layout_payload(
+    owner: &Mutex<ApplicationLayoutOwnerState>,
+    snapshot: &crate::application_layouts::ApplicationLayoutSnapshot,
+    generation: u64,
+    packet: &[u8],
+    send: impl FnOnce(&[u8]) -> anyhow::Result<()>,
+) -> anyhow::Result<bool> {
+    let order = owner.lock().unwrap_or_else(|e| e.into_inner()).output_order.clone();
+    let _output = order.lock().unwrap_or_else(|e| e.into_inner());
+    let state = owner.lock().unwrap_or_else(|e| e.into_inner());
+    if state.generation != generation || state.snapshot_generation != generation
+        || &state.snapshot != snapshot {
+        return Ok(false);
+    }
+    // Admission is linearized against revoke/publication under the state lock.
+    // UI operations never wait on I/O; no other sender can pass this write.
+    drop(state);
+    send(packet)?;
+    Ok(true)
 }
 
 pub struct QmkHidHostBridge {
@@ -1002,8 +1028,14 @@ impl QmkHidHostBridge {
         self.application_layout_device_key = None;
         self.application_layout_binding_generation = None;
         let mut state = self.application_layout_snapshot.lock().unwrap_or_else(|e| e.into_inner());
+        if state.verified_key.is_some() {
+            // Regranting this same discovered owner must not revive validation
+            // tokens captured before a registry/identity revocation.
+            state.generation = state.generation.wrapping_add(1);
+        }
         state.selected = false;
         state.verified_key = None;
+        state.snapshot_generation = state.generation;
         state.snapshot = crate::application_layouts::ApplicationLayoutSnapshot::inactive();
     }
 
@@ -1353,15 +1385,12 @@ fn run_bridge(
             if snapshot_changed {
                 let mut sent = true;
                 for packet in application_layout.packets() {
-                    let state = application_layout_snapshot.lock().unwrap_or_else(|e| e.into_inner());
-                    if state.generation != generation || state.snapshot_generation != generation
-                        || state.snapshot != application_layout { sent = false; break; }
-                    if write_payload(dev, &packet).is_err() {
-                        sent = false;
-                        write_failed = true;
-                        break;
+                    match write_application_layout_payload(&application_layout_snapshot,
+                        &application_layout, generation, &packet, |p| write_payload(dev, p)) {
+                        Ok(true) => {},
+                        Ok(false) => { sent = false; break; },
+                        Err(_) => { sent = false; write_failed = true; break; },
                     }
-                    drop(state);
                     thread::sleep(Duration::from_millis(1));
                 }
                 if sent {
@@ -1369,13 +1398,12 @@ fn run_bridge(
                     last_application_layout_send = Instant::now();
                 }
             } else if last_application_layout_send.elapsed() >= Duration::from_secs(1) {
-                let state = application_layout_snapshot.lock().unwrap_or_else(|e| e.into_inner());
-                if state.generation != generation || state.snapshot_generation != generation
-                    || state.snapshot != application_layout { continue; }
-                if write_payload(dev, &application_layout.keepalive_packet()).is_err() {
-                    write_failed = true;
-                } else {
-                    last_application_layout_send = Instant::now();
+                match write_application_layout_payload(&application_layout_snapshot,
+                    &application_layout, generation, &application_layout.keepalive_packet(),
+                    |p| write_payload(dev, p)) {
+                    Ok(true) => last_application_layout_send = Instant::now(),
+                    Ok(false) => continue,
+                    Err(_) => write_failed = true,
                 }
             }
         }
@@ -3499,6 +3527,134 @@ fn fresh_dedicated_owner_never_receives_previous_profile_snapshot() {
             "new physical owner received previous active-profile bytes"
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn cleared_application_binding_never_revives_old_publication_token() {
+    let target = crate::device::test_usb_device("3-3", 5, 0x42);
+    let mut bridge = QmkHidHostBridge::test_inert(target, Default::default(), None, HostProtocol::Discover);
+    let key = "vial-0000000000000042";
+    bridge.bind_selected_application_layout_device(key.into());
+    let old_generation = bridge.application_layout_publication_generation().unwrap();
+    bridge.clear_application_layout_binding();
+    bridge.bind_selected_application_layout_device(key.into());
+    assert!(!bridge.publish_application_layout_snapshot_for_generation(
+        crate::application_layouts::ApplicationLayoutSnapshot::inactive(), old_generation),
+        "regrant resurrected a revoked publication token");
+}
+
+#[cfg(test)]
+#[test]
+fn application_output_revalidates_queued_packets_and_keepalives_after_owner_revocation() {
+    use crate::application_layouts::{ApplicationLayoutSnapshot, DeviceApplicationLayouts};
+    for keepalive in [false, true] {
+        let mut settings = DeviceApplicationLayouts::default();
+        settings.active_layout_id = settings.create_for_application(&Default::default());
+        let snapshot = ApplicationLayoutSnapshot::from_layout(settings.active_layout().unwrap());
+        let owner = Arc::new(Mutex::new(ApplicationLayoutOwnerState::default()));
+        owner.lock().unwrap().snapshot = snapshot.clone();
+        let packet = if keepalive { snapshot.keepalive_packet() } else { snapshot.packets()[0] };
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let sending_owner = owner.clone();
+        let sending_snapshot = snapshot.clone();
+        let admitted = thread::spawn(move || write_application_layout_payload(
+            &sending_owner, &sending_snapshot, 0, &packet, |_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(())
+            }));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Revocation itself is short and never waits on the admitted transport.
+        owner.lock().unwrap().revoke();
+        let stale_owner = owner.clone();
+        let stale = thread::spawn(move || write_application_layout_payload(
+            &stale_owner, &snapshot, 0, &packet, |_| panic!("queued stale send reached HID")));
+        let successor_owner = owner.clone();
+        let (successor_tx, successor_rx) = std::sync::mpsc::channel();
+        let successor = thread::spawn(move || {
+            let inactive = ApplicationLayoutSnapshot::inactive();
+            write_application_layout_payload(&successor_owner, &inactive, 1,
+                &inactive.keepalive_packet(), |_| { successor_tx.send(()).unwrap(); Ok(()) })
+        });
+        assert!(successor_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "successor overtook an admitted write");
+        release_tx.send(()).unwrap();
+        assert!(admitted.join().unwrap().unwrap());
+        assert!(!stale.join().unwrap().unwrap());
+        assert!(successor.join().unwrap().unwrap(), "idle/revoked inactive control was rejected");
+        successor_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+}
+
+#[cfg(test)]
+fn assert_gated_application_output_ui_progress(keepalive: bool) {
+    use crate::application_layouts::{ApplicationLayoutSnapshot, DeviceApplicationLayouts};
+    let path = tempfile::NamedTempFile::new().unwrap();
+    let mut target = crate::device::test_usb_device("3-3", 5, 0x42);
+    target.path = path.path().to_string_lossy().into_owned();
+    let (hid, packets) = crate::hid::HidDevice::test_device();
+    let mut settings = DeviceApplicationLayouts::default();
+    settings.active_layout_id = settings.create_for_application(&Default::default());
+    settings.layouts.get_mut(&settings.active_layout_id).unwrap().set_keycode(0, 0, 5);
+    let snapshot = ApplicationLayoutSnapshot::from_layout(settings.active_layout().unwrap());
+    let gated_packet = if keepalive { snapshot.keepalive_packet() } else { snapshot.packets()[0] };
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut gated = false;
+    packets.on_output(move |packet| {
+        if !gated && packet == gated_packet {
+            gated = true;
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+    });
+    let mut bridge = test_start_bridge(target, Default::default(), hid.shared_output(), None,
+        HostProtocol::Selected(false), || None);
+    bridge.bind_selected_application_layout_device("vial-0000000000000042".into());
+    bridge.set_selected_application_layout_support(true);
+    let generation = bridge.application_layout_publication_generation().unwrap();
+    bridge.set_application_layout_snapshot(snapshot.clone());
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+    let ui = thread::spawn(move || {
+        assert_eq!(bridge.application_layout_publication_generation(), Some(generation));
+        assert!(bridge.discovered_application_layout_identity().is_some());
+        bridge.clear_application_layout_binding();
+        let rejected = !bridge.publish_application_layout_snapshot_for_generation(snapshot, generation);
+        progress_tx.send(rejected).unwrap();
+        bridge
+    });
+    // Release and join even on RED: the fixture must not leave a blocked worker.
+    let progress = progress_rx.recv_timeout(Duration::from_millis(250));
+    release_tx.send(()).unwrap();
+    let mut bridge = ui.join().unwrap();
+    let worker = bridge.thread.take().unwrap();
+    thread::sleep(Duration::from_millis(100));
+    bridge.stop();
+    worker.join().unwrap();
+    assert_eq!(progress.ok(), Some(true), "UI identity/generation readers stalled behind HID output");
+    let requests = packets.requests();
+    let admitted = requests.iter().position(|p| p == &gated_packet).unwrap();
+    let mut inactive = ApplicationLayoutSnapshot::inactive().packets();
+    inactive.push(ApplicationLayoutSnapshot::inactive().keepalive_packet());
+    inactive.push(ApplicationLayoutSnapshot::deactivate_packet()); // worker shutdown
+    assert!(requests[admitted + 1..].iter().all(|p| inactive.contains(p)),
+        "revoked snapshot sent another packet/keepalive after the admitted write");
+    assert_eq!(bridge.test_application_layout_snapshot(), ApplicationLayoutSnapshot::inactive());
+}
+
+#[cfg(test)]
+#[test]
+fn gated_application_packet_does_not_stall_ui_or_send_revoked_snapshot() {
+    assert_gated_application_output_ui_progress(false);
+}
+
+#[cfg(test)]
+#[test]
+fn gated_application_keepalive_does_not_stall_ui_or_send_revoked_snapshot() {
+    assert_gated_application_output_ui_progress(true);
 }
 
 #[cfg(test)]
