@@ -96,6 +96,240 @@ fn fixture() -> (EntropyApp, crate::hid::TestHidRecorder, String) {
 }
 
 #[test]
+fn macropad_application_navigation_round_trip_reloads_all_keys() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
+    let (mut app, recorder, application) = fixture();
+    let path = _storage.path().join("navigation.entlayout");
+    let source = if let Ok(private_path) = std::env::var("ENTROPY_PROFILE_REPLAY") {
+        assert!(
+            app.import_application_layout_from_path(Path::new(&private_path), &application)
+                .is_err(),
+            "the obsolete input must not be accepted as a layout"
+        );
+        let bytes = std::fs::read(private_path).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // Replay only the captured content, not its obsolete file envelope.
+        serde_json::from_value(value["profile"].clone()).unwrap()
+    } else {
+        let profile = app
+            .application_layout_settings_mut()
+            .unwrap()
+            .layouts
+            .get_mut(&application)
+            .unwrap();
+        profile.layers[0][..5].copy_from_slice(&[4, 0x00A9, 0x00F0, 0x7E05, 0x7E06]);
+        let source = profile.clone();
+        source
+    };
+    let source: crate::application_layouts::ApplicationLayout = source;
+    write_application_entlayout(&path, source.clone(), app.app_settings.language).unwrap();
+    let before = app.application_layout_settings().unwrap().clone();
+    app.import_application_layout_from_path(&path, &application)
+        .unwrap();
+    // Restore through the production writer and reader. All 16x15 controls
+    // and encoder stacks must survive disk reload.
+    let modern = _storage.path().join("navigation.entlayout");
+    app.write_application_layout_export(&modern, &application)
+        .unwrap();
+    let profile = app
+        .application_layout_settings_mut()
+        .unwrap()
+        .layouts
+        .get_mut(&application)
+        .unwrap();
+    profile.layers[0].fill(42);
+    profile.layer_names[0] = "Changed".into();
+    profile.encoder_stacks[0].clear();
+    app.import_application_layout_from_path(&modern, &application)
+        .unwrap();
+    let restored: AppSettings =
+        serde_json::from_slice(&std::fs::read(app_settings_path()).unwrap()).unwrap();
+    let key = app.application_layout_device_key().unwrap();
+    let target = &restored.application_layouts[&key].layouts[&application];
+    assert_eq!(target.layers, source.layers);
+    assert_eq!(target.layer_names, source.layer_names);
+    assert_eq!(target.encoder_stacks, source.encoder_stacks);
+    assert_eq!(target.id, before.layouts[&application].id);
+    assert_eq!(
+        restored.application_layouts[&key].layouts[DEFAULT_APPLICATION_LAYOUT_ID],
+        before.layouts[DEFAULT_APPLICATION_LAYOUT_ID]
+    );
+    assert_eq!(
+        restored.application_layouts[&key].active_layout_id,
+        before.active_layout_id
+    );
+    assert!(recorder.requests().is_empty());
+}
+
+#[test]
+fn macropad_application_entlayout_envelope_is_versioned_and_not_a_device_layout() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
+    let (mut app, recorder, application) = fixture();
+    let path = _storage.path().join("application.entlayout");
+    app.write_application_layout_export(&path, &application)
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(value["format"], "entropy.layout");
+    assert_eq!(value["version"], 8);
+    assert_eq!(value["scope"], "application");
+    let before = serde_json::to_value(&app.app_settings).unwrap();
+    let error = app
+        .import_entlayout_from_path(&path)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("explicit application target"), "{error}");
+    assert_eq!(serde_json::to_value(&app.app_settings).unwrap(), before);
+    app.application_layout_settings_mut()
+        .unwrap()
+        .layouts
+        .get_mut(&application)
+        .unwrap()
+        .set_keycode(0, 0, 42);
+    app.import_application_layout_from_path(&path, &application)
+        .unwrap();
+    assert_eq!(
+        app.application_layout_settings().unwrap().layouts[&application].layers[0][0],
+        7
+    );
+    let mut invalid = value.clone();
+    invalid["version"] = serde_json::json!(9);
+    std::fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+    assert!(app
+        .import_application_layout_from_path(&path, &application)
+        .is_err());
+    assert!(recorder.requests().is_empty());
+    // Characterize unchanged Default/device schema and explicit target boundary.
+    let device = app.entlayout_snapshot().unwrap();
+    let device_path = _storage.path().join("default.entlayout");
+    write_entlayout_file(&device_path, &device, app.app_settings.language).unwrap();
+    let device_value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&device_path).unwrap()).unwrap();
+    assert_eq!(device_value["format"], "entropy.layout");
+    assert_eq!(device_value["version"], 7);
+    assert!(device_value.get("scope").is_none());
+    let before = serde_json::to_value(&app.app_settings).unwrap();
+    assert!(app
+        .import_application_layout_from_path(&device_path, &application)
+        .is_err());
+    for (format, version, scope) in [
+        ("entropy.layout", 7, Some("application")),
+        ("entropy.layout", 8, Some("unknown")),
+        ("entropy.layout", 8, None),
+        ("entropy.application-layout", 2, None),
+        ("entropy.application-layout", 1, Some("application")),
+    ] {
+        let mut malformed = value.clone();
+        malformed["format"] = serde_json::json!(format);
+        malformed["version"] = serde_json::json!(version);
+        if let Some(scope) = scope {
+            malformed["scope"] = serde_json::json!(scope);
+        } else {
+            malformed.as_object_mut().unwrap().remove("scope");
+        }
+        std::fs::write(&path, serde_json::to_vec(&malformed).unwrap()).unwrap();
+        assert!(app
+            .import_application_layout_from_path(&path, &application)
+            .is_err());
+        assert_eq!(serde_json::to_value(&app.app_settings).unwrap(), before);
+    }
+}
+
+#[test]
+fn macropad_application_native_picker_only_offers_entlayout() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
+    let (mut app, _, application) = fixture();
+    for export in [true, false] {
+        crate::app::file_dialog::set_test_dialog_result(None);
+        app.application_layout_file_dialog(application.clone(), export);
+        let options = crate::app::file_dialog::test_dialog_options();
+        assert!(options.contains(".entlayout"), "{options}");
+        assert!(options.contains("\"entlayout\""), "{options}");
+        assert!(!options.contains("entapp"), "{options}");
+        app.poll_file_dialog(&egui::Context::default());
+    }
+}
+
+#[test]
+fn macropad_application_rejects_legacy_format_and_other_extensions_without_changes() {
+    let storage = crate::app::app_storage::ScopedTempConfig::new();
+    let (mut app, recorder, application) = fixture();
+    let before = serde_json::to_value(&app.app_settings).unwrap();
+    let profile = app.application_layout_settings().unwrap().layouts[&application].clone();
+    for extension in ["entlayout", "entapp"] {
+        let path = storage.path().join(format!("legacy.{extension}"));
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "format": "entropy.application-layout", "version": 1, "profile": profile
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(app
+            .import_application_layout_from_path(&path, &application)
+            .is_err());
+    }
+    let modern = storage.path().join("modern.entlayout");
+    app.write_application_layout_export(&modern, &application)
+        .unwrap();
+    for extension in ["entapp", "json"] {
+        let path = storage.path().join(format!("modern.{extension}"));
+        std::fs::copy(&modern, &path).unwrap();
+        assert!(app
+            .import_application_layout_from_path(&path, &application)
+            .is_err());
+        assert!(app
+            .write_application_layout_export(&path, &application)
+            .is_err());
+    }
+    assert_eq!(serde_json::to_value(&app.app_settings).unwrap(), before);
+    assert!(!app_settings_path().exists());
+    assert!(recorder.requests().is_empty());
+}
+
+#[test]
+fn macropad_entlayout_duplicate_fields_rejected_before_any_writes() {
+    let storage = crate::app::app_storage::ScopedTempConfig::new();
+    let (mut app, recorder, application) = fixture();
+    let device = serde_json::to_value(app.entlayout_snapshot().unwrap()).unwrap();
+    let path = storage.path().join("duplicate.entlayout");
+    app.write_application_layout_export(&path, &application)
+        .unwrap();
+    let profile: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let before = serde_json::to_value(&app.app_settings).unwrap();
+    let backups = app_settings_path().parent().unwrap().join("backups");
+    for (value, field, contents, application_scope) in [
+        (&device, "version", &device["version"], false),
+        (&device, "data", &device["data"], false),
+        (&device, "keymap", &device["data"]["keymap"], false),
+        (&profile, "version", &profile["version"], true),
+        (&profile, "profile", &profile["profile"], true),
+        (&profile, "layers", &profile["profile"]["layers"], true),
+    ] {
+        let json = serde_json::to_string(value).unwrap();
+        let member = format!("\"{field}\":{}", serde_json::to_string(contents).unwrap());
+        let duplicate = json.replacen(&member, &format!("{member},{member}"), 1);
+        assert_ne!(duplicate, json);
+        std::fs::write(&path, duplicate).unwrap();
+        let error = if application_scope {
+            app.import_application_layout_from_path(&path, &application)
+                .unwrap_err()
+        } else {
+            app.import_entlayout_from_path(&path).unwrap_err()
+        };
+        assert!(
+            format!("{error:#}").contains("duplicate field"),
+            "{field}: {error:#}"
+        );
+        assert_eq!(serde_json::to_value(&app.app_settings).unwrap(), before);
+        assert!(!app_settings_path().exists());
+        assert!(!backups.exists());
+        assert!(recorder.requests().is_empty());
+    }
+}
+
+#[test]
 fn macropad_application_file_round_trip_targets_only_explicit_profile() {
     let _storage = crate::app::app_storage::ScopedTempConfig::new();
     let (mut app, recorder, application) = fixture();
@@ -121,7 +355,7 @@ fn macropad_application_file_round_trip_targets_only_explicit_profile() {
         );
     let before = app.application_layout_settings().unwrap().clone();
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("application.entapp");
+    let path = dir.path().join("application.entlayout");
     app.write_application_layout_export(&path, &application)
         .unwrap();
     app.application_layout_settings_mut()
@@ -156,7 +390,7 @@ fn macropad_application_file_round_trip_targets_only_explicit_profile() {
 fn macropad_application_persistence_failure_keeps_memory_library_and_existing_destination() {
     let _storage = crate::app::app_storage::ScopedTempConfig::new();
     let (mut app, recorder, application) = fixture();
-    let input = _storage.path().join("application.entapp");
+    let input = _storage.path().join("application.entlayout");
     app.write_application_layout_export(&input, &application)
         .unwrap();
     app.application_layout_settings_mut()
@@ -267,7 +501,7 @@ fn macropad_application_menu_clicks_reach_async_picker_and_profile_file_dispatch
             .unwrap()
             .editor_layout_id = application.clone();
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("clicked.entapp");
+        let path = dir.path().join("clicked.entlayout");
         if !export {
             app.write_application_layout_export(&path, &application)
                 .unwrap();
@@ -386,7 +620,7 @@ fn macropad_application_picker_dispatch_keeps_captured_target_when_selection_cha
     });
     let shared_before = serde_json::to_value(&app.app_settings.saved_pictograms).unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("captured.entapp");
+    let path = dir.path().join("captured.entlayout");
     let ctx = egui::Context::default();
     for export in [true, false] {
         if !export {
@@ -451,11 +685,39 @@ fn macropad_application_picker_dispatch_keeps_captured_target_when_selection_cha
 }
 
 #[test]
+fn macropad_application_export_rejects_unimportable_keys_and_encoder_actions_without_writing() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
+    let (mut app, _, application) = fixture();
+    let path = _storage.path().join("unsupported.entlayout");
+    std::fs::write(&path, b"existing export").unwrap();
+    for code in [
+        0x2000, 0x5700, 0x5F00, 0x7700, 0x7E00, 0x7E04, 0x7E07, 0x7EFF,
+    ] {
+        for encoder in [false, true] {
+            let profile = app
+                .application_layout_settings_mut()
+                .unwrap()
+                .layouts
+                .get_mut(&application)
+                .unwrap();
+            profile.set_keycode(0, 0, if encoder { 4 } else { code });
+            profile.encoder_stacks[0][0].clockwise = if encoder { code } else { 0x00A9 };
+            let error = app
+                .write_application_layout_export(&path, &application)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("Safe resource remapping"), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), b"existing export");
+        }
+    }
+}
+
+#[test]
 fn macropad_application_import_rejects_shared_resource_ids_without_partial_changes() {
     let _storage = crate::app::app_storage::ScopedTempConfig::new();
     let (mut app, recorder, application) = fixture();
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("resource.entapp");
+    let path = dir.path().join("resource.entlayout");
     for code in [0x7700, 0x5700, 0x5f00, 0x7e00] {
         app.application_layout_settings_mut()
             .unwrap()
@@ -463,8 +725,15 @@ fn macropad_application_import_rejects_shared_resource_ids_without_partial_chang
             .get_mut(&application)
             .unwrap()
             .set_keycode(0, 0, code);
-        app.write_application_layout_export(&path, &application)
-            .unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "format": "entropy.layout", "version": 8, "scope": "application",
+                "profile": app.application_layout_settings().unwrap().layouts[&application]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let before = serde_json::to_value(&app.app_settings).unwrap();
         let error = app
             .import_application_layout_from_path(&path, &application)
@@ -481,7 +750,7 @@ fn macropad_application_picker_rejects_stale_connection_and_deleted_target() {
     let _storage = crate::app::app_storage::ScopedTempConfig::new();
     let (mut app, _, application) = fixture();
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("stale.entapp");
+    let path = dir.path().join("stale.entlayout");
     let (tx, rx) = std::sync::mpsc::channel();
     app.pending_file_dialog = Some((
         crate::app::file_dialog::FileDialogAction::ExportApplicationLayout(application.clone()),

@@ -16,6 +16,82 @@ fn entlayout_version_supported(version: u16) -> bool {
     (1..=ENTLAYOUT_VERSION).contains(&version)
 }
 
+// Version 8 adds an explicitly scoped application document. Ordinary device
+// exports remain version 7 and retain their original schema.
+const APPLICATION_ENTLAYOUT_VERSION: u16 = 8;
+
+#[derive(Serialize, Deserialize)]
+struct ApplicationEntLayoutFile {
+    format: String,
+    version: u16,
+    #[serde(default)]
+    scope: Option<String>,
+    profile: crate::application_layouts::ApplicationLayout,
+}
+
+enum EntLayoutDocument {
+    Device(EntLayoutFile),
+    Application(crate::application_layouts::ApplicationLayout),
+}
+
+fn read_entlayout_document(data: &str) -> Result<EntLayoutDocument> {
+    let value: serde_json::Value = serde_json::from_str(data)?;
+    match (value["format"].as_str(), value.get("scope")) {
+        (Some(ENTLAYOUT_FORMAT), None) => {
+            Ok(EntLayoutDocument::Device(serde_json::from_str(data)?))
+        }
+        (Some(ENTLAYOUT_FORMAT), Some(scope)) if scope == "application" => {
+            let file: ApplicationEntLayoutFile = serde_json::from_str(data)?;
+            if file.version != APPLICATION_ENTLAYOUT_VERSION {
+                bail!("Unsupported application layout format or version");
+            }
+            Ok(EntLayoutDocument::Application(file.profile))
+        }
+        _ => bail!("Unsupported layout format or scope"),
+    }
+}
+
+pub(super) fn read_application_entlayout(
+    path: &Path,
+) -> Result<crate::application_layouts::ApplicationLayout> {
+    validate_application_entlayout_extension(path)?;
+    match read_entlayout_document(&std::fs::read_to_string(path)?)? {
+        EntLayoutDocument::Application(profile) => Ok(profile),
+        EntLayoutDocument::Device(_) => {
+            bail!("Device layout cannot be imported into an application target")
+        }
+    }
+}
+
+pub(super) fn write_application_entlayout(
+    path: &Path,
+    profile: crate::application_layouts::ApplicationLayout,
+    language: crate::i18n::Language,
+) -> Result<()> {
+    validate_application_entlayout_extension(path)?;
+    write_entlayout_file(
+        path,
+        &ApplicationEntLayoutFile {
+            format: ENTLAYOUT_FORMAT.into(),
+            version: APPLICATION_ENTLAYOUT_VERSION,
+            scope: Some("application".into()),
+            profile,
+        },
+        language,
+    )
+}
+
+fn validate_application_entlayout_extension(path: &Path) -> Result<()> {
+    if !path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("entlayout"))
+    {
+        bail!("Application layout files require the .entlayout extension");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct EntLayoutFile {
     format: String,
@@ -708,9 +784,12 @@ impl EntropyApp {
                 &[("path", &path.display().to_string())],
             )
         })?;
-        let bundle: EntLayoutFile = serde_json::from_str(&data).context(
+        let bundle = match read_entlayout_document(&data).context(
             crate::i18n::tr_catalog(lang, "entlayout.invalid_entlayout_json"),
-        )?;
+        )? {
+            EntLayoutDocument::Device(bundle) => bundle,
+            EntLayoutDocument::Application(_) => bail!("Application layout requires an explicit application target; use Import into application"),
+        };
         self.validate_entlayout_file(&bundle)?;
         let backup_path = self.write_entlayout_auto_backup()?;
         let (firmware_failures, mapping, portable_settings) = self.apply_entlayout(&bundle)?;
@@ -2883,7 +2962,7 @@ fn check_entalt_repeat_entry(
 
 fn write_entlayout_file(
     path: &Path,
-    bundle: &EntLayoutFile,
+    bundle: &impl Serialize,
     language: crate::i18n::Language,
 ) -> Result<()> {
     let json = serde_json::to_string_pretty(bundle).context(crate::i18n::tr_catalog(

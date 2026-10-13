@@ -81,6 +81,9 @@ pub(crate) struct AppSettings {
     /// editing saved profiles while the USB device is temporarily offline.
     #[serde(default)]
     pub(crate) last_application_layout_device_key: Option<String>,
+    /// Stable physical identity, scoped by Vial UID and hardware revision. Never HID paths.
+    #[serde(default)]
+    pub(crate) application_layout_bindings: std::collections::BTreeMap<String, (u16, u16, String)>,
     #[serde(default)]
     pub(crate) last_application_layout_device_name: Option<String>,
     #[serde(default)]
@@ -240,6 +243,7 @@ impl Default for AppSettings {
             migrated_fixed_encoder_visibility: std::collections::BTreeSet::new(),
             application_layouts: std::collections::BTreeMap::new(),
             last_application_layout_device_key: None,
+            application_layout_bindings: Default::default(),
             last_application_layout_device_name: None,
             minimize_to_tray_on_close: false,
             close_to_tray_behavior: CloseToTrayBehavior::Ask,

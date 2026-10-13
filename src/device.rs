@@ -453,8 +453,9 @@ fn normalized_device_identity(value: &str) -> String {
         .collect()
 }
 
-/// Synthetic kernel enumeration for pure identity and inert owner tests only.
-#[cfg(all(test, target_os = "linux"))]
+/// Synthetic USB enumeration for identity and inert-owner tests on every OS.
+/// These paths are fixture labels only; this helper never opens a device.
+#[cfg(test)]
 pub(crate) fn test_usb_device(port: &str, hidraw: u8, product_id: u16) -> Device {
     Device {
         name: "USB identity fixture".into(),

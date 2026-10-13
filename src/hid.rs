@@ -293,10 +293,14 @@ pub(crate) struct TestHidRecorder {
     responses: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<[u8; MSG_LEN]>>>,
     responder: std::sync::Arc<std::sync::Mutex<Option<TestHidResponder>>>,
     output_connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    output_hook: std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnMut(&[u8]) + Send>>>>,
 }
 
 #[cfg(test)]
 impl TestHidRecorder {
+    pub(crate) fn on_output(&self, hook: impl FnMut(&[u8]) + Send + 'static) {
+        *self.output_hook.lock().unwrap() = Some(Box::new(hook));
+    }
     // Per scripted physical owner; survives moving the HID device into its worker.
     pub(crate) fn set_pictogram_backup_directory(&self, directory: PathBuf) {
         *self.pictogram_backup_directory.lock().unwrap() = Some(directory);
@@ -627,6 +631,7 @@ impl HidDevice {
             requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             responses: Default::default(),
             responder: Default::default(),
+            output_hook: Default::default(),
             output_connected: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let device = Self {
@@ -1048,6 +1053,9 @@ fn ensure_output_report_len(data: &[u8]) -> Result<()> {
 #[cfg(test)]
 fn record_test_output_report(recorder: &TestHidRecorder, data: &[u8]) -> Result<()> {
     recorder.ensure_output_connected()?;
+    if let Some(hook) = recorder.output_hook.lock().unwrap().as_mut() {
+        hook(data);
+    }
     let mut report = [0; MSG_LEN];
     report[..data.len()].copy_from_slice(data);
     recorder
