@@ -6,14 +6,41 @@ use crate::application_layouts::{
     DEFAULT_APPLICATION_LAYOUT_ID,
 };
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-#[derive(Serialize, Deserialize)]
-struct ApplicationLayoutFile {
-    format: String,
-    version: u16,
-    profile: ApplicationLayout,
+fn validate_portable_application_layout(source: &ApplicationLayout) -> Result<()> {
+    if source.layers.len() != APPLICATION_LAYOUT_LAYER_COUNT
+        || source.layer_names.len() != APPLICATION_LAYOUT_LAYER_COUNT
+        || source.encoder_stacks.len() != APPLICATION_LAYOUT_LAYER_COUNT
+        || source
+            .encoder_stacks
+            .iter()
+            .any(|stack| !matches!(stack.len(), 0 | 2..=4))
+    {
+        bail!("Invalid application layout dimensions or encoder stacks");
+    }
+    // Dynamic resources use global/device IDs. Only the fixed Prev/Next codes
+    // verified in display_preview.rs::preview_key_icon are exempt; adjacent
+    // custom codes remain rejected, not an entire QMK custom range.
+    if source
+        .layers
+        .iter()
+        .flatten()
+        .copied()
+        .chain(
+            source
+                .encoder_stacks
+                .iter()
+                .flatten()
+                .flat_map(|action| [action.counter_clockwise, action.clockwise]),
+        )
+        .any(|code| {
+            code >= 0x2000 && !matches!(code, 0x7E05 | 0x7E06 | APPLICATION_LAYOUT_UNSET_KEYCODE)
+        })
+    {
+        bail!("Application layout uses device-specific actions (macros, Tap Dance, layers or custom keycodes). Safe resource remapping is not supported; nothing was written. Use the full app-settings backup for shared resources.");
+    }
+    Ok(())
 }
 
 impl EntropyApp {
@@ -25,13 +52,10 @@ impl EntropyApp {
         } else {
             crate::app::file_dialog::FileDialogAction::ImportApplicationLayout(id.clone())
         };
-        self.spawn_file_dialog(
-            action,
-            rfd::FileDialog::new()
-                .add_filter("Entropy application layout", &["entapp"])
-                .set_file_name(format!("{}.entapp", device_id_slug(&id))),
-            export,
-        );
+        let dialog = rfd::FileDialog::new()
+            .add_filter("Entropy layout", &["entlayout"])
+            .set_file_name(format!("{}.entlayout", device_id_slug(&id)));
+        self.spawn_file_dialog(action, dialog, export);
     }
 
     pub(super) fn write_application_layout_export(&self, path: &Path, id: &str) -> Result<()> {
@@ -43,13 +67,8 @@ impl EntropyApp {
         if id == DEFAULT_APPLICATION_LAYOUT_ID {
             bail!("Use Export layout for Default");
         }
-        let file = ApplicationLayoutFile {
-            format: "entropy.application-layout".into(),
-            version: 1,
-            profile,
-        };
-        std::fs::write(path, serde_json::to_vec_pretty(&file)?)
-            .context("Failed to export application layout")
+        validate_portable_application_layout(&profile)?;
+        super::entlayout::write_application_entlayout(path, profile, self.app_settings.language)
     }
 
     pub(super) fn import_application_layout_from_path(
@@ -57,44 +76,12 @@ impl EntropyApp {
         path: &Path,
         id: &str,
     ) -> Result<()> {
-        let file: ApplicationLayoutFile = serde_json::from_slice(&std::fs::read(path)?)
-            .context("Invalid application layout file (expected .entapp)")?;
-        if file.format != "entropy.application-layout" || file.version != 1 {
-            bail!("Unsupported application layout format or version");
-        }
+        let source = super::entlayout::read_application_entlayout(path)
+            .context("Invalid application layout file (expected .entlayout)")?;
         if id == DEFAULT_APPLICATION_LAYOUT_ID {
             bail!("Use Import layout for Default; application imports require an explicit application target");
         }
-        let source = file.profile;
-        if source.layers.len() != APPLICATION_LAYOUT_LAYER_COUNT
-            || source.layer_names.len() != APPLICATION_LAYOUT_LAYER_COUNT
-            || source.encoder_stacks.len() != APPLICATION_LAYOUT_LAYER_COUNT
-            || source
-                .encoder_stacks
-                .iter()
-                .any(|stack| !matches!(stack.len(), 0 | 2..=4))
-        {
-            bail!("Invalid application layout dimensions or encoder stacks");
-        }
-        // Dynamic resources and custom keycodes use global/device IDs. Until
-        // allocation/remapping exists, refuse them rather than point at unrelated
-        // macros, Tap Dances or custom actions on another installation.
-        if source
-            .layers
-            .iter()
-            .flatten()
-            .copied()
-            .chain(
-                source
-                    .encoder_stacks
-                    .iter()
-                    .flatten()
-                    .flat_map(|action| [action.counter_clockwise, action.clockwise]),
-            )
-            .any(|code| code >= 0x2000 && code != APPLICATION_LAYOUT_UNSET_KEYCODE)
-        {
-            bail!("Application layout uses device-specific actions (macros, Tap Dance, layers or custom keycodes). Safe resource remapping is not supported; nothing was imported. Use the full app-settings backup for shared resources.");
-        }
+        validate_portable_application_layout(&source)?;
         let key = self
             .application_layout_device_key()
             .context("Select a Macropad")?;

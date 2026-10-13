@@ -218,7 +218,18 @@ impl EntropyApp {
         // Foreground application changes happen while Entropy itself is not
         // focused. Keep a lightweight runtime tick alive so auto-switching is
         // not accidentally tied to egui input/repaint events.
-        if self.application_layouts_supported() {
+        if self.application_layouts_supported()
+            || self.qmk_hid_hosts.values().any(|bridge| {
+                super::application_layout_runtime::device_supports_application_layouts(
+                    bridge.device(),
+                ) && !self.app_settings.application_layouts.is_empty()
+                    && self
+                        .device_manager
+                        .devices()
+                        .iter()
+                        .any(|device| device.permits_hid_target(bridge.device()))
+            })
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
     }
@@ -511,6 +522,50 @@ mod tests {
     use super::super::settings_write_queue::SettingsWriteStatus;
     use super::*;
     use crate::keyboard::{KeyboardLayout, LayoutOption, PhysicalKey};
+
+    #[test]
+    fn tray_background_tick_keeps_macropad_service_alive_with_k04_selected() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let mut app = EntropyApp::new_inert_for_test();
+        let mut macropad = crate::device::test_usb_device("3-3", 5, 0x42);
+        macropad.name = "M4CR0Pad v3".into();
+        let mut k04 = crate::device::test_usb_device("3-2", 9, 0x04);
+        k04.name = "K:04".into();
+        app.device_manager
+            .replace_devices(vec![macropad.clone(), k04]);
+        app.selected_device = Some(1);
+        app.last_device_scan_at = 1.0;
+        app.app_settings
+            .application_layouts
+            .insert("tray-macropad".into(), Default::default());
+        let bridge = crate::qmk_hid_host::QmkHidHostBridge::test_inert(
+            macropad.clone(),
+            Default::default(),
+            None,
+            crate::qmk_hid_host::HostProtocol::Discover,
+        );
+        // Cold-start worker has not published UID/capabilities yet.
+        app.qmk_hid_hosts.insert(macropad.path.clone(), bridge);
+        let ctx = egui::Context::default();
+        let mut delay = std::time::Duration::MAX;
+        for frame in 0..4 {
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    time: Some(f64::from(frame)),
+                    ..Default::default()
+                },
+                |ui| {
+                    app.update_native_background(ui.ctx(), 1.0, true, true);
+                },
+            );
+            delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        }
+        assert!(
+            delay <= std::time::Duration::from_millis(200),
+            "hidden tray runtime stopped ticking while Macropad is connected: {delay:?}"
+        );
+        assert_eq!(app.selected_device, Some(1));
+    }
 
     #[test]
     fn macro_tab_preflight_does_not_reopen_after_cancel_until_tab_changes() {

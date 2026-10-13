@@ -309,12 +309,18 @@ impl raw_window_handle::HasDisplayHandle for ParentWindow {
 #[cfg(test)]
 thread_local! {
     static TEST_DIALOG_RESULT: std::cell::RefCell<Option<Option<std::path::PathBuf>>> = const { std::cell::RefCell::new(None) };
+    static TEST_DIALOG_OPTIONS: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
 /// Replace only the native portal boundary in UI click tests.
 #[cfg(test)]
 pub(crate) fn set_test_dialog_result(path: Option<std::path::PathBuf>) {
     TEST_DIALOG_RESULT.with(|result| *result.borrow_mut() = Some(path));
+}
+
+#[cfg(test)]
+pub(crate) fn test_dialog_options() -> String {
+    TEST_DIALOG_OPTIONS.with(|options| options.borrow().clone())
 }
 
 impl EntropyApp {
@@ -353,6 +359,7 @@ impl EntropyApp {
         let (tx, rx) = std::sync::mpsc::channel();
         #[cfg(test)]
         if let Some(path) = TEST_DIALOG_RESULT.with(|result| result.borrow_mut().take()) {
+            TEST_DIALOG_OPTIONS.with(|options| *options.borrow_mut() = format!("{dialog:?}"));
             tx.send(path).unwrap();
             self.pending_file_dialog = Some((action, self.connection_generation, rx));
             return;
