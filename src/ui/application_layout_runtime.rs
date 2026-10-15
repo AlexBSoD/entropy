@@ -881,7 +881,7 @@ impl EntropyApp {
 
             let installed_presets = crate::app_discovery::installed_builtin_presets();
             let mut persist = false;
-            let (snapshot, active_layout_followed, active_layout_changed) = {
+            let (active_layout_followed, active_layout_changed) = {
                 let settings = self
                     .app_settings
                     .application_layouts
@@ -910,19 +910,25 @@ impl EntropyApp {
                     foreground_changed && focused_layout_is_configured,
                 );
                 let active_layout_changed = settings.active_layout_id != previous_active_layout_id;
-                let snapshot = settings
-                    .active_layout()
-                    .filter(|layout| connected_selected_key.as_ref() == Some(&device_key)
-                        || layout.id != crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID)
-                    // A background Default belongs to that device's live firmware,
-                    // not its saved cache and never the selected keyboard's map.
-                    // Selected Default keeps its editor reconciliation/sync path.
-                    .map(crate::application_layouts::ApplicationLayoutSnapshot::from_layout)
-                    .unwrap_or_else(
-                        crate::application_layouts::ApplicationLayoutSnapshot::inactive,
-                    );
-                (snapshot, active_layout_followed, active_layout_changed)
+                (active_layout_followed, active_layout_changed)
             };
+            if selected && active_layout_followed {
+                // Metadata can change routing or make the editor follow a profile
+                // without changing foreground identity/title. Save to the captured
+                // source layout before hiding its field or publishing the snapshot.
+                self.commit_pending_application_layout_edits();
+            }
+            let snapshot = self.app_settings.application_layouts[&device_key]
+                .active_layout()
+                .filter(|layout| {
+                    connected_selected_key.as_ref() == Some(&device_key)
+                        || layout.id != crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID
+                })
+                // A background Default belongs to that device's live firmware,
+                // not its saved cache and never the selected keyboard's map.
+                // Selected Default keeps its editor reconciliation/sync path.
+                .map(crate::application_layouts::ApplicationLayoutSnapshot::from_layout)
+                .unwrap_or_else(crate::application_layouts::ApplicationLayoutSnapshot::inactive);
             if selected && active_layout_changed {
                 // Firmware releases held keys and starts every newly activated
                 // application layout on layer 0. Keep the independent Layout
@@ -2472,6 +2478,150 @@ mod tests {
                 proposed
             );
         }
+    }
+
+    #[test]
+    fn metadata_alias_profile_transition_preserves_layer_rename() {
+        metadata_transition_preserves_layer_rename(true);
+    }
+
+    #[test]
+    fn metadata_editor_follow_preserves_layer_rename() {
+        metadata_transition_preserves_layer_rename(false);
+    }
+
+    fn metadata_transition_preserves_layer_rename(alias_changes_active_profile: bool) {
+        use crate::application_layouts::{
+            DEFAULT_APPLICATION_LAYOUT_ID, DetectedApplication, DeviceApplicationLayouts,
+        };
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let ctx = egui::Context::default();
+        let mut app = EntropyApp::new_inert_for_test();
+        let key = "rename-metadata-transition".to_owned();
+        let mut settings = DeviceApplicationLayouts::default();
+        let target = settings.create_for_application(&DetectedApplication {
+            executable: "com.example.editor".into(),
+            ..Default::default()
+        });
+        let source = if alias_changes_active_profile {
+            DEFAULT_APPLICATION_LAYOUT_ID.to_owned()
+        } else {
+            target.clone()
+        };
+        settings.active_layout_id = source.clone();
+        settings.editor_layout_id = DEFAULT_APPLICATION_LAYOUT_ID.into();
+        app.app_settings
+            .application_layouts
+            .insert(key.clone(), settings);
+        app.app_settings.last_application_layout_device_key = Some(key.clone());
+        app.application_layout_editor_active = true;
+        app.selected_layer = 3;
+        let mut foreground = DetectedApplication {
+            executable: "entropy-host.exe".into(),
+            identities: vec!["entropy-host.exe".into()],
+            display_name: "entropy-host.exe".into(),
+            window_title: "Editor".into(),
+        };
+        if !alias_changes_active_profile {
+            foreground.identities.push("com.example.editor".into());
+        }
+        app.application_layout_foreground = Some(foreground.clone());
+        assert!(app.application_layout_manual_override.is_none());
+        let frame = |app: &mut EntropyApp, events| {
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1100.0, 800.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.draw_layout_layer_switcher_and_hints(ui, 0.0, 0.0, 52.0),
+            );
+        };
+        let position = egui::pos2(550.0, 50.0);
+        frame(&mut app, vec![egui::Event::PointerMoved(position)]);
+        for pressed in [true, false] {
+            frame(
+                &mut app,
+                vec![egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+        frame(&mut app, vec![]);
+        assert_eq!(app.editing_layer, Some(3));
+        assert_eq!(
+            app.editing_layer_layout_id.as_deref(),
+            Some(source.as_str())
+        );
+        frame(&mut app, vec![egui::Event::Text("Draft".into())]);
+        let draft = app.editing_layer_text.clone();
+        assert!(draft.contains("Draft"));
+        let mut refreshed = foreground.clone();
+        if alias_changes_active_profile {
+            refreshed.identities.push("com.example.editor".into());
+        } else {
+            refreshed.display_name = "Editor".into();
+        }
+        assert!(same_foreground_application(
+            Some(&foreground),
+            Some(&refreshed)
+        ));
+        app.update_application_layout_runtime_with(
+            crate::app_discovery::ApplicationDiscoverySnapshot {
+                foreground: Some(refreshed.clone()),
+                foreground_status: crate::app_discovery::ForegroundStatus {
+                    backend: "synthetic metadata snapshot".into(),
+                    state: crate::app_discovery::ForegroundState::Focused(refreshed),
+                },
+                ..Default::default()
+            },
+        );
+        let settings = app.application_layout_settings().unwrap();
+        assert_eq!(settings.active_layout_id, target);
+        assert_eq!(settings.editor_layout_id, target);
+        assert_eq!(app.selected_layer, 0);
+        assert_eq!(
+            settings.layouts[&source].layer_names[3], draft,
+            "metadata transition must commit to the captured source profile"
+        );
+        assert!(app.editing_layer.is_none());
+        assert!(app.editing_layer_layout_id.is_none());
+        frame(&mut app, vec![]);
+        // Starting the next rename must not overwrite the source draft.
+        for pressed in [true, false] {
+            frame(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert_eq!(app.editing_layer, Some(0));
+        assert_eq!(
+            app.editing_layer_layout_id.as_deref(),
+            Some(target.as_str())
+        );
+        let persisted = crate::app::app_storage::load_app_settings();
+        assert_eq!(
+            persisted.application_layouts[&key].layouts[&source].layer_names[3],
+            draft
+        );
+        assert_ne!(
+            persisted.application_layouts[&key].layouts[&target].layer_names[0],
+            draft
+        );
     }
 
     #[test]
