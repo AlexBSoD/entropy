@@ -11,13 +11,15 @@ use std::path::{Path, PathBuf};
 
 const ENTLAYOUT_FORMAT: &str = "entropy.layout";
 const ENTLAYOUT_VERSION: u16 = 7;
+// Complete Macropad device documents add every host profile and matching data.
+const MACROPAD_ENTLAYOUT_VERSION: u16 = 9;
 
 fn entlayout_version_supported(version: u16) -> bool {
     (1..=ENTLAYOUT_VERSION).contains(&version)
 }
 
-// Version 8 adds an explicitly scoped application document. Ordinary device
-// exports remain version 7 and retain their original schema.
+// Version 8 is the older explicitly scoped application document. Non-Macropad
+// ordinary device exports retain version 7 and their original schema.
 const APPLICATION_ENTLAYOUT_VERSION: u16 = 8;
 
 #[derive(Serialize, Deserialize)]
@@ -100,6 +102,136 @@ struct EntLayoutFile {
     created_at: String,
     keyboard: EntLayoutKeyboard,
     data: EntLayoutData,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_application_profiles"
+    )]
+    application_layouts: Option<EntLayoutProfiles>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pictograms: Option<Vec<EntLayoutPictogram>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    application_categories: Vec<(String, String)>,
+}
+
+// Complete Macropad imports own a small filesystem transaction. Legacy writers
+// intentionally retain their historical best-effort behavior.
+#[derive(Default)]
+struct EntLayoutSidecars {
+    files: Vec<(
+        PathBuf,
+        Option<Vec<u8>>,
+        Option<tempfile::NamedTempFile>,
+        bool,
+    )>,
+    complete: bool,
+}
+
+impl EntLayoutSidecars {
+    fn stage(&mut self, path: PathBuf, value: &impl Serialize) -> Result<()> {
+        use std::io::Write;
+        let original = match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Cannot stage metadata {}", path.display()))
+            }
+        };
+        let parent = path.parent().context("Invalid metadata path")?;
+        std::fs::create_dir_all(parent)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        let bytes = serde_json::to_vec(value)?;
+        temporary.write_all(&bytes)?;
+        temporary.as_file().sync_all()?;
+        if std::fs::read(temporary.path())? != bytes {
+            bail!("Metadata staging verification failed");
+        }
+        self.files.push((path, original, Some(temporary), false));
+        Ok(())
+    }
+
+    fn persist(&mut self) -> Result<()> {
+        for (path, _, temporary, applied) in &mut self.files {
+            temporary
+                .take()
+                .context("Missing staged metadata")?
+                .persist(&*path)
+                .with_context(|| format!("Cannot persist metadata {}", path.display()))?;
+            *applied = true;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for EntLayoutSidecars {
+    fn drop(&mut self) {
+        if self.complete {
+            return;
+        }
+        for (path, original, _, applied) in self.files.iter().rev() {
+            if !applied {
+                continue;
+            }
+            let result = if let Some(bytes) = original {
+                std::fs::write(path, bytes)
+            } else {
+                std::fs::remove_file(path)
+            };
+            if let Err(error) = result {
+                log::error!("Metadata rollback failed for {}: {error}", path.display());
+            }
+        }
+    }
+}
+
+type EntLayoutProfiles =
+    std::collections::BTreeMap<String, crate::application_layouts::ApplicationLayout>;
+
+fn deserialize_application_profiles<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<EntLayoutProfiles>, D::Error> {
+    struct Profiles(EntLayoutProfiles);
+    impl<'de> Deserialize<'de> for Profiles {
+        fn deserialize<D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> std::result::Result<Self, D::Error> {
+            struct Visitor;
+            impl<'de> serde::de::Visitor<'de> for Visitor {
+                type Value = Profiles;
+                fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    formatter.write_str("unique application layout IDs")
+                }
+                fn visit_map<M: serde::de::MapAccess<'de>>(
+                    self,
+                    mut access: M,
+                ) -> std::result::Result<Profiles, M::Error> {
+                    let mut profiles = EntLayoutProfiles::new();
+                    while let Some((id, profile)) = access
+                        .next_entry::<String, crate::application_layouts::ApplicationLayout>(
+                    )? {
+                        if profiles.insert(id, profile).is_some() {
+                            return Err(serde::de::Error::custom(
+                                "duplicate application layout ID",
+                            ));
+                        }
+                    }
+                    Ok(Profiles(profiles))
+                }
+            }
+            deserializer.deserialize_map(Visitor)
+        }
+    }
+    Option::<Profiles>::deserialize(deserializer)
+        .map(|profiles| profiles.map(|profiles| profiles.0))
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct EntLayoutPictogram {
+    tap_dance: bool,
+    slot: usize,
+    bitmap: Vec<u8>,
+    color: [u8; 3],
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -597,7 +729,7 @@ impl EntLayoutSectionImportStats {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct EntTextExpanderData {
     enabled: bool,
     app_blacklist: String,
@@ -723,6 +855,11 @@ impl EntropyApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn write_entlayout_export(&mut self, path: &Path) {
+        if let Err(error) = self.prepare_entlayout_pictograms() {
+            self.status_msg =
+                format!("Layout export failed while reading shared pictograms: {error}");
+            return;
+        }
         let Some(bundle) = self.entlayout_snapshot() else {
             self.status_msg = crate::i18n::tr_catalog(
                 self.app_settings.language,
@@ -731,7 +868,10 @@ impl EntropyApp {
             .into();
             return;
         };
-        match write_entlayout_file(path, &bundle, self.app_settings.language) {
+        match self
+            .validate_entlayout_file(&bundle)
+            .and_then(|()| write_entlayout_file(path, &bundle, self.app_settings.language))
+        {
             Ok(()) => {
                 self.status_msg = crate::i18n::tr_catalog_format(
                     self.app_settings.language,
@@ -788,8 +928,17 @@ impl EntropyApp {
             crate::i18n::tr_catalog(lang, "entlayout.invalid_entlayout_json"),
         )? {
             EntLayoutDocument::Device(bundle) => bundle,
-            EntLayoutDocument::Application(_) => bail!("Application layout requires an explicit application target; use Import into application"),
+            EntLayoutDocument::Application(_) => bail!(match lang {
+                crate::i18n::Language::Russian => "Файл содержит только одну раскладку приложения, а не полную резервную копию Macropad. Создайте полную копию через «Экспорт раскладки» в исходном приложении; данные не изменены.",
+                crate::i18n::Language::English => "This file contains a single application layout, not a complete Macropad backup. Create a complete backup using Export layout in the source application; no data was changed.",
+            }),
         };
+        // Reject malformed documents before even read-only preparation. Resolve
+        // cold capability only after schema/resource validation, before backup.
+        self.validate_entlayout_file_with_capability(&bundle, false)?;
+        if bundle.application_layouts.is_some() {
+            self.prepare_entlayout_pictograms()?;
+        }
         self.validate_entlayout_file(&bundle)?;
         let backup_path = self.write_entlayout_auto_backup()?;
         let (firmware_failures, mapping, portable_settings) = self.apply_entlayout(&bundle)?;
@@ -802,11 +951,87 @@ impl EntropyApp {
         ))
     }
 
+    /// Read the production library on a cold connection, independently of the
+    /// settings UI. Only explicit QUERY command/format rejection proves lack of
+    /// support; transport, status and data-read errors must abort portability.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn prepare_entlayout_pictograms(&mut self) -> Result<()> {
+        // Optional connect reads may fail without disconnecting the keyboard.
+        // Retry only the read-only handshake; never interpret a timeout as v7.
+        let retry_probe = self
+            .selected_device
+            .and_then(|index| self.device_manager.devices().get(index))
+            .filter(|device| device.is_ergohaven_display_macropad())
+            .is_some_and(|device| {
+                self.device_about_info.as_ref().is_some_and(|info| {
+                    info.application_layout_probe_failed
+                        && info.vendor_id == device.vendor_id
+                        && info.product_id == device.product_id
+                        && info.path == device.path
+                })
+            });
+        if retry_probe {
+            let supported = self
+                .hid_device
+                .as_ref()
+                .context("No active keyboard connection")?
+                .probe_application_layout_protocol()
+                .context("Application layout capability is unconfirmed; export refused")?;
+            let info = self.device_about_info.as_mut().unwrap();
+            info.supports_application_layouts = supported;
+            info.application_layout_probe_failed = false;
+        }
+        if self.application_layout_device_key().is_none() {
+            return Ok(());
+        }
+        let state = &self.display_settings.pictograms;
+        if state.loading || state.saving || self.vial_hid_task.is_some() {
+            bail!("Shared pictogram storage is busy");
+        }
+        if state.supported == Some(false) || (state.supported == Some(true) && state.loaded) {
+            return Ok(());
+        }
+        let result = self
+            .hid_device
+            .as_ref()
+            .context("No active keyboard connection")?
+            .load_pictograms(&std::sync::atomic::AtomicU32::new(0));
+        match result {
+            Ok(library) => {
+                let state = &mut self.display_settings.pictograms;
+                state.library = library;
+                state.supported = Some(true);
+                state.loaded = true;
+                state.load_failure = None;
+                Ok(())
+            }
+            Err(error)
+                if self.display_settings.pictograms.supported.is_none()
+                    && matches!(
+                        error.to_string().as_str(),
+                        "pictogram command 0xC0 is unsupported" | "unsupported pictogram format"
+                    ) =>
+            {
+                self.display_settings.pictograms.supported = Some(false);
+                self.display_settings.pictograms.loaded = false;
+                Ok(())
+            }
+            Err(error) => Err(error.context("Failed to prepare shared pictograms")),
+        }
+    }
+
     /// The `.entlayout` document for the connected keyboard, as the file
     /// dialog export would write it; `None` before a keyboard is connected.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(super) fn entlayout_export_json(&self) -> Option<Result<String>> {
+    pub(super) fn entlayout_export_json(&mut self) -> Option<Result<String>> {
+        self.layout.as_ref()?;
+        if let Err(error) = self.prepare_entlayout_pictograms() {
+            return Some(Err(error));
+        }
         let bundle = self.entlayout_snapshot()?;
+        if let Err(error) = self.validate_entlayout_file(&bundle) {
+            return Some(Err(error));
+        }
         Some(
             serde_json::to_string_pretty(&bundle).context(crate::i18n::tr_catalog(
                 self.app_settings.language,
@@ -817,11 +1042,27 @@ impl EntropyApp {
 
     fn entlayout_snapshot(&self) -> Option<EntLayoutFile> {
         let layout = self.layout.as_ref()?;
+        // A never-opened application settings page must not downgrade a capable
+        // Macropad backup. Default inherits firmware without publishing host data.
+        let fresh_settings = self.application_layout_device_key().map(|_| {
+            let mut settings = crate::application_layouts::DeviceApplicationLayouts::default();
+            let profile = settings
+                .layouts
+                .get_mut(crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID)
+                .unwrap();
+            for (target, source) in profile.layer_names.iter_mut().zip(&self.layer_names) {
+                *target = source.clone();
+            }
+            settings
+        });
+        let application_settings = self
+            .application_layout_settings()
+            .or(fresh_settings.as_ref());
         // The ordinary layout file is always Default, never the foreground
         // application's host overlay. Include local Default edits even while
         // their standalone firmware write is still pending.
         let default_profile = self.selected_device.and_then(|_| {
-            self.application_layout_settings().and_then(|settings| {
+            application_settings.and_then(|settings| {
                 settings
                     .layouts
                     .get(crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID)
@@ -872,10 +1113,51 @@ impl EntropyApp {
         };
         Some(EntLayoutFile {
             format: ENTLAYOUT_FORMAT.to_owned(),
-            version: ENTLAYOUT_VERSION,
+            version: if application_settings.is_some() {
+                MACROPAD_ENTLAYOUT_VERSION
+            } else {
+                ENTLAYOUT_VERSION
+            },
             created_by: "Entropy".to_owned(),
             created_at: chrono::Local::now().to_rfc3339(),
             keyboard,
+            application_categories: application_settings
+                .map(|settings| {
+                    let referenced: std::collections::BTreeSet<_> = settings
+                        .layouts
+                        .values()
+                        .map(|profile| settings.category_id_for_layout(profile))
+                        .collect();
+                    settings
+                        .category_names
+                        .iter()
+                        .filter(|(id, _)| referenced.contains(*id))
+                        .map(|(id, name)| (id.clone(), name.clone()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            application_layouts: application_settings.map(|settings| settings.layouts.clone()),
+            pictograms: application_settings.and_then(|_| {
+                let state = &self.display_settings.pictograms;
+                state.loaded.then(|| {
+                    [PictogramKind::Macro, PictogramKind::TapDance]
+                        .into_iter()
+                        .flat_map(|kind| {
+                            (0..256).filter_map(move |slot| {
+                                state
+                                    .library
+                                    .bitmap(kind, slot)
+                                    .map(|bitmap| EntLayoutPictogram {
+                                        tap_dance: kind == PictogramKind::TapDance,
+                                        slot,
+                                        bitmap: bitmap.to_vec(),
+                                        color: state.library.color(kind, slot).unwrap(),
+                                    })
+                            })
+                        })
+                        .collect()
+                })
+            }),
             data: EntLayoutData {
                 source_layout: Some(entlayout_source_layout(layout)),
                 keymap: layout
@@ -911,7 +1193,11 @@ impl EntropyApp {
                             .collect()
                     })
                     .unwrap_or_else(|| self.layer_names.clone()),
-                text_expander: self.text_expander_entlayout_snapshot(),
+                text_expander: if application_settings.is_some() {
+                    EntTextExpanderData::default()
+                } else {
+                    self.text_expander_entlayout_snapshot()
+                },
                 macros: EntMacroData {
                     bytecode_base64: self
                         .keycode_picker
@@ -1063,6 +1349,14 @@ impl EntropyApp {
     }
 
     fn validate_entlayout_file(&self, bundle: &EntLayoutFile) -> Result<()> {
+        self.validate_entlayout_file_with_capability(bundle, true)
+    }
+
+    fn validate_entlayout_file_with_capability(
+        &self,
+        bundle: &EntLayoutFile,
+        require_confirmed: bool,
+    ) -> Result<()> {
         if bundle.format != ENTLAYOUT_FORMAT {
             bail!(
                 "{}",
@@ -1073,7 +1367,9 @@ impl EntropyApp {
                 )
             );
         }
-        if !entlayout_version_supported(bundle.version) {
+        if !entlayout_version_supported(bundle.version)
+            && bundle.version != MACROPAD_ENTLAYOUT_VERSION
+        {
             bail!(
                 "{}",
                 crate::i18n::tr_catalog_format(
@@ -1087,6 +1383,245 @@ impl EntropyApp {
             self.app_settings.language,
             "entlayout.connect_target_keyboard",
         ))?;
+        if let Some(pictograms) = &bundle.pictograms {
+            if bundle.version != MACROPAD_ENTLAYOUT_VERSION
+                || (require_confirmed && self.display_settings.pictograms.supported != Some(true))
+            {
+                bail!("Pictogram import requires a confirmed supported target library");
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for icon in pictograms {
+                if icon.slot >= 256
+                    || icon.bitmap.len() != PICTOGRAM_BYTES
+                    || !seen.insert((icon.tap_dance, icon.slot))
+                {
+                    bail!("Invalid or duplicate imported pictogram");
+                }
+            }
+        }
+        if (bundle.version == MACROPAD_ENTLAYOUT_VERSION) != bundle.application_layouts.is_some() {
+            bail!("Invalid complete Macropad layout version/payload");
+        }
+        if let Some(profiles) = &bundle.application_layouts {
+            let mut category_ids = std::collections::BTreeSet::new();
+            let mut category_names = std::collections::BTreeSet::new();
+            for (id, name) in &bundle.application_categories {
+                if id.trim().is_empty()
+                    || name.trim().is_empty()
+                    || name.trim().chars().count() > 48
+                    || !category_ids.insert(id.as_str())
+                    || !category_names.insert(name.trim().to_lowercase())
+                {
+                    bail!("Invalid or duplicate application category");
+                }
+            }
+            for profile in profiles.values() {
+                if let Some(id) = profile.custom_category_id.as_deref() {
+                    if id.starts_with("custom:") && !category_ids.contains(id) {
+                        bail!("Missing application category definition: {id}");
+                    }
+                }
+            }
+            let geometry = bundle
+                .data
+                .source_layout
+                .as_ref()
+                .context("Complete Macropad layout requires source geometry")?;
+            if bundle.keyboard.keys != geometry.keys.len()
+                || bundle.keyboard.layers != bundle.data.keymap.len()
+                || geometry.encoders.len() != bundle.data.encoder_keymap.first().map_or(0, Vec::len)
+                || bundle.data.layer_names.len() != bundle.keyboard.layers
+            {
+                bail!("Inconsistent complete Macropad geometry");
+            }
+            if geometry.keys.iter().any(|key| {
+                key.row as usize >= bundle.keyboard.rows
+                    || key.col as usize >= bundle.keyboard.cols
+                    || !key.x.is_finite()
+                    || !key.y.is_finite()
+                    || !key.w.is_finite()
+                    || !key.h.is_finite()
+                    || key.w <= 0.0
+                    || key.h <= 0.0
+            }) || geometry.encoders.iter().any(|encoder| {
+                encoder.direction > 1
+                    || !encoder.x.is_finite()
+                    || !encoder.y.is_finite()
+                    || encoder.w <= 0.0
+                    || encoder.h <= 0.0
+            }) {
+                bail!("Invalid complete Macropad source geometry");
+            }
+            if require_confirmed {
+                self.application_layout_device_key()
+                    .context("Complete layout requires a Macropad target")?;
+            }
+            if !profiles.contains_key(crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID) {
+                bail!("Complete Macropad layout is missing Default");
+            }
+            let macro_bytes = entmacro_bytecode(&bundle.data.macros)?;
+            if macro_bytes.len() > self.keycode_picker.macro_count {
+                bail!("Target has insufficient macro slots");
+            }
+
+            let target_limits = self.entlayout_keycode_import_limits();
+            let shared_limits = EntLayoutKeycodeImportLimits {
+                layer_count: target_limits.layer_count.min(bundle.keyboard.layers),
+                macro_count: target_limits
+                    .macro_count
+                    .min(entmacro_count(&bundle.data.macros)),
+                tap_dance_count: target_limits
+                    .tap_dance_count
+                    .min(bundle.data.tap_dance.entries.len()),
+            };
+            if bundle.data.tap_dance.entries.len() > shared_limits.tap_dance_count
+                || bundle.data.combos.entries.len() > self.combo_entries.len()
+                || bundle.data.key_overrides.entries.len() > self.key_override_entries.len()
+                || bundle.data.alt_repeat.entries.len() > self.alt_repeat_entries.len()
+            {
+                bail!("Target has insufficient shared resource slots");
+            }
+            for code in bundle
+                .data
+                .keymap
+                .iter()
+                .flatten()
+                .chain(bundle.data.encoder_keymap.iter().flatten())
+            {
+                check_entlayout_keycode(*code, bundle, _layout, shared_limits)
+                    .map_err(|_| anyhow::anyhow!("Unrestorable firmware resource: {code:#06x}"))?;
+            }
+            for encoded in bundle
+                .data
+                .native_keymap
+                .iter()
+                .flatten()
+                .flatten()
+                .chain(
+                    bundle
+                        .data
+                        .combos
+                        .entries
+                        .iter()
+                        .filter_map(|entry| entry.native_output.as_ref()),
+                )
+                .chain(
+                    bundle
+                        .data
+                        .tap_dance
+                        .entries
+                        .iter()
+                        .flat_map(|entry| {
+                            [
+                                entry.native_on_tap.as_ref(),
+                                entry.native_on_hold.as_ref(),
+                                entry.native_on_double_tap.as_ref(),
+                                entry.native_on_tap_hold.as_ref(),
+                            ]
+                        })
+                        .flatten(),
+                )
+            {
+                check_complete_native_action(encoded, bundle, _layout, shared_limits)?;
+            }
+            for entry in &bundle.data.tap_dance.entries {
+                check_enttap_dance_entry(entry, bundle, _layout, shared_limits)
+                    .map_err(|_| anyhow::anyhow!("Unrestorable shared Tap Dance dependency"))?;
+            }
+            for entry in &bundle.data.combos.entries {
+                check_entcombo_entry(entry, bundle, _layout, shared_limits)
+                    .map_err(|_| anyhow::anyhow!("Unrestorable shared Combo dependency"))?;
+            }
+            for entry in &bundle.data.key_overrides.entries {
+                check_entkey_override_entry(entry, bundle, _layout, shared_limits)
+                    .map_err(|_| anyhow::anyhow!("Unrestorable shared key override dependency"))?;
+            }
+            for entry in &bundle.data.alt_repeat.entries {
+                check_entalt_repeat_entry(entry, bundle, _layout, shared_limits)
+                    .map_err(|_| anyhow::anyhow!("Unrestorable shared Alt Repeat dependency"))?;
+            }
+            let limits = EntLayoutKeycodeImportLimits {
+                layer_count: 16,
+                macro_count: self
+                    .keycode_picker
+                    .macro_count
+                    .min(entmacro_count(&bundle.data.macros)),
+                tap_dance_count: self
+                    .keycode_picker
+                    .tap_dance_entries
+                    .len()
+                    .min(bundle.data.tap_dance.entries.len()),
+            };
+            let mut merged = self
+                .application_layout_settings()
+                .map(|settings| settings.layouts.clone())
+                .unwrap_or_default();
+            merged.extend(profiles.clone());
+            let candidates: Vec<_> = merged
+                .iter()
+                .filter(|(id, _)| {
+                    id.as_str() != crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID
+                })
+                .collect();
+            for (index, (id, profile)) in candidates.iter().enumerate() {
+                for (other_id, other) in &candidates[index + 1..] {
+                    // Do not reject unrelated, pre-existing configurations.
+                    if !profiles.contains_key(*id) && !profiles.contains_key(*other_id) {
+                        continue;
+                    }
+                    if profile.title_contains.trim().to_lowercase()
+                        == other.title_contains.trim().to_lowercase()
+                        && crate::application_layouts::application_identities_match(
+                            std::iter::once(profile.executable.as_str())
+                                .chain(profile.application_identities.iter().map(String::as_str)),
+                            std::iter::once(other.executable.as_str())
+                                .chain(other.application_identities.iter().map(String::as_str)),
+                        )
+                    {
+                        bail!("Ambiguous application identity for {id} and {other_id}");
+                    }
+                }
+            }
+            for (id, profile) in profiles {
+                if id.is_empty()
+                    || id != &profile.id
+                    || profile.layers.len() != 16
+                    || profile.layer_names.len() != 16
+                    || profile.encoder_stacks.len() != 16
+                    || profile
+                        .encoder_stacks
+                        .iter()
+                        .any(|stack| !matches!(stack.len(), 0 | 2..=4))
+                {
+                    bail!("Invalid application profile dimensions or identity: {id}");
+                }
+                if let Some(existing) = self
+                    .application_layout_settings()
+                    .and_then(|settings| settings.layouts.get(id))
+                {
+                    if id != crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID
+                        && existing.executable != profile.executable
+                    {
+                        bail!(
+                            "Ambiguous application identity for {id}; existing executable differs"
+                        );
+                    }
+                }
+                for code in profile.layers.iter().flatten().copied().chain(
+                    profile
+                        .encoder_stacks
+                        .iter()
+                        .flatten()
+                        .flat_map(|action| [action.counter_clockwise, action.clockwise]),
+                ) {
+                    if code != crate::application_layouts::APPLICATION_LAYOUT_UNSET_KEYCODE {
+                        check_entlayout_keycode(code, bundle, _layout, limits).map_err(|_| {
+                            anyhow::anyhow!("Unmappable application resource in {id}: {code:#06x}")
+                        })?;
+                    }
+                }
+            }
+        }
         if bundle.data.keymap.is_empty() {
             bail!(
                 "{}",
@@ -1168,6 +1703,30 @@ impl EntropyApp {
                 )
             );
         }
+        // The first pass is pure: reject all malformed source structures and
+        // references before capability preparation or any other HID request.
+        // Query target capacity only in the strict pass, after the read-only
+        // capability retry has had a chance to confirm the matching Macropad.
+        if require_confirmed && bundle.application_layouts.is_some() {
+            let macro_bytes = entmacro_bytecode(&bundle.data.macros)?;
+            if !macro_bytes.is_empty() {
+                let size = self
+                    .hid_device
+                    .as_ref()
+                    .context("No active keyboard connection")?
+                    .get_macro_buffer_size()? as usize;
+                // Empty target slots also require their NUL separator.
+                let required = macro_bytes
+                    .iter()
+                    .map(Vec::len)
+                    .sum::<usize>()
+                    .checked_add(self.keycode_picker.macro_count)
+                    .context("Macro buffer size overflow")?;
+                if required > size {
+                    bail!("Target has insufficient macro bytecode capacity");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1206,9 +1765,236 @@ impl EntropyApp {
         EntLayoutImportMapping,
         EntPortableSettingsImportReport,
     )> {
+        self.hid_device
+            .as_ref()
+            .context("No active keyboard connection")?;
         let mapping = self.entlayout_import_mapping(bundle)?;
+        let mut sidecars = EntLayoutSidecars::default();
+        if bundle.application_layouts.is_some() && !self.current_device_is_likely_rmk() {
+            let name = &self.current_device_name;
+            sidecars.stage(
+                macro_metadata_path(name),
+                &MacroMetadata {
+                    names: normalized_strings(
+                        &bundle.data.macros.names,
+                        self.keycode_picker.macro_count,
+                    ),
+                    descriptions: normalized_strings(
+                        &bundle.data.macros.descriptions,
+                        self.keycode_picker.macro_count,
+                    ),
+                },
+            )?;
+            sidecars.stage(
+                combo_names_path(name),
+                &normalized_strings(&bundle.data.combos.names, self.combo_entries.len()),
+            )?;
+            let mut colors = bundle.data.combos.colors.clone();
+            migrate_legacy_combo_default_colors(&mut colors);
+            normalize_combo_colors(&mut colors, self.combo_entries.len());
+            sidecars.stage(combo_colors_path(name), &colors)?;
+            sidecars.stage(
+                tap_dance_names_path(name),
+                &normalized_strings(
+                    &bundle.data.tap_dance.names,
+                    self.keycode_picker.tap_dance_entries.len(),
+                ),
+            )?;
+            sidecars.stage(
+                key_override_names_path(name),
+                &normalized_strings(
+                    &bundle.data.key_overrides.names,
+                    self.key_override_entries.len(),
+                ),
+            )?;
+            sidecars.stage(
+                alt_repeat_names_path(name),
+                &normalized_strings(&bundle.data.alt_repeat.names, self.alt_repeat_entries.len()),
+            )?;
+        }
+        let mut staged_settings = None;
+        let mut staged_pictograms = None;
+        if let Some(profiles) = &bundle.application_layouts {
+            let key = self
+                .application_layout_device_key()
+                .context("Select a Macropad")?;
+            let mut settings = self.app_settings.clone();
+            let target = settings.application_layouts.entry(key).or_default();
+            let mut category_mapping = std::collections::BTreeMap::new();
+            for (id, name) in &bundle.application_categories {
+                let mapped = target
+                    .category_names
+                    .iter()
+                    .find(|(existing_id, existing_name)| {
+                        target.category_exists(existing_id)
+                            && existing_name.eq_ignore_ascii_case(name.trim())
+                    })
+                    .map(|(id, _)| id.clone());
+                let mapped = match mapped {
+                    Some(id) => id,
+                    None => target
+                        .create_category(name)
+                        .context("Cannot allocate imported application category")?,
+                };
+                category_mapping.insert(id.clone(), mapped);
+            }
+            for (id, source) in profiles {
+                let mut profile = source.clone();
+                let source_category = source.custom_category_id.clone().unwrap_or_else(|| {
+                    source
+                        .category
+                        .unwrap_or_else(|| {
+                            crate::application_layouts::application_layout_category_for_executable(
+                                &source.executable,
+                            )
+                        })
+                        .id()
+                        .to_owned()
+                });
+                if let Some(mapped) = category_mapping.get(&source_category) {
+                    profile.custom_category_id = Some(mapped.clone());
+                }
+                let layout = self.layout.as_ref().context("Missing target layout")?;
+                let limits = EntLayoutKeycodeImportLimits {
+                    layer_count: 16,
+                    ..self.entlayout_keycode_import_limits()
+                };
+                for code in profile.layers.iter_mut().flatten().chain(
+                    profile
+                        .encoder_stacks
+                        .iter_mut()
+                        .flatten()
+                        .flat_map(|action| [&mut action.counter_clockwise, &mut action.clockwise]),
+                ) {
+                    if *code != crate::application_layouts::APPLICATION_LAYOUT_UNSET_KEYCODE {
+                        *code = check_entlayout_keycode(*code, bundle, layout, limits).map_err(
+                            |_| anyhow::anyhow!("Unmappable application resource in {id}"),
+                        )?;
+                    }
+                }
+                target.layouts.insert(id.clone(), profile);
+            }
+            if let (Some(source), Some(layout), Some(device_key)) = (
+                bundle.data.layout_element_visibility.as_ref(),
+                self.layout.as_ref(),
+                self.layout_element_visibility_device_key(),
+            ) {
+                let current = settings
+                    .layout_element_visibility
+                    .get(&device_key)
+                    .cloned()
+                    .unwrap_or_default();
+                let mapped = map_entlayout_element_visibility(
+                    source,
+                    bundle.data.source_layout.as_ref(),
+                    &mapping,
+                    layout,
+                    &current,
+                );
+                if mapped == LayoutElementVisibility::default() {
+                    settings.layout_element_visibility.remove(&device_key);
+                } else {
+                    settings
+                        .layout_element_visibility
+                        .insert(device_key, mapped);
+                }
+            }
+            let destination = app_settings_path();
+            let parent = destination.parent().context("Invalid settings path")?;
+            std::fs::create_dir_all(parent)?;
+            let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+            use std::io::Write;
+            temporary.write_all(&serde_json::to_vec_pretty(&settings)?)?;
+            temporary.as_file().sync_all()?;
+            if destination.is_dir() {
+                bail!("Failed to save Macropad layouts: destination is a directory");
+            }
+            staged_settings = Some((temporary, destination, settings));
+        }
+        sidecars.persist()?;
+        if let Some(pictograms) = &bundle.pictograms {
+            let hid = self
+                .hid_device
+                .as_ref()
+                .context("No active keyboard connection")?;
+            let progress = std::sync::atomic::AtomicU32::new(0);
+            let mut library = if self.display_settings.pictograms.loaded {
+                self.display_settings.pictograms.library.clone()
+            } else {
+                hid.load_pictograms(&progress)?
+            };
+            for icon in pictograms {
+                let kind = if icon.tap_dance {
+                    PictogramKind::TapDance
+                } else {
+                    PictogramKind::Macro
+                };
+                if library.bitmap(kind, icon.slot) == Some(icon.bitmap.as_slice())
+                    && library.color(kind, icon.slot) == Some(icon.color)
+                {
+                    continue;
+                }
+                // A failed/partial upload can already have changed firmware.
+                // Keep the old bytes for display, but never claim they are still
+                // confirmed; only publish readback after all import gates pass.
+                self.display_settings.pictograms.loaded = false;
+                library.set_colored(kind, icon.slot, &icon.bitmap, icon.color);
+                library = hid.upload_pictogram_slot(library, kind, icon.slot, &progress)?;
+            }
+            if !pictograms.is_empty() {
+                let confirmed = hid.load_pictograms(&progress)?;
+                for icon in pictograms {
+                    let kind = if icon.tap_dance {
+                        PictogramKind::TapDance
+                    } else {
+                        PictogramKind::Macro
+                    };
+                    if confirmed.bitmap(kind, icon.slot) != Some(icon.bitmap.as_slice())
+                        || confirmed.color(kind, icon.slot) != Some(icon.color)
+                    {
+                        bail!("Imported pictogram readback mismatch");
+                    }
+                }
+                staged_pictograms = Some(confirmed);
+            }
+        }
         let (mut firmware_failures, portable_settings) =
             self.apply_entlayout_firmware_state(bundle, &mapping)?;
+        // Complete backups must finish every supported HID operation before host
+        // settings publication or sidecar commit. Firmware itself is not atomic.
+        #[cfg(not(target_arch = "wasm32"))]
+        if bundle.application_layouts.is_some() {
+            let mut names = self.layer_names.clone();
+            for (target, source) in names
+                .iter_mut()
+                .take(self.layer_count)
+                .zip(&bundle.data.layer_names)
+            {
+                *target = source.clone();
+            }
+            names.truncate(self.layer_count);
+            let failed = self.write_layer_names_to_firmware(&names);
+            if !failed.is_empty() {
+                firmware_failures.push(format!("layer names (layers {failed:?})"));
+            }
+        }
+        if bundle.application_layouts.is_some() && !firmware_failures.is_empty() {
+            bail!(
+                "Macropad resource import failed; host profiles were not published: {}",
+                firmware_failures.join(", ")
+            );
+        }
+        if let Some((temporary, destination, settings)) = staged_settings {
+            temporary
+                .persist(&destination)
+                .context("Failed to save Macropad layouts")?;
+            self.app_settings = settings;
+        }
+        if let Some(library) = staged_pictograms {
+            self.display_settings.pictograms.library = library;
+            self.display_settings.pictograms.loaded = true;
+        }
+        sidecars.complete = true;
         self.apply_entlayout_local_state(bundle, &mapping)?;
         self.refresh_layer_picker_content_flags();
 
@@ -1217,7 +2003,7 @@ impl EntropyApp {
         // failing layer and reports which ones failed, so stale firmware slots
         // aren't left to win over the local names on the next reconnect.
         #[cfg(not(target_arch = "wasm32"))]
-        {
+        if bundle.application_layouts.is_none() {
             let names = self.layer_names.clone();
             let failed = self.write_layer_names_to_firmware(&names);
             if !failed.is_empty() {
@@ -1358,8 +2144,25 @@ impl EntropyApp {
             tr("entlayout.encoder_keymap"),
             tr("entlayout.encoder_visibility"),
             tr("entlayout.layer_names"),
-            tr("entlayout.text_expander"),
         ];
+        if let Some(profiles) = &bundle.application_layouts {
+            imported.push(match lang {
+                crate::i18n::Language::Russian => format!("Раскладки приложений: {} (Default и все приложения; правила сопоставления восстановлены)", profiles.len()),
+                crate::i18n::Language::English => format!("Application layouts: {} (Default and all applications; app matching restored)", profiles.len()),
+            });
+            if bundle
+                .pictograms
+                .as_ref()
+                .is_some_and(|icons| !icons.is_empty())
+            {
+                imported.push(match lang {
+                    crate::i18n::Language::Russian => "Пиктограммы".into(),
+                    crate::i18n::Language::English => "Pictograms".into(),
+                });
+            }
+        } else {
+            imported.push(tr("entlayout.text_expander"));
+        }
         let mut skipped = Vec::new();
         if bundle.data.layout_element_visibility.is_some() {
             let has_target = self.layout_element_visibility_device_key().is_some();
@@ -1792,6 +2595,17 @@ impl EntropyApp {
                 let size = hid.get_macro_buffer_size()?;
                 let buf = crate::hid::HidDevice::encode_macros(&macro_texts, size);
                 hid.set_macro_buffer(&buf)?;
+                if bundle.version == MACROPAD_ENTLAYOUT_VERSION {
+                    let confirmed =
+                        hid.get_macro_buffer(size, self.keycode_picker.macro_count as u8)?;
+                    if crate::hid::HidDevice::parse_macros(
+                        &confirmed,
+                        self.keycode_picker.macro_count as u8,
+                    ) != macro_texts
+                    {
+                        bail!("Macro bytecode readback mismatch");
+                    }
+                }
                 Ok(())
             })() {
                 failures.push(format!("macros ({err})"));
@@ -2107,10 +2921,11 @@ impl EntropyApp {
         // Macropad renders Default from host profile storage, not self.layout.
         // Update only imported positions in that profile; other applications,
         // encoder stacks and unmapped controls must remain untouched.
-        if let (Some(layout), Some(device_key)) = (
+        if let (Some(layout), Some(device_key), true) = (
             self.layout.as_ref(),
             self.selected_device
                 .and_then(|_| self.application_layout_device_key()),
+            bundle.application_layouts.is_none(),
         ) {
             if let Some(profile) = self
                 .app_settings
@@ -2159,25 +2974,28 @@ impl EntropyApp {
             }
         }
 
-        self.app_settings.text_expander_enabled = bundle.data.text_expander.enabled;
-        self.app_settings.text_expander_app_blacklist =
-            bundle.data.text_expander.app_blacklist.clone();
-        self.app_settings.text_expander_rule_files =
-            normalize_text_expander_rule_files(&bundle.data.text_expander.rule_files);
-        self.app_settings.text_expansion_rules = bundle.data.text_expander.primary_rules.clone();
-        save_app_settings(&self.app_settings);
-        save_text_expansion_rules(&self.app_settings.text_expansion_rules);
-        for file in &bundle.data.text_expander.extra_files {
-            if let Some(file_name) = normalize_text_expander_rules_file_name(&file.file_name) {
-                let path = text_expander_extra_rules_path(&file_name);
-                if let Ok(json) = serde_json::to_string_pretty(&file.rules) {
-                    std::fs::write(path, json)?;
+        if bundle.application_layouts.is_none() {
+            self.app_settings.text_expander_enabled = bundle.data.text_expander.enabled;
+            self.app_settings.text_expander_app_blacklist =
+                bundle.data.text_expander.app_blacklist.clone();
+            self.app_settings.text_expander_rule_files =
+                normalize_text_expander_rule_files(&bundle.data.text_expander.rule_files);
+            self.app_settings.text_expansion_rules =
+                bundle.data.text_expander.primary_rules.clone();
+            save_app_settings(&self.app_settings);
+            save_text_expansion_rules(&self.app_settings.text_expansion_rules);
+            for file in &bundle.data.text_expander.extra_files {
+                if let Some(file_name) = normalize_text_expander_rules_file_name(&file.file_name) {
+                    let path = text_expander_extra_rules_path(&file_name);
+                    if let Ok(json) = serde_json::to_string_pretty(&file.rules) {
+                        std::fs::write(path, json)?;
+                    }
                 }
             }
+            self.text_expander_rules_signature =
+                text_expander_rules_signature(&self.app_settings.text_expander_rule_files);
+            self.sync_text_expander_runtime();
         }
-        self.text_expander_rules_signature =
-            text_expander_rules_signature(&self.app_settings.text_expander_rule_files);
-        self.sync_text_expander_runtime();
 
         if self.current_device_is_likely_rmk() {
             return Ok(());
@@ -2211,11 +3029,13 @@ impl EntropyApp {
         self.keycode_picker
             .macro_descriptions
             .truncate(self.keycode_picker.macro_count);
-        save_macro_metadata(
-            &self.keycode_picker.macro_names,
-            &self.keycode_picker.macro_descriptions,
-            &self.current_device_name,
-        );
+        if bundle.application_layouts.is_none() {
+            save_macro_metadata(
+                &self.keycode_picker.macro_names,
+                &self.keycode_picker.macro_descriptions,
+                &self.current_device_name,
+            );
+        }
         self.keycode_picker.macro_metadata_dirty = false;
         self.keycode_picker.mark_macros_clean();
 
@@ -2333,8 +3153,10 @@ impl EntropyApp {
         migrate_legacy_combo_default_colors(&mut self.combo_colors);
         normalize_combo_colors(&mut self.combo_colors, self.combo_entries.len());
         self.combo_term = bundle.data.combos.term.or(self.combo_term);
-        save_combo_names(&self.combo_names, &self.current_device_name);
-        save_combo_colors(&self.combo_colors, &self.current_device_name);
+        if bundle.application_layouts.is_none() {
+            save_combo_names(&self.combo_names, &self.current_device_name);
+            save_combo_colors(&self.combo_colors, &self.current_device_name);
+        }
         self.combo_synced_entries = self.combo_entries.clone();
         self.combo_dirty = false;
         self.combo_edit_revision = self.combo_edit_revision.wrapping_add(1);
@@ -2347,21 +3169,27 @@ impl EntropyApp {
             &bundle.data.tap_dance.names,
             self.keycode_picker.tap_dance_entries.len(),
         );
-        save_tap_dance_names(
-            &self.keycode_picker.tap_dance_names,
-            &self.current_device_name,
-        );
+        if bundle.application_layouts.is_none() {
+            save_tap_dance_names(
+                &self.keycode_picker.tap_dance_names,
+                &self.current_device_name,
+            );
+        }
         self.keycode_picker.tap_dance_dirty = false;
 
         self.key_override_names = normalized_strings(
             &bundle.data.key_overrides.names,
             self.key_override_entries.len(),
         );
-        save_key_override_names(&self.key_override_names, &self.current_device_name);
+        if bundle.application_layouts.is_none() {
+            save_key_override_names(&self.key_override_names, &self.current_device_name);
+        }
 
         self.alt_repeat_names =
             normalized_strings(&bundle.data.alt_repeat.names, self.alt_repeat_entries.len());
-        save_alt_repeat_names(&self.alt_repeat_names, &self.current_device_name);
+        if bundle.application_layouts.is_none() {
+            save_alt_repeat_names(&self.alt_repeat_names, &self.current_device_name);
+        }
 
         #[cfg(not(target_arch = "wasm32"))]
         if self.deferred_device_load.is_staged() {
@@ -2675,6 +3503,9 @@ fn try_map_entlayout_keycode(
     layout: &KeyboardLayout,
     limits: EntLayoutKeycodeImportLimits,
 ) -> Option<u16> {
+    if bundle.version == MACROPAD_ENTLAYOUT_VERSION {
+        return check_entlayout_keycode(keycode, bundle, layout, limits).ok();
+    }
     let keycode = map_custom_keycode_by_name(keycode, bundle, layout).flatten()?;
     validate_macro_keycode(keycode, limits.macro_count)?;
     validate_tap_dance_keycode(keycode, limits.tap_dance_count)?;
@@ -2816,6 +3647,53 @@ fn remap_entalt_repeat_entry(
     })
 }
 
+fn check_complete_native_action(
+    encoded: &str,
+    bundle: &EntLayoutFile,
+    layout: &KeyboardLayout,
+    limits: EntLayoutKeycodeImportLimits,
+) -> Result<()> {
+    use rmk_types::action::{Action, KeyAction};
+    let check = |action| -> Result<()> {
+        let code = match action {
+            Action::TriggerMacro(slot) => Some(0x7700 + u16::from(slot)),
+            Action::LayerOn(layer)
+            | Action::LayerOff(layer)
+            | Action::LayerToggle(layer)
+            | Action::DefaultLayer(layer)
+            | Action::LayerToggleOnly(layer)
+            | Action::OneShotLayer(layer)
+            | Action::PersistentDefaultLayer(layer)
+            | Action::LayerOnWithModifier(layer, _) => {
+                if usize::from(layer) >= limits.layer_count {
+                    bail!("Unavailable native layer");
+                }
+                None
+            }
+            Action::User(slot) => Some(0x7e00 + u16::from(slot)),
+            _ => None,
+        };
+        if let Some(code) = code {
+            check_entlayout_keycode(code, bundle, layout, limits)
+                .map_err(|_| anyhow::anyhow!("Unavailable native resource: {code:#06x}"))?;
+        }
+        Ok(())
+    };
+    match decode_native_key_action(encoded)? {
+        KeyAction::Single(action) | KeyAction::Tap(action) => check(action)?,
+        KeyAction::TapHold(tap, hold, _) => {
+            check(tap)?;
+            check(hold)?;
+        }
+        KeyAction::Morse(slot) => {
+            check_entlayout_keycode(0x5700 + u16::from(slot), bundle, layout, limits)
+                .map_err(|_| anyhow::anyhow!("Unavailable native Tap Dance"))?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn check_entlayout_keycode(
     keycode: u16,
     bundle: &EntLayoutFile,
@@ -2853,6 +3731,12 @@ fn check_custom_keycode_by_name(
         .iter()
         .find(|custom| custom.index == source_idx)
     else {
+        if bundle.version == MACROPAD_ENTLAYOUT_VERSION
+            && (0x7E00..=0x7EFF).contains(&keycode)
+            && !matches!(keycode, 0x7E05 | 0x7E06)
+        {
+            return Err(EntLayoutSkipReason::UnmappableCustomKeycode);
+        }
         return Ok(keycode);
     };
     let target_idx = layout

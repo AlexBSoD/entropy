@@ -76,16 +76,7 @@ impl EntropyApp {
             // key legend order, layer operations, show/hide keys | import, export, image
             // (native builds only) | layout indicator, about device.
             #[cfg(not(target_arch = "wasm32"))]
-            let application_profile = self
-                .application_layout_settings()
-                .and_then(|settings| settings.editor_layout())
-                .filter(|profile| {
-                    profile.id != crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID
-                })
-                .map(|profile| (profile.id.clone(), profile.name.clone()));
-            #[cfg(not(target_arch = "wasm32"))]
-            let (file_rows, file_dividers) =
-                (3 + if application_profile.is_some() { 2 } else { 0 }, 1);
+            let (file_rows, file_dividers) = (3, 1);
             #[cfg(target_arch = "wasm32")]
             let (file_rows, file_dividers) = (0, 0);
             let row_count =
@@ -120,24 +111,6 @@ impl EntropyApp {
                 device_menu_labels.push(entlayout_import_label(lang).to_owned());
                 device_menu_labels.push(entlayout_export_label(lang).to_owned());
                 device_menu_labels.push(layout_image_export_label(lang).to_owned());
-                if let Some((_, name)) = &application_profile {
-                    device_menu_labels.push(format!(
-                        "{}: {name}",
-                        if lang == crate::i18n::Language::Russian {
-                            "Импорт в приложение"
-                        } else {
-                            "Import into application"
-                        }
-                    ));
-                    device_menu_labels.push(format!(
-                        "{}: {name}",
-                        if lang == crate::i18n::Language::Russian {
-                            "Экспорт приложения"
-                        } else {
-                            "Export application"
-                        }
-                    ));
-                }
             }
             device_menu_labels
                 .push(crate::i18n::tr_catalog(lang, "ui.sticky_layout_window_label").to_owned());
@@ -362,42 +335,6 @@ impl EntropyApp {
                             self.close_top_dropdowns(ctx);
                             self.request_image_export_after_full_load();
                             ctx.request_repaint();
-                        }
-                        if let Some((id, name)) = &application_profile {
-                            for export in [false, true] {
-                                let verb = match (lang, export) {
-                                    (crate::i18n::Language::Russian, false) => {
-                                        "Импорт в приложение"
-                                    }
-                                    (crate::i18n::Language::Russian, true) => "Экспорт приложения",
-                                    (_, false) => "Import into application",
-                                    (_, true) => "Export application",
-                                };
-                                if top_dropdown_icon_item(
-                                    ui,
-                                    dropdown_size.x - 16.0,
-                                    if export {
-                                        TopMenuIcon::ExportLayout
-                                    } else {
-                                        TopMenuIcon::ImportLayout
-                                    },
-                                    &format!("{verb}: {name}"),
-                                    !self.hid_user_action_busy()
-                                        && self.pending_file_dialog.is_none(),
-                                    false,
-                                )
-                                .on_hover_text(if lang == crate::i18n::Language::Russian {
-                                    "Только клавиши, имена слоёв и стеки энкодера выбранного приложения. Импорт заменяет эти данные; привязка приложения и остальные профили сохраняются. Общие ресурсы не переносятся."
-                                } else {
-                                    "Only keys, layer names and encoder stacks of this selected application. Import replaces that content; app matching and other profiles are preserved. Shared resources are not transferred."
-                                })
-                                .clicked()
-                                {
-                                    self.close_top_dropdowns(ctx);
-                                    self.application_layout_file_dialog(id.clone(), export);
-                                    ctx.request_repaint();
-                                }
-                            }
                         }
                     }
 

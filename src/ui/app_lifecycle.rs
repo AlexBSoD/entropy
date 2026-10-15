@@ -234,6 +234,16 @@ impl EntropyApp {
         }
     }
 
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(super) fn tick_layout_import_lifecycle_for_test(&mut self, ctx: &egui::Context, now: f64) {
+        // Exercise the same worker/deferred/import/runtime ordering as a native frame.
+        // Keep periodic discovery not due even while a worker owns hid_device:
+        // pretending the device is Bluetooth alone only suppresses scanning when
+        // hid_device is Some. A real scan can invalidate this synthetic connection.
+        self.last_device_scan_at = now.max(f64::EPSILON);
+        self.update_native_background(ctx, now, false, true);
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn import_pending(&self) -> bool {
         self.pending_entlayout_import_path.is_some()
