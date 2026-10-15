@@ -802,7 +802,19 @@ impl EntropyApp {
         discovered: crate::app_discovery::ApplicationDiscoverySnapshot,
     ) {
         let foreground_changed = self.application_layout_foreground != discovered.foreground;
-        if foreground_changed {
+        // Discovery can enrich a foreground app's display name/aliases after a
+        // catalog scan without changing focus. Such metadata updates must not
+        // finish an in-progress rename. Keep title changes meaningful because
+        // application profiles can match individual window titles.
+        let foreground_context_changed = !same_foreground_application(
+            self.application_layout_foreground.as_ref(),
+            discovered.foreground.as_ref(),
+        ) || self
+            .application_layout_foreground
+            .as_ref()
+            .map(|app| &app.window_title)
+            != discovered.foreground.as_ref().map(|app| &app.window_title);
+        if foreground_context_changed {
             // Commit while editor_layout_id still points at the source profile.
             // The runtime may select another profile later in this update.
             self.commit_pending_application_layout_edits();
@@ -2350,6 +2362,116 @@ mod tests {
             app.application_layout_manual_override,
             Some((device_key, app.application_discovery.foreground.clone()))
         );
+    }
+
+    #[test]
+    fn foreground_catalog_refresh_keeps_layer_rename_open() {
+        use crate::application_layouts::{DetectedApplication, DeviceApplicationLayouts};
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        // No HID transport or host discovery thread: only the OS snapshot boundary
+        // is supplied; real egui clicks/text and the production runtime run below.
+        for nondefault in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = EntropyApp::new_inert_for_test();
+            let key = "rename-catalog-refresh".to_owned();
+            let mut settings = DeviceApplicationLayouts::default();
+            let profile = if nondefault {
+                settings.create_for_application(&DetectedApplication {
+                    executable: "calculator.exe".into(),
+                    ..Default::default()
+                })
+            } else {
+                crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID.to_owned()
+            };
+            settings.active_layout_id = profile.clone();
+            settings.editor_layout_id = profile.clone();
+            app.app_settings
+                .application_layouts
+                .insert(key.clone(), settings);
+            app.app_settings.last_application_layout_device_key = Some(key.clone());
+            app.application_layout_editor_active = true;
+            let foreground = DetectedApplication {
+                executable: "entropy.exe".into(),
+                identities: vec!["entropy.exe".into()],
+                display_name: "entropy.exe".into(),
+                window_title: "Entropy".into(),
+            };
+            app.application_layout_foreground = Some(foreground.clone());
+            // Match the production state after explicitly selecting a profile.
+            app.application_layout_manual_override = Some((key.clone(), Some(foreground.clone())));
+            let frame = |app: &mut EntropyApp, events| {
+                let _ = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1100.0, 800.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| app.draw_layout_layer_switcher_and_hints(ui, 0.0, 0.0, 52.0),
+                );
+            };
+            let pos = egui::pos2(550.0, 50.0);
+            frame(&mut app, vec![egui::Event::PointerMoved(pos)]);
+            for pressed in [true, false] {
+                frame(
+                    &mut app,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            frame(&mut app, vec![]);
+            assert_eq!(app.editing_layer, Some(0), "click must start editing");
+            // A catalog scan enriches metadata without changing focus or profile.
+            let mut refreshed = foreground;
+            refreshed.display_name = "Entropy".into();
+            app.update_application_layout_runtime_with(
+                crate::app_discovery::ApplicationDiscoverySnapshot {
+                    foreground: Some(refreshed.clone()),
+                    foreground_status: crate::app_discovery::ForegroundStatus {
+                        backend: "synthetic Win32 snapshot + catalog".into(),
+                        state: crate::app_discovery::ForegroundState::Focused(refreshed),
+                    },
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                app.application_layout_settings().unwrap().active_layout_id,
+                profile
+            );
+            assert_eq!(
+                app.editing_layer,
+                Some(0),
+                "background metadata refresh closed rename (nondefault={nondefault})"
+            );
+            frame(&mut app, vec![egui::Event::Text("New".into())]);
+            assert!(app.editing_layer_text.contains("New"));
+            let proposed = app.editing_layer_text.clone();
+            frame(
+                &mut app,
+                vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            assert!(app.editing_layer.is_none());
+            let persisted = crate::app::app_storage::load_app_settings();
+            assert_eq!(
+                persisted.application_layouts[&key].layouts[&profile].layer_names[0],
+                proposed
+            );
+        }
     }
 
     #[test]
