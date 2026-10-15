@@ -1747,16 +1747,19 @@ impl EntropyApp {
         }
 
         for (qsid, width) in Self::module_setting_widths(&settings.fields) {
-            let value = if width > 1 {
+            let result = if width > 1 {
                 dev_conn.get_qmk_setting_u16(qsid)
             } else {
-                dev_conn.get_qmk_setting_u8(qsid).map(|value| value as u16)
+                dev_conn.get_qmk_setting_u8(qsid).map(u16::from)
+            };
+            match result {
+                Ok(value) => {
+                    settings.values.insert(qsid, value);
+                }
+                Err(error) => {
+                    log::warn!("get_qmk_setting(module qsid {qsid}): {error}");
+                }
             }
-            .unwrap_or_else(|e| {
-                log::warn!("get_qmk_setting(module qsid {qsid}): {e}");
-                0
-            });
-            settings.values.insert(qsid, value);
         }
         settings
     }

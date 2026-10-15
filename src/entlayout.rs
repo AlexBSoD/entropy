@@ -1,7 +1,8 @@
 use super::portable_settings::{
-    ent_portable_setting_contracts_match, ent_portable_setting_is_known,
-    ent_portable_setting_is_valid, ent_portable_setting_spec, write_entlayout_portable_setting,
-    EntPortableSetting, EntPortableSettingWidth, ENT_PORTABLE_QSIDS,
+    ent_portable_setting_contracts_match, ent_portable_setting_import_value,
+    ent_portable_setting_is_known, ent_portable_setting_is_valid, ent_portable_setting_spec,
+    write_entlayout_portable_setting, EntPortableSetting, EntPortableSettingWidth,
+    ENT_PORTABLE_QSIDS,
 };
 use super::*;
 use anyhow::{bail, Context, Result};
@@ -340,25 +341,33 @@ impl EntPortableSettingsImportReport {
     }
 }
 
-struct EntPortableSettingsImportPlan<'a> {
-    compatible: Vec<&'a EntPortableSetting>,
+struct EntPortableSettingsImportPlan {
+    compatible: Vec<EntPortableSetting>,
     report: EntPortableSettingsImportReport,
 }
 
-fn plan_entlayout_portable_settings_import<'a>(
-    settings: &'a [EntPortableSetting],
+fn plan_entlayout_portable_settings_import(
+    settings: &[EntPortableSetting],
     target_settings: &[EntPortableSetting],
-) -> EntPortableSettingsImportPlan<'a> {
+) -> EntPortableSettingsImportPlan {
     let mut compatible = Vec::new();
     let mut report = EntPortableSettingsImportReport::default();
     let mut seen = std::collections::BTreeSet::new();
 
     for setting in settings {
-        if !ent_portable_setting_is_known(setting.qsid) {
+        if setting.module.is_none() && !ent_portable_setting_is_known(setting.qsid) {
             report.record_incompatible();
             continue;
         }
-        if !seen.insert(setting.qsid) || !ent_portable_setting_is_valid(setting) {
+        if (setting.module.is_some()
+            && settings
+                .iter()
+                .filter(|entry| entry.qsid == setting.qsid)
+                .count()
+                != 1)
+            || !seen.insert(setting.qsid)
+            || !ent_portable_setting_is_valid(setting)
+        {
             report.record_incompatible();
             continue;
         }
@@ -373,6 +382,8 @@ fn plan_entlayout_portable_settings_import<'a>(
             report.record_incompatible();
             continue;
         }
+        let mut setting = setting.clone();
+        setting.value = ent_portable_setting_import_value(&setting, target);
         if setting.value == target.value {
             // Already matching values are successful imports without another
             // flash write or BLE round trip.
@@ -1996,6 +2007,16 @@ impl EntropyApp {
         }
         sidecars.complete = true;
         self.apply_entlayout_local_state(bundle, &mapping)?;
+        if bundle
+            .data
+            .portable_settings
+            .iter()
+            .any(|setting| setting.module.is_some())
+        {
+            // Imported display options cannot override the committed firmware
+            // module word (failed/skipped writes keep the target cache).
+            self.sync_firmware_managed_layout_options();
+        }
         self.refresh_layer_picker_content_flags();
 
         // Persist the imported layer names into firmware now that self.layer_names
@@ -2551,7 +2572,7 @@ impl EntropyApp {
         }
 
         for setting in portable_settings {
-            let result = write_entlayout_portable_setting(hid, setting);
+            let result = write_entlayout_portable_setting(hid, &setting);
             match result {
                 Ok(()) => {
                     portable_settings_report.record_imported();
@@ -4026,8 +4047,160 @@ fn entlayout_hash(layout: &KeyboardLayout) -> String {
 mod macropad_tests;
 
 #[cfg(test)]
+#[path = "entlayout_module_tests.rs"]
+mod module_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entlayout_module_snapshot_exports_loaded_k04_both_sides() {
+        let definition: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/k04-vial-b4709ab9.json")).unwrap();
+        let mut app = EntropyApp::new_inert_for_test();
+        app.layout = Some(KeyboardLayout::from_vial_json(&definition).unwrap());
+        app.supported_qmk_settings = vec![140, 141, 143, 324];
+        app.module_settings =
+            EntropyApp::module_settings_from_definition(&definition, &app.supported_qmk_settings);
+        app.module_settings
+            .values
+            .extend([(140, 1), (141, 1), (143, 3)]);
+        let json = serde_json::to_value(app.entlayout_snapshot().unwrap()).unwrap();
+        let settings = json["data"]["portable_settings"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let qsids = settings
+            .iter()
+            .map(|s| s["qsid"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            qsids,
+            vec![140, 141, 143],
+            "loaded module values must survive .entlayout export; unloaded 324 must not"
+        );
+        let bundle: EntLayoutFile = serde_json::from_value(json).unwrap();
+        assert_eq!(bundle.data.portable_settings.len(), 3);
+    }
+
+    pub(super) fn module_app() -> EntropyApp {
+        let definition: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/k04-vial-b4709ab9.json")).unwrap();
+        let mut app = EntropyApp::new_inert_for_test();
+        app.layout = Some(KeyboardLayout::from_vial_json(&definition).unwrap());
+        app.layer_count = 1;
+        app.layout.as_mut().unwrap().layers =
+            vec![vec![0u16.into(); app.layout.as_ref().unwrap().keys.len()]];
+        app.supported_qmk_settings = vec![140, 141, 143, 324];
+        app.module_settings =
+            EntropyApp::module_settings_from_definition(&definition, &app.supported_qmk_settings);
+        app.module_settings
+            .values
+            .extend([(140, 0), (141, 0), (143, 0), (324, 0)]);
+        app
+    }
+
+    #[test]
+    fn entlayout_module_roundtrip_restores_both_sides_and_auto_layer() {
+        let mut source = module_app();
+        source
+            .module_settings
+            .values
+            .extend([(140, 1), (141, 1), (143, 3), (324, 12)]);
+        let json = serde_json::to_string(&source.entlayout_snapshot().unwrap()).unwrap();
+        let bundle: EntLayoutFile = serde_json::from_str(&json).unwrap();
+        let mut target = module_app();
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        target.hid_device = Some(hid);
+        let (_, _, report) = target.apply_entlayout(&bundle).unwrap();
+        assert_eq!(report.imported, 4);
+        assert_eq!(target.module_settings.values, source.module_settings.values);
+        let sets = recorder
+            .requests()
+            .into_iter()
+            .filter(|r| r[..2] == [0xfe, 0x0b])
+            .map(|r| r[..6].to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sets,
+            vec![
+                vec![0xfe, 0x0b, 140, 0, 1, 0],
+                vec![0xfe, 0x0b, 141, 0, 1, 0],
+                vec![0xfe, 0x0b, 143, 0, 3, 0],
+                vec![0xfe, 0x0b, 68, 1, 12, 0]
+            ]
+        );
+        assert_eq!(
+            target.layout.as_ref().unwrap().layers,
+            source.layout.as_ref().unwrap().layers
+        );
+    }
+
+    #[test]
+    fn entlayout_module_failed_get_is_not_exported() {
+        let definition: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/k04-vial-b4709ab9.json")).unwrap();
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        recorder.respond_by(|request| {
+            (request[..2] == [0xfe, 0x0a]).then(|| Err("scripted GET failure".to_owned()))
+        });
+        let settings = EntropyApp::read_module_settings(&definition, &[140, 141], &hid);
+        assert!(
+            settings.values.is_empty(),
+            "failed GET must remain unloaded, not become a fabricated zero"
+        );
+        let mut app = module_app();
+        app.module_settings = settings;
+        assert!(app.entlayout_portable_settings_snapshot().is_empty());
+    }
+
+    #[test]
+    fn entlayout_module_rejects_duplicate_qsid_before_any_write() {
+        let mut source = module_app();
+        source.module_settings.values.insert(140, 1);
+        let mut bundle = source.entlayout_snapshot().unwrap();
+        bundle.data.portable_settings.retain(|s| s.qsid == 140);
+        bundle
+            .data
+            .portable_settings
+            .push(bundle.data.portable_settings[0].clone());
+        let target = module_app();
+        let plan = plan_entlayout_portable_settings_import(
+            &bundle.data.portable_settings,
+            &target.entlayout_portable_settings_snapshot(),
+        );
+        assert!(
+            plan.compatible.is_empty(),
+            "ambiguous duplicate QSID must never write even the first entry"
+        );
+        assert_eq!(plan.report.incompatible, 2);
+    }
+
+    #[test]
+    fn entlayout_module_rejects_malformed_serialized_contract() {
+        let source = module_app();
+        let setting = source
+            .entlayout_portable_settings_snapshot()
+            .into_iter()
+            .find(|s| s.qsid == 140)
+            .unwrap();
+        for (key, value) in [
+            ("width", serde_json::json!(3)),
+            ("bit", serde_json::json!(16)),
+            ("max", serde_json::json!(300)),
+            ("kind", serde_json::json!("unknown")),
+        ] {
+            let mut json = serde_json::to_value(&setting).unwrap();
+            json["module"][0][key] = value;
+            let malformed: EntPortableSetting = serde_json::from_value(json).unwrap();
+            let malformed_settings = [malformed];
+            let plan =
+                plan_entlayout_portable_settings_import(&malformed_settings, &[setting.clone()]);
+            assert!(plan.compatible.is_empty());
+            assert_eq!(plan.report.incompatible, 1);
+        }
+    }
 
     fn portable_setting(
         id: &str,
@@ -4041,6 +4214,7 @@ mod tests {
             width,
             value,
             variants: Vec::new(),
+            module: None,
         }
     }
 
@@ -4423,6 +4597,7 @@ mod tests {
             width: EntPortableSettingWidth::U8,
             value: 1,
             variants: vec!["Layer 1".to_owned(), "Layer 2".to_owned()],
+            module: None,
         };
         let mut compatible_target = source.clone();
         compatible_target.value = 0;
