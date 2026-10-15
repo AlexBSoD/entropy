@@ -98,6 +98,237 @@ fn macropad_cold_json_export_discovers_and_reads_pictograms() {
 }
 
 #[test]
+fn macropad_ordinary_import_retries_unconfirmed_capability_after_transport_recovers() {
+    let storage = crate::app::app_storage::ScopedTempConfig::new();
+    let (mut app, recorder, _) = fixture();
+    let bundle = app.entlayout_snapshot().unwrap();
+    let input = storage.path().join("retry.entlayout");
+    write_entlayout_file(&input, &bundle, app.app_settings.language).unwrap();
+    let original_input = std::fs::read(&input).unwrap();
+    let before = serde_json::to_value(&app.app_settings).unwrap();
+    save_app_settings(&app.app_settings);
+    let saved = std::fs::read(app_settings_path()).unwrap();
+    let info = app.device_about_info.as_mut().unwrap();
+    info.supports_application_layouts = false;
+    info.application_layout_probe_failed = true;
+    let recovered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let transport = recovered.clone();
+    let mut keys = std::collections::BTreeMap::new();
+    recorder.respond_by(move |request| {
+        let mut response = [0; 32];
+        match request[0] {
+            0xe6 => {
+                assert_eq!(
+                    &request[..5],
+                    &[
+                        0xe6,
+                        crate::application_layouts::APPLICATION_LAYOUT_PROTOCOL_VERSION,
+                        0xa5,
+                        0,
+                        0
+                    ]
+                );
+                assert!(request[5..].iter().all(|byte| *byte == 0));
+                if !transport.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Some(Err("injected capability read failure".into()));
+                }
+                response[..3].copy_from_slice(&[
+                    0xe6,
+                    crate::application_layouts::APPLICATION_LAYOUT_PROTOCOL_VERSION,
+                    0x5a,
+                ]);
+            }
+            0x05 => {
+                keys.insert(
+                    (request[1], request[2], request[3]),
+                    [request[4], request[5]],
+                );
+            }
+            0x04 => {
+                if let Some(code) = keys.get(&(request[1], request[2], request[3])) {
+                    response[4..6].copy_from_slice(code);
+                }
+            }
+            _ => return None,
+        }
+        Some(Ok(response))
+    });
+    assert!(app.import_entlayout_from_path(&input).is_err());
+    assert!(
+        recorder.requests().iter().any(|r| r[0] == 0xe6),
+        "ordinary import must reach read-only retry"
+    );
+    assert!(recorder.requests().iter().all(|r| r[0] == 0xe6));
+    assert!(
+        app.device_about_info
+            .as_ref()
+            .unwrap()
+            .application_layout_probe_failed
+    );
+    assert!(app.application_layout_device_key().is_none());
+    assert!(!storage.path().join("entropy/backups").exists());
+    assert_eq!(serde_json::to_value(&app.app_settings).unwrap(), before);
+    assert_eq!(std::fs::read(app_settings_path()).unwrap(), saved);
+    assert_eq!(std::fs::read(&input).unwrap(), original_input);
+    recovered.store(true, std::sync::atomic::Ordering::SeqCst);
+    let report = app.import_entlayout_from_path(&input).unwrap();
+    assert!(report.contains("Layout import complete"));
+    assert!(
+        !app.device_about_info
+            .as_ref()
+            .unwrap()
+            .application_layout_probe_failed
+    );
+    assert!(app.application_layout_device_key().is_some());
+    assert_eq!(
+        app.application_layout_settings().unwrap().layouts,
+        bundle.application_layouts.unwrap()
+    );
+    assert!(recorder.requests().iter().any(|r| r[0] == 0x05));
+}
+
+#[test]
+fn macropad_ordinary_import_malformed_sources_never_probe_or_read_macro_capacity() {
+    for (malformed, unconfirmed) in ["geometry", "profile", "resource", "keymap", "macro"]
+        .into_iter()
+        .flat_map(|malformed| [false, true].map(|unconfirmed| (malformed, unconfirmed)))
+    {
+        let storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (mut app, recorder, application) = fixture();
+        app.keycode_picker.macro_count = 1;
+        app.keycode_picker.macro_texts = vec!["x".into()];
+        let mut bundle = app.entlayout_snapshot().unwrap();
+        bundle.data.macros.bytecode_base64 = vec![BASE64_STANDARD.encode(b"x")];
+        match malformed {
+            "geometry" => bundle.data.source_layout.as_mut().unwrap().keys[0].w = 0.0,
+            "profile" => {
+                bundle
+                    .application_layouts
+                    .as_mut()
+                    .unwrap()
+                    .get_mut(&application)
+                    .unwrap()
+                    .layers
+                    .pop();
+            }
+            "resource" => {
+                bundle
+                    .application_layouts
+                    .as_mut()
+                    .unwrap()
+                    .get_mut(&application)
+                    .unwrap()
+                    .layers[0][0] = 0x77ff
+            }
+            "keymap" => {
+                bundle.data.keymap[0].pop();
+            }
+            "macro" => bundle.data.macros.bytecode_base64 = vec!["invalid base64!".into()],
+            _ => unreachable!(),
+        }
+        let input = storage.path().join("malformed.entlayout");
+        write_entlayout_file(&input, &bundle, app.app_settings.language).unwrap();
+        let original = std::fs::read(&input).unwrap();
+        let before = serde_json::to_value(&app.app_settings).unwrap();
+        let info = app.device_about_info.as_mut().unwrap();
+        info.supports_application_layouts = !unconfirmed;
+        info.application_layout_probe_failed = unconfirmed;
+        assert!(
+            app.import_entlayout_from_path(&input).is_err(),
+            "{malformed}"
+        );
+        assert!(
+            recorder.requests().is_empty(),
+            "{malformed}: {:?}",
+            recorder.requests()
+        );
+        assert!(!storage.path().join("entropy/backups").exists());
+        assert!(!app_settings_path().exists());
+        assert_eq!(serde_json::to_value(&app.app_settings).unwrap(), before);
+        assert_eq!(std::fs::read(input).unwrap(), original);
+    }
+}
+
+#[test]
+fn macropad_ordinary_import_does_not_retry_explicit_unsupported_or_wrong_identity() {
+    for mismatch in ["unsupported", "vendor", "product", "path", "non-macropad"] {
+        let storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (mut app, recorder, _) = fixture();
+        let bundle = app.entlayout_snapshot().unwrap();
+        let input = storage.path().join("refused.entlayout");
+        write_entlayout_file(&input, &bundle, app.app_settings.language).unwrap();
+        let info = app.device_about_info.as_mut().unwrap();
+        info.supports_application_layouts = false;
+        info.application_layout_probe_failed = mismatch != "unsupported";
+        match mismatch {
+            "vendor" => info.vendor_id ^= 1,
+            "product" => info.product_id ^= 1,
+            "path" => info.path.push_str("-other"),
+            "non-macropad" => {
+                let mut device = app.device_manager.devices()[0].clone();
+                device.product_id = 0x0071;
+                device.name = "K:04".into();
+                app.device_manager.replace_devices(vec![device]);
+            }
+            _ => {}
+        }
+        assert!(app.import_entlayout_from_path(&input).is_err());
+        assert!(recorder.requests().is_empty(), "{mismatch}");
+        assert!(app.application_layout_device_key().is_none());
+        assert!(!storage.path().join("entropy/backups").exists());
+        assert!(!app_settings_path().exists());
+    }
+}
+
+#[test]
+fn macropad_ordinary_import_retry_rejection_never_grants_capability() {
+    for version in [
+        crate::application_layouts::APPLICATION_LAYOUT_PROTOCOL_VERSION,
+        255,
+    ] {
+        let storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (mut app, recorder, _) = fixture();
+        let bundle = app.entlayout_snapshot().unwrap();
+        let input = storage.path().join("rejected-probe.entlayout");
+        write_entlayout_file(&input, &bundle, app.app_settings.language).unwrap();
+        let before = serde_json::to_value(&app.app_settings).unwrap();
+        let info = app.device_about_info.as_mut().unwrap();
+        info.supports_application_layouts = false;
+        info.application_layout_probe_failed = true;
+        recorder.respond_by(move |request| {
+            (request[0] == 0xe6).then(|| {
+                let mut response = [0; 32];
+                response[..3].copy_from_slice(&[
+                    0xe6,
+                    version,
+                    if version == 255 { 0x5a } else { 0xa5 },
+                ]);
+                Ok(response)
+            })
+        });
+        assert!(app.import_entlayout_from_path(&input).is_err());
+        assert_eq!(recorder.requests().len(), 1);
+        assert_eq!(recorder.requests()[0][0], 0xe6);
+        assert!(
+            !app.device_about_info
+                .as_ref()
+                .unwrap()
+                .application_layout_probe_failed
+        );
+        assert!(app.application_layout_device_key().is_none());
+        assert_eq!(serde_json::to_value(&app.app_settings).unwrap(), before);
+        assert!(!storage.path().join("entropy/backups").exists());
+        assert!(!app_settings_path().exists());
+        assert!(app.import_entlayout_from_path(&input).is_err());
+        assert_eq!(
+            recorder.requests().len(),
+            1,
+            "explicit unsupported must not retry"
+        );
+    }
+}
+
+#[test]
 fn macropad_cold_import_discovers_pictograms_before_validation_and_backup() {
     let storage = crate::app::app_storage::ScopedTempConfig::new();
     let (mut app, recorder, _) = fixture();
@@ -759,6 +990,182 @@ fn macropad_unified_import_restores_pictograms_with_real_hid_transfer_and_readba
     app.import_entlayout_from_path(&path).unwrap();
     assert_eq!(app.display_settings.pictograms.library, expected);
     assert!(recorder.requests().iter().any(|request| request[0] == 0xc9));
+}
+
+// Stateful wire boundary: only COMMIT changes firmware; reads are generated
+// from committed bytes, never from the import's staged host library.
+fn assert_pictogram_import_cache_recovery(failure: Option<&'static str>) {
+    let storage = crate::app::app_storage::ScopedTempConfig::new();
+    let (mut app, recorder, _) = fixture();
+    app.display_settings.pictograms.supported = Some(true);
+    app.display_settings.pictograms.loaded = true;
+    let mut bundle = app.entlayout_snapshot().unwrap();
+    bundle.pictograms = Some(
+        (0..2)
+            .map(|slot| EntLayoutPictogram {
+                tap_dance: false,
+                slot,
+                bitmap: vec![0x55 + slot as u8; PICTOGRAM_BYTES],
+                color: [1, 2, 3],
+            })
+            .collect(),
+    );
+    let input = storage.path().join("two-icons.entlayout");
+    write_entlayout_file(&input, &bundle, app.app_settings.language).unwrap();
+    save_app_settings(&app.app_settings);
+    let settings = std::fs::read(app_settings_path()).unwrap();
+    let before = serde_json::to_value(&app.app_settings).unwrap();
+    if failure == Some("late") {
+        app.supported_qmk_settings = vec![200];
+    }
+    let committed = std::sync::Arc::new(std::sync::Mutex::new(PictogramLibrary::blank()));
+    let firmware = committed.clone();
+    let mut commits = 0;
+    let mut failed = false;
+    let mut slot = 0;
+    let mut record = Vec::new();
+    let mut reads = std::collections::VecDeque::new();
+    let mut keys = std::collections::BTreeMap::new();
+    recorder.respond_by(move |request| {
+        let mut reply = [0; 32];
+        reply[0] = request[0];
+        match request[0] {
+            0xc0 => {
+                if !failed
+                    && ((failure == Some("second-query") && commits == 1)
+                        || (failure == Some("readback") && commits == 2))
+                {
+                    failed = true;
+                    return Some(Err("injected post-commit query failure".into()));
+                }
+                let readback = if !failed && failure == Some("mismatch") && commits == 2 {
+                    failed = true;
+                    PictogramLibrary::blank()
+                } else {
+                    firmware.lock().unwrap().clone()
+                };
+                reads = crate::app::pictograms::test_pictogram_read_responses(&readback).into();
+                reply = reads.pop_front().unwrap();
+                reply[17] = crate::app::pictograms::test_pictogram_upload_responses(true, 0)[0][17];
+            }
+            0xca | 0xcb => reply = reads.pop_front().expect("unexpected read"),
+            0xc7 => {
+                assert_eq!(request[1], 0);
+                slot = u16::from_le_bytes([request[2], request[3]]) as usize;
+                record.clear();
+            }
+            0xc8 => {
+                assert_eq!(
+                    u16::from_le_bytes([request[1], request[2]]) as usize * 29,
+                    record.len()
+                );
+                record.extend_from_slice(&request[3..]);
+            }
+            0xc9 => {
+                firmware.lock().unwrap().set_colored(
+                    PictogramKind::Macro,
+                    slot,
+                    &record[4..4 + PICTOGRAM_BYTES],
+                    record[..3].try_into().unwrap(),
+                );
+                commits += 1;
+            }
+            0xfe if failure == Some("late") && request[1] == 0x0a => {
+                return Some(Err("injected late layer-name failure".into()));
+            }
+            0x05 => {
+                keys.insert(
+                    (request[1], request[2], request[3]),
+                    [request[4], request[5]],
+                );
+            }
+            0x04 => {
+                if let Some(code) = keys.get(&(request[1], request[2], request[3])) {
+                    reply[4..6].copy_from_slice(code);
+                }
+            }
+            _ => return None,
+        }
+        Some(Ok(reply))
+    });
+    let result = app.import_entlayout_from_path(&input);
+    assert_eq!(result.is_err(), failure.is_some(), "{result:?}");
+    let actual = committed.lock().unwrap().clone();
+    assert!(
+        actual.bitmap(PictogramKind::Macro, 0).is_some(),
+        "first COMMIT must reach firmware"
+    );
+    if failure.is_some() {
+        assert_eq!(serde_json::to_value(&app.app_settings).unwrap(), before);
+        assert_eq!(std::fs::read(app_settings_path()).unwrap(), settings);
+        assert!(
+            !app.display_settings.pictograms.loaded,
+            "uncertain import must invalidate confirmed cache"
+        );
+        assert_eq!(
+            app.display_settings.pictograms.library,
+            PictogramLibrary::blank(),
+            "never publish unverified staged bytes"
+        );
+    } else {
+        assert!(app.display_settings.pictograms.loaded);
+        assert_eq!(app.display_settings.pictograms.library, actual);
+    }
+    let prior_requests = recorder.requests().len();
+    let output = storage.path().join("after-import.entlayout");
+    app.write_entlayout_export(&output);
+    let exported: EntLayoutFile = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    let icons = exported.pictograms.unwrap();
+    assert_eq!(
+        icons.len(),
+        if failure == Some("second-query") {
+            1
+        } else {
+            2
+        }
+    );
+    for icon in icons {
+        assert_eq!(
+            actual.bitmap(PictogramKind::Macro, icon.slot),
+            Some(icon.bitmap.as_slice())
+        );
+        assert_eq!(
+            actual.color(PictogramKind::Macro, icon.slot),
+            Some(icon.color)
+        );
+    }
+    assert_eq!(
+        recorder.requests()[prior_requests..]
+            .iter()
+            .any(|r| r[0] == 0xc0),
+        failure.is_some(),
+        "ordinary export must refresh uncertain firmware and reuse confirmed success"
+    );
+}
+
+#[test]
+fn macropad_partial_pictogram_import_refreshes_export_after_second_query_failure() {
+    assert_pictogram_import_cache_recovery(Some("second-query"));
+}
+
+#[test]
+fn macropad_pictogram_import_refreshes_export_after_readback_failure() {
+    assert_pictogram_import_cache_recovery(Some("readback"));
+}
+
+#[test]
+fn macropad_pictogram_import_refreshes_export_after_readback_mismatch() {
+    assert_pictogram_import_cache_recovery(Some("mismatch"));
+}
+
+#[test]
+fn macropad_pictogram_import_refreshes_export_after_late_firmware_failure() {
+    assert_pictogram_import_cache_recovery(Some("late"));
+}
+
+#[test]
+fn macropad_pictogram_import_success_retains_confirmed_cache() {
+    assert_pictogram_import_cache_recovery(None);
 }
 
 #[test]

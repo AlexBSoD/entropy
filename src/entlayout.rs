@@ -1452,8 +1452,10 @@ impl EntropyApp {
             }) {
                 bail!("Invalid complete Macropad source geometry");
             }
-            self.application_layout_device_key()
-                .context("Complete layout requires a Macropad target")?;
+            if require_confirmed {
+                self.application_layout_device_key()
+                    .context("Complete layout requires a Macropad target")?;
+            }
             if !profiles.contains_key(crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID) {
                 bail!("Complete Macropad layout is missing Default");
             }
@@ -1461,23 +1463,7 @@ impl EntropyApp {
             if macro_bytes.len() > self.keycode_picker.macro_count {
                 bail!("Target has insufficient macro slots");
             }
-            if !macro_bytes.is_empty() {
-                let size = self
-                    .hid_device
-                    .as_ref()
-                    .context("No active keyboard connection")?
-                    .get_macro_buffer_size()? as usize;
-                // Empty target slots also require their NUL separator.
-                let required = macro_bytes
-                    .iter()
-                    .map(Vec::len)
-                    .sum::<usize>()
-                    .checked_add(self.keycode_picker.macro_count)
-                    .context("Macro buffer size overflow")?;
-                if required > size {
-                    bail!("Target has insufficient macro bytecode capacity");
-                }
-            }
+
             let target_limits = self.entlayout_keycode_import_limits();
             let shared_limits = EntLayoutKeycodeImportLimits {
                 layer_count: target_limits.layer_count.min(bundle.keyboard.layers),
@@ -1717,6 +1703,30 @@ impl EntropyApp {
                 )
             );
         }
+        // The first pass is pure: reject all malformed source structures and
+        // references before capability preparation or any other HID request.
+        // Query target capacity only in the strict pass, after the read-only
+        // capability retry has had a chance to confirm the matching Macropad.
+        if require_confirmed && bundle.application_layouts.is_some() {
+            let macro_bytes = entmacro_bytecode(&bundle.data.macros)?;
+            if !macro_bytes.is_empty() {
+                let size = self
+                    .hid_device
+                    .as_ref()
+                    .context("No active keyboard connection")?
+                    .get_macro_buffer_size()? as usize;
+                // Empty target slots also require their NUL separator.
+                let required = macro_bytes
+                    .iter()
+                    .map(Vec::len)
+                    .sum::<usize>()
+                    .checked_add(self.keycode_picker.macro_count)
+                    .context("Macro buffer size overflow")?;
+                if required > size {
+                    bail!("Target has insufficient macro bytecode capacity");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1924,6 +1934,10 @@ impl EntropyApp {
                 {
                     continue;
                 }
+                // A failed/partial upload can already have changed firmware.
+                // Keep the old bytes for display, but never claim they are still
+                // confirmed; only publish readback after all import gates pass.
+                self.display_settings.pictograms.loaded = false;
                 library.set_colored(kind, icon.slot, &icon.bitmap, icon.color);
                 library = hid.upload_pictogram_slot(library, kind, icon.slot, &progress)?;
             }
