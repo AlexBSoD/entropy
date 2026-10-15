@@ -1414,6 +1414,8 @@ fn macropad_unified_import_cold_load_failure_can_retry_from_nondefault_menu() {
 
 fn exercise_unified_menu_lifecycle(export: bool, nondefault: bool, failing_read: u8) {
     let cold_failure = failing_read != 0;
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
     let (mut app, recorder, application) = fixture();
     let selection = if nondefault {
         application.clone()
@@ -1497,6 +1499,10 @@ fn exercise_unified_menu_lifecycle(export: bool, nondefault: bool, failing_read:
         macros[..3].copy_from_slice(b"old");
         recorder.respond_by(move |request| match request[0] {
             opcode if opcode == failing_read && fail_once => {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("release cold read");
                 fail_once = false;
                 Some(Err("injected cold layout read failure".into()))
             }
@@ -1596,6 +1602,27 @@ fn exercise_unified_menu_lifecycle(export: bool, nondefault: bool, failing_read:
         );
     }
     if cold_failure {
+        // Keep the real HID worker in flight across a native background tick.
+        // Fast local replies used to hide accidental discovery of the fake device.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            app.tick_layout_import_lifecycle_for_test(&ctx, 0.1);
+            if entered_rx.try_recv().is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cold read did not start: {}",
+                app.status_msg
+            );
+            std::thread::yield_now();
+        }
+        assert!(app.hid_device.is_none());
+        let generation = app.connection_generation;
+        app.tick_layout_import_lifecycle_for_test(&ctx, 0.1);
+        release_tx.send(()).unwrap();
+        assert!(matches!(app.device_scan_state, DeviceScanState::Idle), "synthetic lifecycle must not start real HID discovery while the worker owns the device");
+        assert_eq!(app.connection_generation, generation);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while std::time::Instant::now() < deadline && app.deferred_full_layout_action_pending() {
             app.tick_layout_import_lifecycle_for_test(&ctx, 0.1);
@@ -1639,7 +1666,9 @@ fn exercise_unified_menu_lifecycle(export: bool, nondefault: bool, failing_read:
     };
     assert_eq!(
         app.pending_file_dialog.as_ref().map(|pending| &pending.0),
-        Some(&expected)
+        Some(&expected),
+        "read={failing_read:#x}, nondefault={nondefault}, action={:?}, busy={}, gaps={:?}, status={}",
+        app.deferred_full_layout_action, app.hid_write_lifecycle_busy(), app.entlayout_export_gaps(), app.status_msg
     );
     // Keep NONDEFAULT selected across completion and production lifecycle dispatch.
     app.application_layout_settings_mut()
