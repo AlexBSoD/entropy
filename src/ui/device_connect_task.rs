@@ -752,7 +752,6 @@ impl EntropyApp {
         }
         #[cfg(test)]
         let test_hid = self.test_connect_hid.take();
-        let headless = self.headless;
 
         std::thread::spawn(move || {
             let progress = |message: &str| -> Result<(), String> {
@@ -833,14 +832,19 @@ impl EntropyApp {
                     }
                 };
 
+                let application_layout_probe = if dev.is_ergohaven_display_macropad() {
+                    dev_conn.probe_application_layout_protocol()
+                } else {
+                    Ok(false)
+                };
+                let application_layout_probe_failed = application_layout_probe.is_err();
                 let supports_application_layouts =
-                    if !headless && dev.is_ergohaven_display_macropad() {
-                        let supported = dev_conn.supports_application_layout_protocol();
-                        log::info!("Application layout protocol supported: {supported}");
-                        supported
-                    } else {
+                    application_layout_probe.unwrap_or_else(|error| {
+                        log::warn!(
+                            "Application layout protocol capability is unconfirmed: {error:#}"
+                        );
                         false
-                    };
+                    });
 
                 progress("Reading Vial layout definition…")?;
                 log::info!("Getting layout JSON…");
@@ -1496,6 +1500,7 @@ impl EntropyApp {
                     path: dev.path.clone(),
                     firmware_version,
                     supports_application_layouts,
+                    application_layout_probe_failed,
                     firmware_update_target,
                     supports_battery_halves,
                     battery_halves,

@@ -1206,7 +1206,9 @@ impl EntropyApp {
                     );
                 }
                 self.device_about_info = Some(r.about_info.clone());
-                self.remember_connected_application_layout_device();
+                if !self.headless {
+                    self.remember_connected_application_layout_device();
+                }
                 if staged_bluetooth_load {
                     self.schedule_initial_battery_refresh();
                 } else {

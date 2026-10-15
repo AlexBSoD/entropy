@@ -234,6 +234,13 @@ impl EntropyApp {
         }
     }
 
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(super) fn tick_layout_import_lifecycle_for_test(&mut self, ctx: &egui::Context, now: f64) {
+        // Exercise the same worker/deferred/import/runtime ordering as a native frame.
+        // Suppress periodic discovery only; the synthetic device must never be opened.
+        self.update_native_background(ctx, now, false, true);
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn import_pending(&self) -> bool {
         self.pending_entlayout_import_path.is_some()

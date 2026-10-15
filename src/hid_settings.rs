@@ -147,6 +147,11 @@ impl HidDevice {
     }
 
     pub fn supports_application_layout_protocol(&self) -> bool {
+        self.probe_application_layout_protocol().unwrap_or(false)
+    }
+
+    /// A missing transport reply is unknown, not an old firmware rejection.
+    pub fn probe_application_layout_protocol(&self) -> Result<bool> {
         // The zero acknowledgement cannot consume a real event: firmware event
         // sequence numbers begin at one. This does not change the active layout.
         let request = [
@@ -157,7 +162,7 @@ impl HidDevice {
             0,
         ];
         self.usb_send(&request)
-            .is_ok_and(|response| application_layout_poll_supported(&response))
+            .map(|response| application_layout_poll_supported(&response))
     }
 
     pub fn get_firmware_version(&self) -> Result<Option<String>> {

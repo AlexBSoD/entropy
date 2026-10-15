@@ -2739,6 +2739,63 @@ mod tests {
     }
 
     #[test]
+    fn read_only_pictogram_and_capability_preparation_keeps_writes_denied() {
+        let session = ReadOnlyHidSession::default();
+        let (hid, recorder) = HidDevice::test_read_only_device(session.clone());
+        for read in [
+            vec![0xc0],
+            vec![0xc1, 0, 0],
+            vec![0xca, 0, 0],
+            vec![0xcb, 0, 0, 0, 0],
+            vec![
+                0xe6,
+                crate::application_layouts::APPLICATION_LAYOUT_PROTOCOL_VERSION,
+                0xa5,
+                0,
+                0,
+            ],
+        ] {
+            assert!(hid.usb_send(&read).is_ok(), "{read:02x?}");
+        }
+        let before = recorder.requests().len();
+        for write in [
+            vec![0xc2],
+            vec![0xc3],
+            vec![0xc4],
+            vec![0xc6],
+            vec![0xc7],
+            vec![0xc8],
+            vec![0xc9],
+            vec![
+                0xe6,
+                crate::application_layouts::APPLICATION_LAYOUT_PROTOCOL_VERSION,
+                0xa5,
+                1,
+                0,
+            ],
+            vec![
+                0xe6,
+                crate::application_layouts::APPLICATION_LAYOUT_PROTOCOL_VERSION,
+                0xa5,
+                0,
+                1,
+            ],
+            vec![
+                0xe6,
+                crate::application_layouts::APPLICATION_LAYOUT_PROTOCOL_VERSION,
+                0xa5,
+                0,
+                0,
+                1,
+            ],
+            vec![0xe5, 0],
+        ] {
+            assert!(hid.usb_send(&write).is_err(), "{write:02x?}");
+        }
+        assert_eq!(recorder.requests().len(), before);
+    }
+
+    #[test]
     fn read_only_session_passes_reads_and_keeps_the_failed_ones() {
         let session = ReadOnlyHidSession::default();
         let (hid, recorder) = HidDevice::test_read_only_device(session.clone());

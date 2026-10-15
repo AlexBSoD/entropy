@@ -548,6 +548,8 @@ pub(crate) struct DeviceAboutInfo {
     pub(crate) path: String,
     pub(crate) firmware_version: Option<String>,
     pub(crate) supports_application_layouts: bool,
+    // Connection-local only; never a persisted editor/runtime authority grant.
+    pub(crate) application_layout_probe_failed: bool,
     pub(crate) firmware_update_target: Option<FirmwareReleaseTarget>,
     pub(crate) supports_battery_halves: bool,
     pub(crate) battery_halves: Option<crate::hid::BatteryHalves>,
