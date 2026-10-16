@@ -48,7 +48,7 @@ hdiutil attach -readonly -nobrowse -mountpoint "$MOUNT" "${DMGS[0]}" >/dev/null
 shopt -s nullglob
 VISIBLE=("$MOUNT"/*)
 [[ "${#VISIBLE[@]}" == 2 ]] || exit 1
-lipo -verify_arch "$ARCH" "$MOUNT/Entropy.app/Contents/MacOS/entropy"
+lipo "$MOUNT/Entropy.app/Contents/MacOS/entropy" -verify_arch "$ARCH"
 for component in "$MOUNT/Entropy.app/Contents/MacOS/entropy" "$MOUNT/Entropy.app"; do
     macos_verify_stable_signature "$component" "$MACOS_RELEASE_CERTIFICATE_SHA1" com.ergohaven.entropy
 done

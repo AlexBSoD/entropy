@@ -29,7 +29,14 @@ class Packaging(unittest.TestCase):
         binary.write_text('prebuilt binary')
         binary.chmod(0o755)
         self.tool('cargo', 'exit 99')
-        self.tool('lipo', 'printf "arm64\\n"')
+        self.tool('lipo', '''if [[ "$#" == 2 && "$1" == -archs && -x "$2" ]]; then
+ printf 'arm64\\n'
+elif [[ "$#" == 3 && -x "$1" && "$2" == -verify_arch && "$3" == arm64 ]]; then
+ exit 0
+else
+ echo 'lipo: expected input file before -verify_arch and a matching architecture' >&2
+ exit 1
+fi''')
         self.tool('plutil', 'exit 0')
         self.tool('ditto', 'if [[ "$1" == -c ]]; then touch "${@: -1}"; else cp -R "$1" "$2"; fi')
         self.tool('codesign', '''printf '%s\\n' "$*" >> "$PWD/codesign.log"
@@ -100,7 +107,7 @@ fi''')
                        capture_output=True)
         good_codesign = (self.tools / 'codesign').read_text()
         good_hdiutil = (self.tools / 'hdiutil').read_text()
-        for failure in ['cleanup', 'signature', 'detach', 'credentials', 'sha', 'target']:
+        for failure in ['cleanup', 'signature', 'detach', 'credentials', 'sha', 'target', 'architecture']:
             with self.subTest(failure=failure):
                 (self.tools / 'codesign').write_text(good_codesign)
                 (self.tools / 'hdiutil').write_text(good_hdiutil)
@@ -119,6 +126,8 @@ fi''')
                     env['GITHUB_SHA'] = 'not-a-sha'
                 elif failure == 'target':
                     env['TARGET'] = 'unknown'
+                elif failure == 'architecture':
+                    env['TARGET'] = 'x86_64-apple-darwin'
                 result = subprocess.run(['bash', str(collector)], cwd=self.root,
                                         env=env, capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0)
