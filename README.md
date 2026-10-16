@@ -331,35 +331,3 @@ cargo build --release --target x86_64-pc-windows-gnu
 ## License
 
 Entropy is licensed under GPL-3.0-or-later. See [LICENSE](LICENSE).
-
-## macOS release signing (maintainers)
-
-Before using the release workflow, add these repository secrets in
-`ergohaven/entropy` (never in a PR or source file):
-
-- `MACOS_CERTIFICATE_P12_BASE64`: base64 of the **existing** encrypted project
-  certificate **and private key** export (PKCS#12).
-- `MACOS_CERTIFICATE_PASSWORD`: its export password.
-
-Do not generate a replacement certificate. The approved certificate SHA-1 is
-`50B8A2614631D0EE1705213D19D07A52C921D665`, pinned in
-`scripts/macos_stable_signing.sh`. Both macOS architectures use
-`com.ergohaven.entropy` and an explicit certificate-root plus identifier
-designated requirement, never a binary-hash or identifier-only requirement.
-
-Only trusted upstream `v0.*` tag runs can load credentials. Restrict release-tag
-creation/updates and changes to release code to trusted maintainers. Cargo and
-the certificate importer are compiled before credentials are provided. The P12
-is imported directly from memory into a temporary keychain; no P12/password
-file is written. The keychain search list is restored and the temporary keychain
-deleted on success or failure, with no default-keychain or certificate-trust
-changes. Missing credentials, a wrong certificate, or signature verification
-failure stops packaging: there is no ad-hoc release fallback. PR builds remain
-ad-hoc and do not use signing secrets.
-
-Keep an encrypted offline backup of the existing identity. Losing/rotating it
-requires new permission grants; a compromised private key can impersonate the
-app's permission identity. Self-signing is not a substitute for Developer ID or
-notarization. Before shipping, validate permission persistence with distinct
-signed binaries on Apple Silicon and Intel; the completed ARM64 manual A/B
-experiment does not establish Intel or every macOS version's behavior.
