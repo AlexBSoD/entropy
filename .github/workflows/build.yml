@@ -72,9 +72,25 @@ jobs:
         if: matrix.kind != 'macos'
         run: cargo build --release
 
+      - name: Test macOS packaging and signing policy (no credentials)
+        if: matrix.kind == 'macos'
+        run: |
+          python3 scripts/test_macos_packaging.py -v
+          bash scripts/test_macos_stable_signing.sh
+          swiftc scripts/import_macos_certificate.swift -o "$RUNNER_TEMP/entropy-certificate-import"
+          # Missing credentials must fail without creating or changing any keychain.
+          if "$RUNNER_TEMP/entropy-certificate-import" /nonexistent; then exit 1; fi
+
       - name: Build macOS app bundle
         if: matrix.kind == 'macos'
         run: TARGET="${{ matrix.target }}" scripts/build_macos_app.sh
+
+      - name: Verify mounted macOS DMG
+        if: matrix.kind == 'macos'
+        shell: bash
+        run: |
+          dmgs=(dist/macos/*.dmg)
+          ENTROPY_TEST_DMG="${dmgs[0]}" python3 scripts/test_macos_packaging.py NativeDMG -v
 
       - name: Test
         if: matrix.kind == 'linux'

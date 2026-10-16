@@ -15,7 +15,7 @@ jobs:
     name: Build (${{ matrix.os }})
     # Stable tags such as v0.1.2 publish as latest releases.
     # Suffix tags such as v0.1.2-rc.1 publish as prereleases.
-    if: ${{ startsWith(github.ref_name, 'v0.') }}
+    if: ${{ github.repository == 'ergohaven/entropy' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && startsWith(github.ref, 'refs/tags/v0.') }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -80,11 +80,28 @@ jobs:
           asset="entropy-${GITHUB_REF_NAME}-windows-x86_64.exe"
           cp target/release/entropy.exe "dist/release/$asset"
 
-      - name: Build macOS app bundle and DMG
+      # Neither Cargo nor swiftc runs with signing credentials in its environment.
+      - name: Build macOS binary and certificate importer
+        if: matrix.kind == 'macos'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '10.15'
+        run: |
+          cargo build --locked --release --target "${{ matrix.target }}"
+          swiftc scripts/import_macos_certificate.swift -o "$RUNNER_TEMP/entropy-certificate-import"
+
+      - name: Sign macOS app and build DMG
+        if: matrix.kind == 'macos'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: bash scripts/sign_macos_release.sh
+
+      - name: Collect signed macOS DMG
         if: matrix.kind == 'macos'
         shell: bash
         run: |
-          TARGET="${{ matrix.target }}" scripts/build_macos_app.sh
           mkdir -p dist/release
           asset="entropy-${GITHUB_REF_NAME}-macos-${{ matrix.arch }}.dmg"
           cp dist/macos/*.dmg "dist/release/$asset"
@@ -123,7 +140,7 @@ jobs:
           printf '\n## Downloads\n\n' >> RELEASE_NOTES.md
           printf '%s\n' '- Linux: download the `.AppImage`, make it executable, and run it.' >> RELEASE_NOTES.md
           printf '%s\n' '- Windows: download and run the portable `.exe`.' >> RELEASE_NOTES.md
-          printf '%s\n' '- macOS: download the unsigned `.dmg` for your Mac (`arm64` for Apple Silicon, `x86_64` for Intel), drag Entropy to Applications, then remove quarantine if macOS blocks the app.' >> RELEASE_NOTES.md
+          printf '%s\n' '- macOS: download the `.dmg` for your Mac (`arm64` for Apple Silicon, `x86_64` for Intel). See README for installation and Open Anyway instructions (self-signed, not notarized).' >> RELEASE_NOTES.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
