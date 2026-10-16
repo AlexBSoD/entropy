@@ -4,10 +4,14 @@ set -euo pipefail
 set +x
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/scripts/macos_stable_signing.sh"
-[[ "${GITHUB_REPOSITORY:-}" == ergohaven/entropy &&
-   ( "${GITHUB_EVENT_NAME:-}" == push || "${GITHUB_EVENT_NAME:-}" == workflow_dispatch ) &&
-   "${GITHUB_REF:-}" == refs/tags/v0.* ]] || {
-    echo 'Signing is restricted to upstream release tags' >&2; exit 1;
+[[ "${GITHUB_REPOSITORY:-}" == ergohaven/entropy && (
+   ( "${GITHUB_EVENT_NAME:-}" == push && "${GITHUB_REF:-}" == refs/tags/v0.* ) ||
+   ( "${GITHUB_EVENT_NAME:-}" == workflow_dispatch &&
+     "${GITHUB_REF:-}" == refs/heads/ci/macos-signing-validation-pr195 &&
+     "${MACOS_SIGNING_TEST:-}" == 1 )
+) ]] || {
+    echo 'Signing is restricted to upstream release tags or the opted-in manual test branch' >&2
+    exit 1
 }
 [[ -n "${MACOS_CERTIFICATE_P12_BASE64:-}" && -n "${MACOS_CERTIFICATE_PASSWORD:-}" ]] || {
     echo 'Missing signing credentials; refusing ad-hoc release' >&2; exit 1;
@@ -24,6 +28,9 @@ unset MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD
     echo 'Compile the certificate importer before providing credentials' >&2; exit 1;
 }
 umask 077
+# Only fixed public success markers may leave the signing process. Remove stale
+# evidence before doing anything with a keychain; failures never retain a pass.
+rm -f "$RUNNER_TEMP/entropy-signing-cleanup.txt"
 # Snapshot stays in memory; preserve quoted paths, including spaces.
 ORIGINAL_KEYCHAINS="$(security list-keychains -d user)"
 SIGNING_DIR="$(mktemp -d "$RUNNER_TEMP/entropy-signing.XXXXXX")"
@@ -40,17 +47,24 @@ set_search_list() {
     security list-keychains -d user -s "${paths[@]}"
 }
 cleanup() {
-    local status=$? failed=0
+    local status=$? failed=0 restored=''
     trap - EXIT
     # Delete first: security may itself update the list on deletion.
     if [[ -e "$KEYCHAIN" ]]; then
         security delete-keychain "$KEYCHAIN" >/dev/null 2>&1 || failed=1
     fi
     set_search_list >/dev/null 2>&1 || failed=1
+    restored="$(security list-keychains -d user 2>/dev/null)" || failed=1
+    [[ "$restored" == "$ORIGINAL_KEYCHAINS" ]] || failed=1
     rm -rf "$SIGNING_DIR" || failed=1
+    [[ ! -e "$SIGNING_DIR" && ! -e "$KEYCHAIN" ]] || failed=1
     if [[ "$failed" != 0 ]]; then
         echo 'Failed to clean up signing keychain or restore search list' >&2
         exit 1
+    fi
+    if [[ "$status" == 0 ]]; then
+        printf '%s\n' 'temporary_keychain_deleted=yes' 'search_list_restored=yes' \
+            > "$RUNNER_TEMP/entropy-signing-cleanup.txt"
     fi
     exit "$status"
 }
