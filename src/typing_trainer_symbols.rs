@@ -226,7 +226,7 @@ mod tests {
             KeyBinding::Rmk(KeyAction::TapHold(
                 Action::User(crate::universal_symbols::USER_SYMBOL_START + 4),
                 Action::Modifier(ModifierCombination::LSHIFT),
-                Default::default(),
+                u8::MAX,
             )),
             KeyBinding::Rmk(KeyAction::Tap(Action::Key(KeyCode::Hid(HidKeyCode::B)))),
         ]]);

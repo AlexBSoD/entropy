@@ -50,7 +50,7 @@ base64 = "0.21"
 ab_glyph = "0.2"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 postcard = "1"
-rmk-types = { git = "https://github.com/ergohaven/rmk.git", rev = "99cdcd542600eb1a439675455997fe7cf3928600", default-features = false }
+rmk-types = { git = "https://github.com/AlexBSoD/rmk.git", rev = "5896357d17cd62b24bf3b4c143ae8c18e454c1b9", default-features = false }
 semver = "1"
 url = "2"
 

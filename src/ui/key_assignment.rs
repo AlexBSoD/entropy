@@ -786,7 +786,7 @@ mod tests {
         let action = KeyAction::TapHold(
             Action::KeyWithModifier(HidKeyCode::LeftBracket, ModifierCombination::LSHIFT),
             Action::Modifier(ModifierCombination::RCTRL),
-            Default::default(),
+            u8::MAX,
         );
 
         app.handle_secondary_target(

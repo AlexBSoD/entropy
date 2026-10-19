@@ -14,13 +14,16 @@ const ENTLAYOUT_FORMAT: &str = "entropy.layout";
 const ENTLAYOUT_VERSION: u16 = 7;
 // Complete Macropad device documents add every host profile and matching data.
 const MACROPAD_ENTLAYOUT_VERSION: u16 = 9;
+// Device documents carrying native RMK actions in the v2 postcard layout. Up to
+// version 7 they use v1, which import upgrades.
+const NATIVE_V2_ENTLAYOUT_VERSION: u16 = 10;
 
 fn entlayout_version_supported(version: u16) -> bool {
-    (1..=ENTLAYOUT_VERSION).contains(&version)
+    (1..=ENTLAYOUT_VERSION).contains(&version) || version == NATIVE_V2_ENTLAYOUT_VERSION
 }
 
 // Version 8 is the older explicitly scoped application document. Non-Macropad
-// ordinary device exports retain version 7 and their original schema.
+// ordinary device exports retain version 7 (10 with native RMK actions).
 const APPLICATION_ENTLAYOUT_VERSION: u16 = 8;
 
 #[derive(Serialize, Deserialize)]
@@ -41,7 +44,15 @@ fn read_entlayout_document(data: &str) -> Result<EntLayoutDocument> {
     let value: serde_json::Value = serde_json::from_str(data)?;
     match (value["format"].as_str(), value.get("scope")) {
         (Some(ENTLAYOUT_FORMAT), None) => {
-            Ok(EntLayoutDocument::Device(serde_json::from_str(data)?))
+            let mut file: EntLayoutFile = serde_json::from_str(data)?;
+            if file.version <= ENTLAYOUT_VERSION {
+                for encoded in entlayout_native_actions_mut(&mut file.data) {
+                    if let Some(v1) = encoded.as_deref() {
+                        *encoded = upgrade_native_v1_key_action(v1)?;
+                    }
+                }
+            }
+            Ok(EntLayoutDocument::Device(file))
         }
         (Some(ENTLAYOUT_FORMAT), Some(scope)) if scope == "application" => {
             let file: ApplicationEntLayoutFile = serde_json::from_str(data)?;
@@ -412,6 +423,93 @@ fn decode_native_key_action(encoded: &str) -> Result<rmk_types::action::KeyActio
         .decode(encoded)
         .context("invalid base64 RMK key action")?;
     postcard::from_bytes(&bytes).context("invalid RMK key action payload")
+}
+
+fn entlayout_native_actions_mut(
+    data: &mut EntLayoutData,
+) -> impl Iterator<Item = &mut Option<String>> {
+    data.native_keymap
+        .iter_mut()
+        .flatten()
+        .chain(
+            data.combos
+                .entries
+                .iter_mut()
+                .map(|entry| &mut entry.native_output),
+        )
+        .chain(data.tap_dance.entries.iter_mut().flat_map(|entry| {
+            [
+                &mut entry.native_on_tap,
+                &mut entry.native_on_hold,
+                &mut entry.native_on_double_tap,
+                &mut entry.native_on_tap_hold,
+            ]
+        }))
+}
+
+/// Re-encodes a native action from the v1 postcard layout: v1 `KeyboardAction`
+/// still had DebugToggle and the three Output variants, and `TapHold` carried a
+/// packed `MorseProfile` (varint u32) where v2 holds a profile-table index.
+/// Removed actions return `None`, so the key falls back to its Vial keycode;
+/// tap-hold keys take the firmware's default profile.
+fn upgrade_native_v1_key_action(encoded: &str) -> Result<Option<String>> {
+    use rmk_types::action::{Action, KeyAction, KeyboardAction};
+
+    const V1_KEY_ACTION_SINGLE: u8 = 2;
+    const V1_KEY_ACTION_TAP: u8 = 3;
+    const V1_KEY_ACTION_TAP_HOLD: u8 = 4;
+    const V1_ACTION_KEYBOARD_CONTROL: u8 = 17;
+
+    fn take_action(bytes: &[u8]) -> Result<(Option<Action>, &[u8])> {
+        let Some((&V1_ACTION_KEYBOARD_CONTROL, rest)) = bytes.split_first() else {
+            let (action, rest) =
+                postcard::take_from_bytes(bytes).context("invalid RMK key action payload")?;
+            return Ok((Some(action), rest));
+        };
+        let (&control, rest) = rest
+            .split_first()
+            .context("invalid RMK key action payload")?;
+        let control = match control {
+            0 => Some(KeyboardAction::Bootloader),
+            1 => Some(KeyboardAction::Reboot),
+            3 => Some(KeyboardAction::ClearEeprom),
+            7 => Some(KeyboardAction::ComboOn),
+            8 => Some(KeyboardAction::ComboOff),
+            9 => Some(KeyboardAction::ComboToggle),
+            10 => Some(KeyboardAction::CapsWordToggle),
+            2 | 4..=6 => None,
+            _ => bail!("invalid RMK key action payload"),
+        };
+        Ok((control.map(Action::KeyboardControl), rest))
+    }
+
+    let bytes = BASE64_STANDARD
+        .decode(encoded)
+        .context("invalid base64 RMK key action")?;
+    let action = match bytes.split_first() {
+        Some((&tag @ (V1_KEY_ACTION_SINGLE | V1_KEY_ACTION_TAP), rest)) => {
+            let (Some(action), _) = take_action(rest)? else {
+                return Ok(None);
+            };
+            if tag == V1_KEY_ACTION_SINGLE {
+                KeyAction::Single(action)
+            } else {
+                KeyAction::Tap(action)
+            }
+        }
+        Some((&V1_KEY_ACTION_TAP_HOLD, rest)) => {
+            let (tap, rest) = take_action(rest)?;
+            let (hold, rest) = take_action(rest)?;
+            postcard::take_from_bytes::<u32>(rest).context("invalid RMK key action payload")?;
+            let (Some(tap), Some(hold)) = (tap, hold) else {
+                return Ok(None);
+            };
+            KeyAction::TapHold(tap, hold, u8::MAX)
+        }
+        // No, Transparent and Morse kept their layout.
+        _ => postcard::from_bytes(&bytes).context("invalid RMK key action payload")?,
+    };
+    Ok(encode_native_key_action(action))
 }
 
 fn entlayout_dynamic_binding(
@@ -1122,7 +1220,7 @@ impl EntropyApp {
             rows: layout.rows,
             cols: layout.cols,
         };
-        Some(EntLayoutFile {
+        let mut bundle = EntLayoutFile {
             format: ENTLAYOUT_FORMAT.to_owned(),
             version: if application_settings.is_some() {
                 MACROPAD_ENTLAYOUT_VERSION
@@ -1302,7 +1400,13 @@ impl EntropyApp {
                 },
                 portable_settings: self.entlayout_portable_settings_snapshot(),
             },
-        })
+        };
+        if bundle.version == ENTLAYOUT_VERSION
+            && entlayout_native_actions_mut(&mut bundle.data).any(|encoded| encoded.is_some())
+        {
+            bundle.version = NATIVE_V2_ENTLAYOUT_VERSION;
+        }
+        Some(bundle)
     }
 
     fn text_expander_entlayout_snapshot(&self) -> EntTextExpanderData {
@@ -4573,6 +4677,8 @@ mod tests {
         assert!(entlayout_version_supported(7));
         assert!(!entlayout_version_supported(0));
         assert!(!entlayout_version_supported(8));
+        assert!(entlayout_version_supported(NATIVE_V2_ENTLAYOUT_VERSION));
+        assert!(!entlayout_version_supported(11));
     }
 
     #[test]
@@ -4699,11 +4805,91 @@ mod tests {
         let action = KeyAction::TapHold(
             Action::KeyWithModifier(HidKeyCode::Kc0, ModifierCombination::LSHIFT),
             Action::Modifier(ModifierCombination::LCTRL),
-            Default::default(),
+            u8::MAX,
         );
         let encoded = encode_native_key_action(action).expect("native action should fit");
 
         assert_eq!(decode_native_key_action(&encoded).unwrap(), action);
+    }
+
+    #[test]
+    fn v1_native_actions_upgrade_only_in_older_documents() {
+        use rmk_types::action::{Action, KeyAction, KeyboardAction};
+        use rmk_types::keycode::HidKeyCode;
+        use rmk_types::modifier::ModifierCombination;
+
+        fn postcard_bytes<T: Serialize>(value: &T) -> Vec<u8> {
+            postcard::to_slice(value, &mut [0u8; 16]).unwrap().to_vec()
+        }
+        let tap = Action::KeyWithModifier(HidKeyCode::Kc0, ModifierCombination::LSHIFT);
+        let hold = Action::Modifier(ModifierCombination::LCTRL);
+        let tap_hold_v1 = [
+            vec![4],
+            postcard_bytes(&tap),
+            postcard_bytes(&hold),
+            // Packed v1 MorseProfile: PermissiveHold, 200 ms hold timeout.
+            postcard_bytes(&0x4000_00C8u32),
+        ]
+        .concat();
+        let upgrade = |bytes: &[u8]| {
+            upgrade_native_v1_key_action(&BASE64_STANDARD.encode(bytes))
+                .unwrap()
+                .map(|encoded| decode_native_key_action(&encoded).unwrap())
+        };
+        let control = |action| Action::KeyboardControl(action);
+        let caps_word = KeyAction::Single(control(KeyboardAction::CapsWordToggle));
+        let tap_hold = KeyAction::TapHold(tap, hold, u8::MAX);
+        let user = KeyAction::Single(Action::User(3));
+
+        assert_eq!(upgrade(&[2, 17, 10]), Some(caps_word));
+        assert_eq!(
+            upgrade(&[3, 17, 3]),
+            Some(KeyAction::Tap(control(KeyboardAction::ClearEeprom)))
+        );
+        assert_eq!(
+            upgrade(&[2, 17, 1]),
+            Some(KeyAction::Single(control(KeyboardAction::Reboot)))
+        );
+        // DebugToggle and OutputUsb no longer exist.
+        assert_eq!(upgrade(&[2, 17, 2]), None);
+        assert_eq!(upgrade(&[2, 17, 5]), None);
+        assert_eq!(upgrade(&tap_hold_v1), Some(tap_hold));
+        assert_eq!(upgrade(&postcard_bytes(&user)), Some(user));
+        assert_eq!(upgrade(&[5, 2]), Some(KeyAction::Morse(2)));
+        assert!(upgrade_native_v1_key_action(&BASE64_STANDARD.encode([2, 17, 11])).is_err());
+        assert!(upgrade_native_v1_key_action(&BASE64_STANDARD.encode(&tap_hold_v1[..3])).is_err());
+
+        let (_, mut target) = offset_alternative_backup();
+        target.layers[0][0] = tap_hold.into();
+        let mut app = EntropyApp::new_inert_for_test();
+        app.layout = Some(target);
+        app.layout_options_value = Some(1);
+        let mut current = app.entlayout_snapshot().unwrap();
+        assert_eq!(current.version, NATIVE_V2_ENTLAYOUT_VERSION);
+        let v2_keymap = vec![vec![
+            encode_native_key_action(tap_hold),
+            None,
+            encode_native_key_action(caps_word),
+        ]];
+        current.data.native_keymap = v2_keymap.clone();
+        let read = |bundle: &EntLayoutFile| match read_entlayout_document(
+            &serde_json::to_string(bundle).unwrap(),
+        )
+        .unwrap()
+        {
+            EntLayoutDocument::Device(file) => file.data.native_keymap,
+            EntLayoutDocument::Application(_) => unreachable!(),
+        };
+        assert_eq!(read(&current), v2_keymap);
+
+        let mut legacy = current;
+        legacy.version = ENTLAYOUT_VERSION;
+        legacy.data.native_keymap = vec![vec![
+            Some(BASE64_STANDARD.encode(&tap_hold_v1)),
+            Some(BASE64_STANDARD.encode([2, 17, 6])),
+            Some(BASE64_STANDARD.encode([2, 17, 10])),
+        ]];
+        assert_eq!(read(&legacy), v2_keymap);
     }
 
     #[test]

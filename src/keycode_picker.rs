@@ -797,7 +797,7 @@ mod tests {
                 KeyAction::TapHold(
                     Action::KeyWithModifier(HidKeyCode::Kc0, ModifierCombination::LSHIFT),
                     Action::Modifier(ModifierCombination::LCTRL),
-                    Default::default(),
+                    u8::MAX,
                 )
                 .into()
             )
@@ -810,7 +810,7 @@ mod tests {
                 KeyAction::TapHold(
                     Action::KeyWithModifier(HidKeyCode::LeftBracket, ModifierCombination::LSHIFT,),
                     Action::Modifier(ModifierCombination::RCTRL),
-                    Default::default(),
+                    u8::MAX,
                 )
                 .into()
             )
@@ -828,7 +828,7 @@ mod tests {
             KeyAction::TapHold(
                 Action::KeyWithModifier(HidKeyCode::LeftBracket, ModifierCombination::LSHIFT),
                 Action::Modifier(ModifierCombination::RCTRL),
-                Default::default(),
+                u8::MAX,
             )
             .into(),
         );
@@ -1306,7 +1306,8 @@ impl KeycodePicker {
                 Action::Modifier(ModifierCombination::from_packed_bits(
                     ((base >> 8) & 0x1F) as u8,
                 )),
-                Default::default(),
+                // No profile-table entry: the firmware's default tap-hold profile.
+                u8::MAX,
             )
             .into()
         } else {

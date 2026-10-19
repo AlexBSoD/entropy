@@ -11,7 +11,7 @@ const ERGOHAVEN_CUSTOM_NEXT_NATIVE_KEY_ACTION: u8 = 0x04;
 const ERGOHAVEN_CUSTOM_NATIVE_DYNAMIC_ACTION: u8 = 0x05;
 const ERGOHAVEN_CUSTOM_NEXT_NATIVE_DYNAMIC_ACTION: u8 = 0x06;
 const ERGOHAVEN_CUSTOM_COMBO_LAYER: u8 = 0x07;
-const ERGOHAVEN_NATIVE_KEY_ACTION_VERSION: u8 = 0x01;
+const ERGOHAVEN_NATIVE_KEY_ACTION_VERSION: u8 = 0x02;
 const ERGOHAVEN_NATIVE_KEY_ACTION_CAP_GET_SET: u16 = 0x0001;
 const ERGOHAVEN_NATIVE_KEY_ACTION_CAP_UNIVERSAL_SYMBOLS: u16 = 0x0002;
 const ERGOHAVEN_NATIVE_KEY_ACTION_CAP_RUSSIAN_LETTERS: u16 = 0x0004;
@@ -873,7 +873,7 @@ mod tests {
         let action = KeyAction::TapHold(
             Action::KeyWithModifier(HidKeyCode::Kc0, ModifierCombination::LSHIFT),
             Action::Modifier(ModifierCombination::LCTRL),
-            Default::default(),
+            u8::MAX,
         );
         let mut response = [0u8; MSG_LEN];
         let mut encoded = [0u8; NATIVE_KEY_ACTION_MAX_PAYLOAD];
@@ -900,7 +900,7 @@ mod tests {
         let action = KeyAction::TapHold(
             Action::KeyWithModifier(HidKeyCode::LeftBracket, ModifierCombination::LSHIFT),
             Action::Modifier(ModifierCombination::RCTRL),
-            Default::default(),
+            u8::MAX,
         );
         let binding = crate::keyboard::KeyBinding::Rmk(action);
         let label = crate::app::key_binding_label_with_macro_names(
@@ -928,7 +928,7 @@ mod tests {
         let action = KeyAction::TapHold(
             Action::KeyWithModifier(HidKeyCode::LeftBracket, ModifierCombination::LSHIFT),
             Action::Modifier(ModifierCombination::RCTRL),
-            Default::default(),
+            u8::MAX,
         );
 
         let parts = rmk_mod_tap_parts(action).expect("native Mod Tap should be recognized");
@@ -949,7 +949,7 @@ mod tests {
         let action = KeyAction::TapHold(
             Action::KeyWithModifier(HidKeyCode::LeftBracket, ModifierCombination::LSHIFT),
             Action::Modifier(ModifierCombination::RCTRL),
-            Default::default(),
+            u8::MAX,
         );
 
         assert_eq!(
@@ -957,7 +957,7 @@ mod tests {
             KeyAction::TapHold(
                 Action::KeyWithModifier(HidKeyCode::LeftBracket, ModifierCombination::RSHIFT),
                 Action::Modifier(ModifierCombination::LCTRL),
-                Default::default(),
+                u8::MAX,
             )
         );
     }
