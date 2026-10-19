@@ -6,6 +6,285 @@ use std::time::{Duration, Instant};
 #[path = "tap_dance_tests.rs"]
 mod tap_dance_tests;
 
+fn pictogram_canvas_rect(output: &egui::FullOutput) -> egui::Rect {
+    let lines: Vec<_> = output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::LineSegment { points, stroke }
+                if (stroke.width - 0.7).abs() < 0.001
+                    && points[0].x == points[1].x
+                    && points[1].y - points[0].y >= 96.0 =>
+            {
+                Some(*points)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        lines.len(),
+        PICTOGRAM_WIDTH + 1,
+        "actual editor grid must be visible"
+    );
+    egui::Rect::from_min_max(lines.first().unwrap()[0], lines.last().unwrap()[1])
+}
+
+fn undo_shortcut(modifiers: egui::Modifiers) -> Vec<egui::Event> {
+    [true, false]
+        .into_iter()
+        .map(|pressed| egui::Event::Key {
+            key: egui::Key::Z,
+            physical_key: Some(egui::Key::Z),
+            pressed,
+            repeat: false,
+            modifiers,
+        })
+        .collect()
+}
+
+#[test]
+fn full_ui_pictogram_ctrl_z_undoes_drawing_like_the_button_without_hid_writes() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
+    let (mut app, ctx, recorder) = app(true);
+    click_label(&mut app, &ctx, "Пиктограммы");
+    app.display_settings.pictograms.source_levels = vec![0; PICTOGRAM_WIDTH * PICTOGRAM_HEIGHT];
+    let original = app.display_settings.pictograms.source_levels.clone();
+    let output = frame(&mut app, &ctx, vec![]);
+    let canvas = pictogram_canvas_rect(&output);
+    let cell = canvas.width() / PICTOGRAM_WIDTH as f32;
+    click(
+        &mut app,
+        &ctx,
+        canvas.min + egui::vec2(cell * 2.5, cell * 2.5),
+    );
+    let first_stroke = app.display_settings.pictograms.source_levels.clone();
+    assert_ne!(first_stroke, original, "real pointer event must draw");
+    click(
+        &mut app,
+        &ctx,
+        canvas.min + egui::vec2(cell * 4.5, cell * 4.5),
+    );
+    assert_ne!(app.display_settings.pictograms.source_levels, first_stroke);
+    assert_eq!(app.display_settings.pictograms.undo.len(), 2);
+    let modifiers = egui::Modifiers {
+        ctrl: true,
+        command: true,
+        ..Default::default()
+    };
+    frame(&mut app, &ctx, undo_shortcut(modifiers));
+    assert_eq!(
+        app.display_settings.pictograms.source_levels, first_stroke,
+        "Ctrl+Z must undo exactly one real drawing stroke"
+    );
+    assert_eq!(app.display_settings.pictograms.undo.len(), 1);
+    let undo_label = crate::i18n::tr_catalog(app.app_settings.language, "display_settings.undo");
+    click_label(&mut app, &ctx, undo_label);
+    assert_eq!(app.display_settings.pictograms.source_levels, original);
+    assert!(app.display_settings.pictograms.undo.is_empty());
+    frame(&mut app, &ctx, undo_shortcut(modifiers));
+    assert_eq!(app.display_settings.pictograms.source_levels, original);
+    assert!(
+        recorder.requests().is_empty(),
+        "drawing undo is local, never a device write"
+    );
+}
+
+#[test]
+fn full_ui_pictogram_undo_does_not_treat_shift_alt_or_plain_z_as_undo() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
+    let (mut app, ctx, recorder) = app(true);
+    click_label(&mut app, &ctx, "Пиктограммы");
+    app.display_settings.pictograms.source_levels = vec![0; PICTOGRAM_WIDTH * PICTOGRAM_HEIGHT];
+    let canvas = pictogram_canvas_rect(&frame(&mut app, &ctx, vec![]));
+    click(&mut app, &ctx, canvas.center());
+    let drawing = app.display_settings.pictograms.source_levels.clone();
+    let count = app.display_settings.pictograms.undo.len();
+    assert_eq!(count, 1);
+    for modifiers in [
+        egui::Modifiers::NONE,
+        egui::Modifiers {
+            ctrl: true,
+            command: true,
+            shift: true,
+            ..Default::default()
+        },
+        egui::Modifiers {
+            ctrl: true,
+            command: true,
+            alt: true,
+            ..Default::default()
+        },
+    ] {
+        frame(&mut app, &ctx, undo_shortcut(modifiers));
+        assert!(
+            app.display_settings.pictograms.source_levels == drawing,
+            "unsupported chord must not undo: {modifiers:?}"
+        );
+        assert_eq!(app.display_settings.pictograms.undo.len(), count);
+    }
+    assert!(recorder.requests().is_empty());
+}
+
+#[test]
+fn full_ui_pictogram_undo_leaves_name_text_and_other_tabs_in_control() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
+    let (mut app, ctx, recorder) = app(true);
+    click_label(&mut app, &ctx, "Пиктограммы");
+    app.display_settings.pictograms.source_levels = vec![0; PICTOGRAM_WIDTH * PICTOGRAM_HEIGHT];
+    let canvas = pictogram_canvas_rect(&frame(&mut app, &ctx, vec![]));
+    click(&mut app, &ctx, canvas.center());
+    let drawing = app.display_settings.pictograms.source_levels.clone();
+    app.display_settings.pictograms.editor_name = "Undo name fixture".into();
+    click_label(&mut app, &ctx, "Undo name fixture");
+    assert!(
+        ctx.egui_wants_keyboard_input(),
+        "the real name field must own focus"
+    );
+    frame(&mut app, &ctx, vec![egui::Event::Text("edited".into())]);
+    let edited = app.display_settings.pictograms.editor_name.clone();
+    let modifiers = egui::Modifiers {
+        ctrl: true,
+        command: true,
+        ..Default::default()
+    };
+    frame(&mut app, &ctx, undo_shortcut(modifiers));
+    assert_ne!(
+        app.display_settings.pictograms.editor_name, edited,
+        "TextEdit retains text undo"
+    );
+    assert_eq!(app.display_settings.pictograms.source_levels, drawing);
+    assert_eq!(app.display_settings.pictograms.undo.len(), 1);
+    click_label(&mut app, &ctx, "Основной экран");
+    frame(&mut app, &ctx, undo_shortcut(modifiers));
+    assert_eq!(app.display_settings.pictograms.source_levels, drawing);
+    assert_eq!(app.display_settings.pictograms.undo.len(), 1);
+    assert!(recorder.requests().is_empty());
+}
+
+#[test]
+fn full_ui_pictogram_cmd_z_and_pending_picker_keep_undo_local() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
+    let (mut app, ctx, recorder) = app(true);
+    click_label(&mut app, &ctx, "Пиктограммы");
+    app.display_settings.pictograms.source_levels = vec![0; PICTOGRAM_WIDTH * PICTOGRAM_HEIGHT];
+    let original = app.display_settings.pictograms.source_levels.clone();
+    let canvas = pictogram_canvas_rect(&frame(&mut app, &ctx, vec![]));
+    click(&mut app, &ctx, canvas.center());
+    let drawing = app.display_settings.pictograms.source_levels.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.pending_file_dialog = Some((
+        crate::app::file_dialog::FileDialogAction::ExportPictograms,
+        app.connection_generation,
+        rx,
+    ));
+    let modifiers = egui::Modifiers {
+        mac_cmd: true,
+        command: true,
+        ..Default::default()
+    };
+    frame(&mut app, &ctx, undo_shortcut(modifiers));
+    assert_eq!(app.display_settings.pictograms.source_levels, drawing);
+    assert_eq!(app.display_settings.pictograms.undo.len(), 1);
+    tx.send(None).unwrap();
+    app.poll_file_dialog(&ctx);
+    frame(&mut app, &ctx, undo_shortcut(modifiers));
+    assert_eq!(app.display_settings.pictograms.source_levels, original);
+    assert!(app.display_settings.pictograms.undo.is_empty());
+    assert!(recorder.requests().is_empty());
+}
+
+#[test]
+fn full_ui_pictogram_undo_does_not_break_a_held_pointer_stroke() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
+    let (mut app, ctx, recorder) = app(true);
+    click_label(&mut app, &ctx, "Пиктограммы");
+    app.display_settings.pictograms.source_levels = vec![0; PICTOGRAM_WIDTH * PICTOGRAM_HEIGHT];
+    let original = app.display_settings.pictograms.source_levels.clone();
+    let canvas = pictogram_canvas_rect(&frame(&mut app, &ctx, vec![]));
+    let cell = canvas.width() / PICTOGRAM_WIDTH as f32;
+    click(
+        &mut app,
+        &ctx,
+        canvas.min + egui::vec2(cell * 2.5, cell * 2.5),
+    );
+    let first = app.display_settings.pictograms.source_levels.clone();
+    let pos = canvas.center();
+    frame(
+        &mut app,
+        &ctx,
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+        ],
+    );
+    assert!(app.display_settings.pictograms.editor_last_cell.is_some());
+    assert_eq!(app.display_settings.pictograms.undo.len(), 2);
+    let modifiers = egui::Modifiers {
+        ctrl: true,
+        command: true,
+        ..Default::default()
+    };
+    frame(&mut app, &ctx, undo_shortcut(modifiers));
+    assert_eq!(
+        app.display_settings.pictograms.undo.len(),
+        2,
+        "a held drawing stroke must retain its undo boundary"
+    );
+    let next = pos + egui::vec2(cell * 2.0, cell * 2.0);
+    frame(&mut app, &ctx, vec![egui::Event::PointerMoved(next)]);
+    frame(
+        &mut app,
+        &ctx,
+        vec![egui::Event::PointerButton {
+            pos: next,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        }],
+    );
+    frame(&mut app, &ctx, undo_shortcut(modifiers));
+    assert_eq!(app.display_settings.pictograms.source_levels, first);
+    frame(&mut app, &ctx, undo_shortcut(modifiers));
+    assert_eq!(app.display_settings.pictograms.source_levels, original);
+    assert!(recorder.requests().is_empty());
+}
+
+#[test]
+fn full_ui_pictogram_undo_does_not_change_drawing_behind_app_modals() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
+    for close_prompt in [true, false] {
+        let (mut app, ctx, recorder) = app(true);
+        click_label(&mut app, &ctx, "Пиктограммы");
+        app.display_settings.pictograms.source_levels = vec![0; PICTOGRAM_WIDTH * PICTOGRAM_HEIGHT];
+        let canvas = pictogram_canvas_rect(&frame(&mut app, &ctx, vec![]));
+        click(&mut app, &ctx, canvas.center());
+        let drawing = app.display_settings.pictograms.source_levels.clone();
+        if close_prompt {
+            app.close_to_tray_prompt_open = true;
+        } else {
+            app.import_report_open = true;
+            app.import_report_title = "Undo modal fixture".into();
+        }
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        frame(&mut app, &ctx, undo_shortcut(modifiers));
+        assert!(
+            app.display_settings.pictograms.source_levels == drawing,
+            "app modal must block background drawing undo: close_prompt={close_prompt}"
+        );
+        assert_eq!(app.display_settings.pictograms.undo.len(), 1);
+        assert!(recorder.requests().is_empty());
+    }
+}
+
 #[test]
 fn translated_catalog_reuses_storage_per_language() {
     let _storage = crate::app::app_storage::ScopedTempConfig::new();

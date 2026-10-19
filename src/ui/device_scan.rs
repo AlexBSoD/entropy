@@ -3,7 +3,9 @@ use super::*;
 const DEVICE_SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 fn should_wait_for_manual_device_selection(status_msg: &str) -> bool {
-    status_msg.starts_with("Open failed:") || status_msg.starts_with("Connect timeout")
+    status_msg.starts_with("Open failed:")
+        || status_msg.starts_with("Connect timeout")
+        || status_msg.starts_with("Connect failed:")
 }
 
 fn should_auto_connect_only_device(device_count: usize) -> bool {
@@ -273,7 +275,13 @@ impl EntropyApp {
                 if endpoint_was_reenumerated {
                     log::info!("USB HID endpoint was re-enumerated; reopening the device");
                     self.start_connect(idx);
-                } else if self.layout.is_none() && !was_loading {
+                } else if (self.layout.is_none()
+                    || (self.hid_device.is_none() && !self.hid_write_task_owner_active()))
+                    && !was_loading
+                {
+                    // A failed USB settings write can drop the HID owner while
+                    // discovery still reports the same path/instance. Do not
+                    // wait for another OS re-enumeration to reopen it.
                     self.start_connect(idx);
                 } else {
                     self.sync_qmk_hid_host_bridges();
@@ -378,6 +386,32 @@ mod tests {
     }
 
     #[test]
+    fn same_usb_endpoint_reopens_after_settings_write_loses_hid_owner() {
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = EntropyApp::new(&cc);
+        let (launch_tx, requests) = mpsc::channel();
+        app.test_connect_requests = Some(launch_tx);
+        let device = scan_test_device("SM62");
+        app.device_manager.replace_devices(vec![device.clone()]);
+        app.selected_device = Some(0);
+        app.layout = Some(KeyboardLayout {
+            name: "SM62".to_owned(), rows: 0, cols: 0,
+            keys: vec![], encoders: vec![], layers: vec![vec![]],
+            encoder_layers: vec![vec![]], layer_names: vec!["Base".to_owned()],
+            custom_keycodes: vec![], layout_options: vec![],
+            live_features: Default::default(), supports_rgb: false,
+            lighting_mode: None, firmware: FirmwareProtocol::Vial,
+        });
+        assert!(app.hid_device.is_none());
+
+        app.apply_device_scan_result(vec![device.clone()]);
+
+        assert_eq!(requests.try_recv().unwrap().0.path, device.path);
+        assert!(matches!(app.connect_state, ConnectState::Loading { .. }));
+    }
+
+    #[test]
     fn scans_preserve_queued_identity_through_absence_and_reordering() {
         let ctx = egui::Context::default();
         let cc = eframe::CreationContext::_new_kittest(ctx.clone());
@@ -475,6 +509,9 @@ mod tests {
         ));
         assert!(should_wait_for_manual_device_selection(
             "Connect timeout — RMK/Vial device did not finish loading"
+        ));
+        assert!(should_wait_for_manual_device_selection(
+            "Connect failed: HID timeout — device did not respond"
         ));
         assert!(!should_wait_for_manual_device_selection(""));
     }

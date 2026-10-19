@@ -421,7 +421,7 @@ pub(crate) const BUILTIN_PICTOGRAM_KEYS: &[&str] = &[
     "display_settings.pictogram_firmware_home",
     "display_settings.pictogram_firmware_insert",
     "display_settings.pictogram_firmware_end",
-    "display_settings.pictogram_firmware_delete",
+    "display_settings.pictogram_firmware_backspace",
     "display_settings.pictogram_firmware_screenshot",
     "display_settings.pictogram_firmware_mouse_left",
     "display_settings.pictogram_firmware_mouse_middle",

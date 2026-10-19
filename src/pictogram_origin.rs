@@ -72,6 +72,16 @@ pub(super) fn is_known_migrated_stock_pictogram(icon: &SavedPictogram) -> bool {
                 }
             }
         }
+        // The old Delete pictogram was renamed to Backspace without changing
+        // its pixels. Preserve exact historical name+mask recognition; explicit
+        // user origin and pixel edits still bypass this stock-only migration.
+        for language in crate::i18n::Language::ALL {
+            let old_name = crate::i18n::tr_catalog(language, "display_settings.pictogram_firmware_delete");
+            let new_name = crate::i18n::tr_catalog(language, "display_settings.pictogram_firmware_backspace");
+            if let Some(masks) = records.get(new_name).cloned() {
+                records.entry(old_name.to_owned()).or_default().extend(masks);
+            }
+        }
         records
     });
     records.get(icon.name.trim()).is_some_and(|bitmaps| {

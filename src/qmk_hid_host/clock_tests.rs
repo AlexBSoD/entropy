@@ -249,9 +249,13 @@ impl DesktopSource for BlockedDesktopSource {
         self.query(1);
         Some(1)
     }
-    fn media(&mut self) -> Option<(String, String)> {
+    fn media(&mut self) -> Option<MediaInfo> {
         self.query(2);
-        Some((format!("artist {}", self.calls), "title".into()))
+        Some(MediaInfo {
+            artist: format!("artist {}", self.calls),
+            title: "title".into(),
+            ..Default::default()
+        })
     }
 }
 
@@ -394,7 +398,7 @@ fn one_desktop_sampler_survives_subscription_churn_and_discards_old_epoch() {
         assert!(Instant::now() < deadline);
         thread::sleep(Duration::from_millis(2));
     }
-    assert_eq!(service.snapshot().media.unwrap().0, "artist 2");
+    assert_eq!(service.snapshot().media.unwrap().artist, "artist 2");
     drop(survivor);
     assert!(service.snapshot().media.is_none());
     assert!(

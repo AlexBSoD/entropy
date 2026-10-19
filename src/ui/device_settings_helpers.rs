@@ -481,7 +481,7 @@ impl EntropyApp {
         }
 
         let name = device.name.to_ascii_lowercase();
-        let ergohaven_macropad_display = device.is_ergohaven_display_macropad();
+        let ergohaven_macropad_display = device.is_ergohaven_display_macropad() || device.is_ergohaven_sm62();
 
         ergohaven_macropad_display || name.contains("m4cr0pad v2") || name.contains("m4cr0pad v3")
     }
@@ -3002,6 +3002,23 @@ mod tests {
         assert!(!active.time);
         assert!(!active.volume);
         assert!(!active.media);
+    }
+
+    #[test]
+    fn sm62_automatically_receives_display_host_media() {
+        let device = crate::device::Device {
+            name: "SM62".to_owned(),
+            vendor_id: 0xE126,
+            product_id: 0x00B2,
+            manufacturer: "Ergohaven".to_owned(),
+            serial_number: String::new(),
+            bus_type: String::new(),
+            path: "test-sm62".to_owned(),
+            instance_token: String::new(),
+            firmware: FirmwareProtocol::Vial,
+        };
+        assert!(EntropyApp::device_uses_automatic_display_host_data(&device));
+        assert!(!device.is_ergohaven_display_macropad());
     }
 
     #[test]

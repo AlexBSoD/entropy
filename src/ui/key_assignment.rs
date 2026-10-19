@@ -682,6 +682,25 @@ impl EntropyApp {
             return;
         };
         match action {
+            UndoAction::ApplicationLayoutLayer {
+                device_key,
+                layout_id,
+                layer,
+                old_keycodes,
+            } => {
+                if let Some(profile) = self
+                    .app_settings
+                    .application_layouts
+                    .get_mut(&device_key)
+                    .and_then(|settings| settings.layouts.get_mut(&layout_id))
+                {
+                    for (control, keycode) in old_keycodes.into_iter().enumerate() {
+                        profile.set_keycode(layer, control, keycode);
+                    }
+                    save_app_settings(&self.app_settings);
+                    self.refresh_layer_picker_content_flags();
+                }
+            }
             UndoAction::ApplicationLayoutControl {
                 device_key,
                 layout_id,

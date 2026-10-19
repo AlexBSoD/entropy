@@ -940,7 +940,7 @@ impl EntropyApp {
                 );
                 let (supported_qmk_settings, live_host_capabilities) = if vial_protocol >= 4 {
                     progress("Querying QMK settings…")?;
-                    let (settings, live_host_capabilities) = current_qmk_settings(
+                    let (mut settings, live_host_capabilities) = current_qmk_settings(
                         &json,
                         || dev_conn.query_qmk_settings(),
                         || {
@@ -950,6 +950,60 @@ impl EntropyApp {
                             })
                         },
                     );
+                    // Early SM62 builds expose these QSIDs to GET but list them after
+                    // 318/319. The paged QMK query advances by the highest ID in a
+                    // page, so it can skip 230..239. Probe the actual device before
+                    // deciding that its display controls are unavailable.
+                    if dev.is_ergohaven_sm62()
+                        && !(230..=239).all(|qsid| settings.contains(&qsid))
+                    {
+                        let probe = (230..=239)
+                            .map(|qsid| dev_conn.get_qmk_setting_u8(qsid))
+                            .collect::<anyhow::Result<Vec<_>>>();
+                        if let Ok(values) = probe {
+                            if values[0] <= 3 && values[5] <= 3
+                                && values[2] <= 240 && values[7] <= 240
+                                && [1, 3, 4, 6, 8, 9].iter().all(|index| values[*index] <= 1)
+                            {
+                                settings.extend(230..=239);
+                                settings.sort_unstable();
+                                settings.dedup();
+                                log::info!("SM62 display settings available by direct probe");
+                            }
+                        }
+                    }
+                    if dev.is_ergohaven_sm62()
+                        && (230..=239).all(|qsid| settings.contains(&qsid))
+                        && ![240, 241].iter().all(|qsid| settings.contains(qsid))
+                    {
+                        let dates = [240, 241]
+                            .iter()
+                            .map(|qsid| dev_conn.get_qmk_setting_u8(*qsid))
+                            .collect::<anyhow::Result<Vec<_>>>();
+                        if let Ok(values) = dates {
+                            if values.iter().all(|value| *value <= 1) {
+                                settings.extend([240, 241]);
+                                settings.sort_unstable();
+                                settings.dedup();
+                            }
+                        }
+                    }
+                    if dev.is_ergohaven_sm62()
+                        && (230..=239).all(|qsid| settings.contains(&qsid))
+                        && ![242, 243].iter().all(|qsid| settings.contains(qsid))
+                    {
+                        let holds = [242, 243]
+                            .iter()
+                            .map(|qsid| dev_conn.get_qmk_setting_u16(*qsid))
+                            .collect::<anyhow::Result<Vec<_>>>();
+                        if let Ok(values) = holds {
+                            if values.iter().all(|value| *value <= 10_000) {
+                                settings.extend([242, 243]);
+                                settings.sort_unstable();
+                                settings.dedup();
+                            }
+                        }
+                    }
                     if let Some(context) = qmk_cache_context.as_ref() {
                         save_cached_qmk_settings(cache_key, context, &settings);
                     }
@@ -1306,9 +1360,10 @@ impl EntropyApp {
                     load_rgb_settings(&dev_conn, &layout)
                 };
 
-                let display_settings = if DISPLAY_COLOR_QSIDS
-                    .iter()
-                    .all(|qsid| supported_qmk_settings.contains(qsid))
+                let display_settings = if (230..=239).all(|qsid| supported_qmk_settings.contains(&qsid))
+                    || DISPLAY_COLOR_QSIDS
+                        .iter()
+                        .all(|qsid| supported_qmk_settings.contains(qsid))
                 {
                     progress("Reading display settings…")?;
                     load_display_settings(&dev_conn, &supported_qmk_settings)

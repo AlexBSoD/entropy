@@ -802,7 +802,19 @@ impl EntropyApp {
         discovered: crate::app_discovery::ApplicationDiscoverySnapshot,
     ) {
         let foreground_changed = self.application_layout_foreground != discovered.foreground;
-        if foreground_changed {
+        // Discovery can enrich a foreground app's display name/aliases after a
+        // catalog scan without changing focus. Such metadata updates must not
+        // finish an in-progress rename. Keep title changes meaningful because
+        // application profiles can match individual window titles.
+        let foreground_context_changed = !same_foreground_application(
+            self.application_layout_foreground.as_ref(),
+            discovered.foreground.as_ref(),
+        ) || self
+            .application_layout_foreground
+            .as_ref()
+            .map(|app| &app.window_title)
+            != discovered.foreground.as_ref().map(|app| &app.window_title);
+        if foreground_context_changed {
             // Commit while editor_layout_id still points at the source profile.
             // The runtime may select another profile later in this update.
             self.commit_pending_application_layout_edits();
@@ -869,7 +881,7 @@ impl EntropyApp {
 
             let installed_presets = crate::app_discovery::installed_builtin_presets();
             let mut persist = false;
-            let (snapshot, active_layout_followed, active_layout_changed) = {
+            let (active_layout_followed, active_layout_changed) = {
                 let settings = self
                     .app_settings
                     .application_layouts
@@ -898,19 +910,27 @@ impl EntropyApp {
                     foreground_changed && focused_layout_is_configured,
                 );
                 let active_layout_changed = settings.active_layout_id != previous_active_layout_id;
-                let snapshot = settings
-                    .active_layout()
-                    .filter(|layout| connected_selected_key.as_ref() == Some(&device_key)
-                        || layout.id != crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID)
-                    // A background Default belongs to that device's live firmware,
-                    // not its saved cache and never the selected keyboard's map.
-                    // Selected Default keeps its editor reconciliation/sync path.
-                    .map(crate::application_layouts::ApplicationLayoutSnapshot::from_layout)
-                    .unwrap_or_else(
-                        crate::application_layouts::ApplicationLayoutSnapshot::inactive,
-                    );
-                (snapshot, active_layout_followed, active_layout_changed)
+                (active_layout_followed, active_layout_changed)
             };
+            if selected && active_layout_followed {
+                // Metadata can change routing or make the editor follow a profile
+                // without changing foreground identity/title. Save to the captured
+                // source layout before hiding its field or publishing the snapshot.
+                self.commit_pending_application_layout_edits();
+            }
+            let snapshot = self.app_settings.application_layouts[&device_key]
+                .active_layout()
+                .map(|layout| {
+                    // Ownership and semantic identity are separate: background
+                    // Default releases the overlay, but is still Default.
+                    if connected_selected_key.as_ref() != Some(&device_key)
+                        && layout.id == crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID {
+                        crate::application_layouts::ApplicationLayoutSnapshot::firmware_default()
+                    } else {
+                        crate::application_layouts::ApplicationLayoutSnapshot::from_layout(layout)
+                    }
+                })
+                .unwrap_or_else(crate::application_layouts::ApplicationLayoutSnapshot::inactive);
             if selected && active_layout_changed {
                 // Firmware releases held keys and starts every newly activated
                 // application layout on layer 0. Keep the independent Layout
@@ -1281,7 +1301,7 @@ mod tests {
                 macro_packets
                     .requests()
                     .iter()
-                    .any(|request| request.starts_with(packet))
+                    .any(|request| request.starts_with(if packet[0] == 0xe3 { &packet[..9] } else { packet }))
             }) {
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -1427,7 +1447,7 @@ mod tests {
         while !expected
             .packets()
             .iter()
-            .all(|packet| packets.requests().iter().any(|r| r.starts_with(packet)))
+            .all(|packet| packets.requests().iter().any(|r| r.starts_with(if packet[0] == 0xe3 { &packet[..9] } else { packet })))
         {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -1529,7 +1549,7 @@ mod tests {
                 while !expected
                     .packets()
                     .iter()
-                    .all(|packet| packets.requests().iter().any(|r| r.starts_with(packet)))
+                    .all(|packet| packets.requests().iter().any(|r| r.starts_with(if packet[0] == 0xe3 { &packet[..9] } else { packet })))
                 {
                     assert!(
                         std::time::Instant::now() < deadline,
@@ -1640,13 +1660,13 @@ mod tests {
             // External Vial edited persistent firmware to firmware_code, while
             // Entropy's saved Default is 4. The synthetic firmware boundary uses
             // its own keymap iff the production worker commits an inactive overlay.
-            let expected = crate::application_layouts::ApplicationLayoutSnapshot::inactive();
+            let expected = crate::application_layouts::ApplicationLayoutSnapshot::firmware_default();
             assert_eq!(app.qmk_hid_hosts[&macropad.path].test_application_layout_snapshot(), expected,
                 "background Default replayed saved code 4 over firmware code {firmware_code}");
             let sent_before_resend = packets.requests().len();
             let worker = app.qmk_hid_hosts.get_mut(&macropad.path).unwrap();
             worker.force_application_layout_resend();
-            while !packets.requests()[sent_before_resend..].iter().any(|p| p == expected.packets().last().unwrap()) {
+            while !packets.requests()[sent_before_resend..].iter().any(|p| p[..9] == expected.packets().last().unwrap()[..9]) {
                 assert!(std::time::Instant::now() < deadline, "inactive Default not committed");
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
@@ -1680,7 +1700,7 @@ mod tests {
             let application = app.qmk_hid_hosts[&macropad.path].test_application_layout_snapshot();
             assert!(application.active);
             let application_commit = *application.packets().last().unwrap();
-            while !packets.requests().contains(&application_commit) {
+            while !packets.requests().iter().any(|p| p[..9] == application_commit[..9]) {
                 assert!(std::time::Instant::now() < deadline, "application control not committed");
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
@@ -1695,7 +1715,7 @@ mod tests {
                 ..Default::default()
             });
             assert_eq!(app.qmk_hid_hosts[&macropad.path].test_application_layout_snapshot(), expected);
-            while !packets.requests()[return_start..].contains(expected.packets().last().unwrap()) {
+            while !packets.requests()[return_start..].iter().any(|p| p[..9] == expected.packets().last().unwrap()[..9]) {
                 assert!(std::time::Instant::now() < deadline, "return to Default not committed");
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
@@ -1788,7 +1808,7 @@ mod tests {
         let published = app.qmk_hid_hosts[&macropad.path].test_application_layout_snapshot();
         let start = packets.requests().len();
         app.qmk_hid_hosts[&macropad.path].force_application_layout_resend();
-        while !packets.requests()[start..].contains(published.packets().last().unwrap()) {
+        while !packets.requests()[start..].iter().any(|p| p[..9] == published.packets().last().unwrap()[..9]) {
             assert!(std::time::Instant::now() < deadline, "Default not committed by real worker");
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -1796,7 +1816,7 @@ mod tests {
             overlay_code.load(std::sync::atomic::Ordering::Acquire)
         } else { firmware_code };
         assert_eq!(effective_code, firmware_code, "offline cached Default masked the live firmware keymap");
-        assert_eq!(published, crate::application_layouts::ApplicationLayoutSnapshot::inactive());
+        assert_eq!(published, crate::application_layouts::ApplicationLayoutSnapshot::firmware_default());
         assert!(!packets.requests().iter().any(|p| p[0] == commit_type && p[2] != 0),
             "offline editor authorized an active cached Default");
 
@@ -1820,7 +1840,7 @@ mod tests {
         });
         let application = app.qmk_hid_hosts[&macropad.path].test_application_layout_snapshot();
         assert!(application.active);
-        while !packets.requests().contains(application.packets().last().unwrap()) {
+        while !packets.requests().iter().any(|p| p[..9] == application.packets().last().unwrap()[..9]) {
             assert!(std::time::Instant::now() < deadline, "offline application overlay not committed");
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -1834,9 +1854,9 @@ mod tests {
             },
             ..Default::default()
         });
-        let inactive = crate::application_layouts::ApplicationLayoutSnapshot::inactive();
+        let inactive = crate::application_layouts::ApplicationLayoutSnapshot::firmware_default();
         assert_eq!(app.qmk_hid_hosts[&macropad.path].test_application_layout_snapshot(), inactive);
-        while !packets.requests()[start..].contains(inactive.packets().last().unwrap()) {
+        while !packets.requests()[start..].iter().any(|p| p[..9] == inactive.packets().last().unwrap()[..9]) {
             assert!(std::time::Instant::now() < deadline, "offline return to Default not committed");
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -2353,6 +2373,260 @@ mod tests {
     }
 
     #[test]
+    fn foreground_catalog_refresh_keeps_layer_rename_open() {
+        use crate::application_layouts::{DetectedApplication, DeviceApplicationLayouts};
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        // No HID transport or host discovery thread: only the OS snapshot boundary
+        // is supplied; real egui clicks/text and the production runtime run below.
+        for nondefault in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = EntropyApp::new_inert_for_test();
+            let key = "rename-catalog-refresh".to_owned();
+            let mut settings = DeviceApplicationLayouts::default();
+            let profile = if nondefault {
+                settings.create_for_application(&DetectedApplication {
+                    executable: "calculator.exe".into(),
+                    ..Default::default()
+                })
+            } else {
+                crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID.to_owned()
+            };
+            settings.active_layout_id = profile.clone();
+            settings.editor_layout_id = profile.clone();
+            app.app_settings
+                .application_layouts
+                .insert(key.clone(), settings);
+            app.app_settings.last_application_layout_device_key = Some(key.clone());
+            app.application_layout_editor_active = true;
+            let foreground = DetectedApplication {
+                executable: "entropy.exe".into(),
+                identities: vec!["entropy.exe".into()],
+                display_name: "entropy.exe".into(),
+                window_title: "Entropy".into(),
+            };
+            app.application_layout_foreground = Some(foreground.clone());
+            // Match the production state after explicitly selecting a profile.
+            app.application_layout_manual_override = Some((key.clone(), Some(foreground.clone())));
+            let frame = |app: &mut EntropyApp, events| {
+                let _ = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1100.0, 800.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| app.draw_layout_layer_switcher_and_hints(ui, 0.0, 0.0, 52.0),
+                );
+            };
+            let pos = egui::pos2(550.0, 50.0);
+            frame(&mut app, vec![egui::Event::PointerMoved(pos)]);
+            for pressed in [true, false] {
+                frame(
+                    &mut app,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            frame(&mut app, vec![]);
+            assert_eq!(app.editing_layer, Some(0), "click must start editing");
+            // A catalog scan enriches metadata without changing focus or profile.
+            let mut refreshed = foreground;
+            refreshed.display_name = "Entropy".into();
+            app.update_application_layout_runtime_with(
+                crate::app_discovery::ApplicationDiscoverySnapshot {
+                    foreground: Some(refreshed.clone()),
+                    foreground_status: crate::app_discovery::ForegroundStatus {
+                        backend: "synthetic Win32 snapshot + catalog".into(),
+                        state: crate::app_discovery::ForegroundState::Focused(refreshed),
+                    },
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                app.application_layout_settings().unwrap().active_layout_id,
+                profile
+            );
+            assert_eq!(
+                app.editing_layer,
+                Some(0),
+                "background metadata refresh closed rename (nondefault={nondefault})"
+            );
+            frame(&mut app, vec![egui::Event::Text("New".into())]);
+            assert!(app.editing_layer_text.contains("New"));
+            let proposed = app.editing_layer_text.clone();
+            frame(
+                &mut app,
+                vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            assert!(app.editing_layer.is_none());
+            let persisted = crate::app::app_storage::load_app_settings();
+            assert_eq!(
+                persisted.application_layouts[&key].layouts[&profile].layer_names[0],
+                proposed
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_alias_profile_transition_preserves_layer_rename() {
+        metadata_transition_preserves_layer_rename(true);
+    }
+
+    #[test]
+    fn metadata_editor_follow_preserves_layer_rename() {
+        metadata_transition_preserves_layer_rename(false);
+    }
+
+    fn metadata_transition_preserves_layer_rename(alias_changes_active_profile: bool) {
+        use crate::application_layouts::{
+            DEFAULT_APPLICATION_LAYOUT_ID, DetectedApplication, DeviceApplicationLayouts,
+        };
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let ctx = egui::Context::default();
+        let mut app = EntropyApp::new_inert_for_test();
+        let key = "rename-metadata-transition".to_owned();
+        let mut settings = DeviceApplicationLayouts::default();
+        let target = settings.create_for_application(&DetectedApplication {
+            executable: "com.example.editor".into(),
+            ..Default::default()
+        });
+        let source = if alias_changes_active_profile {
+            DEFAULT_APPLICATION_LAYOUT_ID.to_owned()
+        } else {
+            target.clone()
+        };
+        settings.active_layout_id = source.clone();
+        settings.editor_layout_id = DEFAULT_APPLICATION_LAYOUT_ID.into();
+        app.app_settings
+            .application_layouts
+            .insert(key.clone(), settings);
+        app.app_settings.last_application_layout_device_key = Some(key.clone());
+        app.application_layout_editor_active = true;
+        app.selected_layer = 3;
+        let mut foreground = DetectedApplication {
+            executable: "entropy-host.exe".into(),
+            identities: vec!["entropy-host.exe".into()],
+            display_name: "entropy-host.exe".into(),
+            window_title: "Editor".into(),
+        };
+        if !alias_changes_active_profile {
+            foreground.identities.push("com.example.editor".into());
+        }
+        app.application_layout_foreground = Some(foreground.clone());
+        assert!(app.application_layout_manual_override.is_none());
+        let frame = |app: &mut EntropyApp, events| {
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1100.0, 800.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.draw_layout_layer_switcher_and_hints(ui, 0.0, 0.0, 52.0),
+            );
+        };
+        let position = egui::pos2(550.0, 50.0);
+        frame(&mut app, vec![egui::Event::PointerMoved(position)]);
+        for pressed in [true, false] {
+            frame(
+                &mut app,
+                vec![egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+        frame(&mut app, vec![]);
+        assert_eq!(app.editing_layer, Some(3));
+        assert_eq!(
+            app.editing_layer_layout_id.as_deref(),
+            Some(source.as_str())
+        );
+        frame(&mut app, vec![egui::Event::Text("Draft".into())]);
+        let draft = app.editing_layer_text.clone();
+        assert!(draft.contains("Draft"));
+        let mut refreshed = foreground.clone();
+        if alias_changes_active_profile {
+            refreshed.identities.push("com.example.editor".into());
+        } else {
+            refreshed.display_name = "Editor".into();
+        }
+        assert!(same_foreground_application(
+            Some(&foreground),
+            Some(&refreshed)
+        ));
+        app.update_application_layout_runtime_with(
+            crate::app_discovery::ApplicationDiscoverySnapshot {
+                foreground: Some(refreshed.clone()),
+                foreground_status: crate::app_discovery::ForegroundStatus {
+                    backend: "synthetic metadata snapshot".into(),
+                    state: crate::app_discovery::ForegroundState::Focused(refreshed),
+                },
+                ..Default::default()
+            },
+        );
+        let settings = app.application_layout_settings().unwrap();
+        assert_eq!(settings.active_layout_id, target);
+        assert_eq!(settings.editor_layout_id, target);
+        assert_eq!(app.selected_layer, 0);
+        assert_eq!(
+            settings.layouts[&source].layer_names[3], draft,
+            "metadata transition must commit to the captured source profile"
+        );
+        assert!(app.editing_layer.is_none());
+        assert!(app.editing_layer_layout_id.is_none());
+        frame(&mut app, vec![]);
+        // Starting the next rename must not overwrite the source draft.
+        for pressed in [true, false] {
+            frame(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert_eq!(app.editing_layer, Some(0));
+        assert_eq!(
+            app.editing_layer_layout_id.as_deref(),
+            Some(target.as_str())
+        );
+        let persisted = crate::app::app_storage::load_app_settings();
+        assert_eq!(
+            persisted.application_layouts[&key].layouts[&source].layer_names[3],
+            draft
+        );
+        assert_ne!(
+            persisted.application_layouts[&key].layouts[&target].layer_names[0],
+            draft
+        );
+    }
+
+    #[test]
     fn profile_change_commits_layer_drafts_to_the_profile_where_editing_started() {
         let ctx = egui::Context::default();
         let creation_context = eframe::CreationContext::_new_kittest(ctx);
@@ -2540,5 +2814,126 @@ mod tests {
         assert_eq!(settings.layouts[&active].layers[0][0], 0x0005);
         assert_eq!(settings.layouts[&editor].layers[0][0], 0x0004);
         assert_eq!(settings.active_layout_id, editor);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    #[ignore = "requires MACROPAD_WAKE_EXE production C/LVGL harness"]
+    fn autolayout_standby_wake_host_to_firmware() {
+        let exe = std::env::var("MACROPAD_WAKE_EXE").expect("build run_macropad_wake.py first");
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let mut app = EntropyApp::new_inert_for_test();
+        let mut device = m4cr0pad_v3_device();
+        device.path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs").to_string_lossy().into_owned();
+        app.device_manager.replace_devices(vec![device.clone()]);
+        app.selected_device = Some(0);
+        app.current_keyboard_id = Some(0x42);
+        app.current_device_name = device.name.clone();
+        app.layout = Some(indicator_test_layout());
+        mark_application_layout_protocol_supported(&mut app);
+        let (hid, packets) = crate::hid::HidDevice::test_device();
+        packets.respond_by(|request| {
+            if request[0] == 0xe6 {
+                let mut response = [0;32]; response[..3].copy_from_slice(&[0xe6,7,0x5a]);Some(Ok(response))
+            } else {None}
+        });
+        let bridge = crate::qmk_hid_host::test_start_profile_handoff_bridge(device.clone(),hid.shared_output());
+        bridge.set_selected_application_layout_support(true);
+        app.qmk_hid_hosts.insert(device.path.clone(),bridge);
+        app.shared_hid_output=hid.shared_output(); app.hid_device=Some(hid);
+        app.remember_connected_application_layout_device();
+        let key=app.application_layout_device_key().unwrap();
+        let foreground=|executable: &str| crate::application_layouts::DetectedApplication {
+            executable:executable.into(),display_name:executable.into(),..Default::default()
+        };
+        let a=foreground("wake-editor-a");let b=foreground("wake-editor-b");
+        let settings=app.app_settings.application_layouts.entry(key.clone()).or_default();
+        let aid=settings.create_for_application(&a);let bid=settings.create_for_application(&b);
+        settings.layouts.get_mut(&aid).unwrap().set_keycode(0,0,0x0010);
+        settings.layouts.get_mut(&aid).unwrap().set_keycode(0,14,0x00a9);
+        settings.layouts.get_mut(&aid).unwrap().set_keycode(0,13,0x0010);
+        // Distinct identity, identical visible names/bindings/revisions, no content heuristic.
+        let mut twin=settings.layouts[&aid].clone();twin.id=bid.clone();twin.executable=b.executable.clone();
+        settings.layouts.insert(bid,twin);
+        let mut cursor=0usize;let mut trace=String::new();
+        let mut route=|app: &mut EntropyApp, foreground: Option<crate::application_layouts::DetectedApplication>, suffix: &str, force: bool| {
+            app.update_application_layout_runtime_with(crate::app_discovery::ApplicationDiscoverySnapshot {
+                foreground:foreground.clone(),foreground_status:crate::app_discovery::ForegroundStatus {
+                    backend:"injected OS".into(),state:foreground.map(crate::app_discovery::ForegroundState::Focused).unwrap_or(crate::app_discovery::ForegroundState::NoFocusedWindow),
+                },..Default::default()
+            });
+            if force {app.qmk_hid_hosts[&device.path].force_application_layout_resend();}
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(4);
+            loop {
+                let requests=packets.requests();
+                if let Some(end)=requests[cursor..].iter().position(|p|p[0]==0xe3) {
+                    for p in &requests[cursor..=cursor+end] {
+                        if matches!(p[0],0xe1..=0xe5|0xe7..=0xea) {
+                            trace.push('P');for byte in &p[..32] {trace.push_str(&format!(" {byte:02x}"));}trace.push('\n');
+                        }
+                    }
+                    cursor+=end+1;break
+                }
+                assert!(std::time::Instant::now()<deadline,"worker must commit semantic profile transition");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            trace.push_str(suffix);
+            if suffix == "N\n" {
+                // Capture an actual worker heartbeat, not a hand-built packet.
+                let deadline = std::time::Instant::now()+std::time::Duration::from_secs(3);
+                loop {
+                    let requests=packets.requests();
+                    if let Some(p)=requests[cursor..].iter().find(|p|p[0]==0xe5) {
+                        trace.push('P');for byte in &p[..32] {trace.push_str(&format!(" {byte:02x}"));}trace.push_str("\nN\n");
+                        cursor=requests.len();break;
+                    }
+                    assert!(std::time::Instant::now()<deadline,"worker heartbeat missing");
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            if let Ok(path)=std::env::var("MACROPAD_WAKE_TRACE") {std::fs::write(path,&trace).unwrap();}
+            use std::io::Write;
+            let mut child=std::process::Command::new(&exe).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+            child.stdin.take().unwrap().write_all(trace.as_bytes()).unwrap();
+            let output=child.wait_with_output().unwrap();
+            println!("{}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+            assert!(output.status.success(),"production firmware standby regression: {}",output.status);
+        };
+        // Establish initial state, then sleep before the reported transition.
+        route(&mut app,None,"S\n",true);
+        route(&mut app,Some(a.clone()),"W\nS\n",false);
+        // Repeated full synchronizations must not reset standby.
+        route(&mut app,Some(a.clone()),"N\n",true);
+        route(&mut app,Some(b.clone()),"W\nS\n",false);
+        let active=app.app_settings.application_layouts.get_mut(&key).unwrap().active_layout_id.clone();
+        let edited=app.app_settings.application_layouts.get_mut(&key).unwrap().layouts.get_mut(&active).unwrap();
+        edited.name.push_str(" renamed");edited.bump_revision();
+        route(&mut app,Some(b.clone()),"N\n",false);
+        route(&mut app,None,"W\nS\nD\n",false);
+        route(&mut app,Some(a.clone()),"N\nE\nN\nR\nV\nK\nS\nX\n",false);
+        route(&mut app,Some(b.clone()),"W\nS\nO\n",true);
+        route(&mut app,Some(a.clone()),"F\nK\nS\n",false);
+        // UI selection changes ownership, not the foreground's Default identity.
+        route(&mut app,None,"W\nS\n",false);
+        app.selected_device=None;
+        route(&mut app,None,"N\n",true);
+        let background = app.qmk_hid_hosts[&device.path].test_application_layout_snapshot();
+        assert!(!background.active, "no authority to replay a cached firmware Default");
+        assert_eq!(background.profile_id.as_deref(),Some(crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID),"background Default must retain semantic identity");
+        app.selected_device=Some(0);
+        route(&mut app,None,"N\n",true);
+        app.selected_device=None;
+        route(&mut app,Some(a),"W\nG\n",false);
+        route(&mut app,Some(b.clone()),"Z\n",false);
+        // A real application -> background firmware-owned Default must wake.
+        route(&mut app,None,"W\nS\nT\n",false);
+        route(&mut app,Some(b),"W\nY\n",false);
+        drop(route);
+        if let Ok(path)=std::env::var("MACROPAD_WAKE_TRACE") {std::fs::write(path,&trace).unwrap();}
+        use std::io::Write;
+        let mut child=std::process::Command::new(exe).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(trace.as_bytes()).unwrap();
+        let output=child.wait_with_output().unwrap();
+        println!("{}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success(),"production firmware standby regression: {}",output.status);
     }
 }

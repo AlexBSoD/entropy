@@ -23,8 +23,8 @@ pub(crate) const COMBO_COLOR_SEED_PALETTE: [u32; 16] = [
 ];
 
 use super::typing_trainer_symbols::{
-    record_symbol_attempt, weighted_symbol_text, TypingTrainerCharacterStatsMap,
-    TYPING_TRAINER_SYMBOL_COUNTS,
+    TYPING_TRAINER_SYMBOL_COUNTS, TypingTrainerCharacterStatsMap, record_symbol_attempt,
+    weighted_symbol_text,
 };
 use super::*;
 
@@ -2521,6 +2521,24 @@ pub(crate) const DATE_DEFAULT: [u8; 15] =
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DisplaySettingsState {
+    pub(crate) sm62_supported: bool,
+    pub(crate) sm62_values: [u8; 10],
+    pub(crate) confirmed_sm62_values: [u8; 10],
+    pub(crate) sm62_stars_supported: bool,
+    pub(crate) sm62_stars_values: [u8; 2],
+    pub(crate) confirmed_sm62_stars_values: [u8; 2],
+    pub(crate) sm62_screens_off_supported: bool,
+    pub(crate) sm62_screens_off_values: [u8; 2],
+    pub(crate) confirmed_sm62_screens_off_values: [u8; 2],
+    pub(crate) sm62_language_supported: bool,
+    pub(crate) sm62_language_values: [u8; 2],
+    pub(crate) confirmed_sm62_language_values: [u8; 2],
+    pub(crate) sm62_date_supported: bool,
+    pub(crate) sm62_hold_supported: bool,
+    pub(crate) sm62_hold_ms: [u16; 2],
+    pub(crate) confirmed_sm62_hold_ms: [u16; 2],
+    pub(crate) sm62_date_values: [u8; 2],
+    pub(crate) confirmed_sm62_date_values: [u8; 2],
     pub(crate) date_supported: bool,
     pub(crate) standby_controls_supported: bool,
     pub(crate) date: [u8; 15],
@@ -2596,6 +2614,7 @@ pub(crate) struct DisplaySettingsState {
     pub(crate) clock_colon_blink_supported: bool,
     pub(crate) clock_colon_blink: bool,
     pub(crate) confirmed_clock_colon_blink: bool,
+    pub(crate) display_timeout_supported: bool,
     pub(crate) display_timeout: u8,
     pub(crate) confirmed_display_timeout: u8,
     #[cfg(not(target_arch = "wasm32"))]
@@ -2605,6 +2624,24 @@ pub(crate) struct DisplaySettingsState {
 impl Default for DisplaySettingsState {
     fn default() -> Self {
         Self {
+            sm62_supported: false,
+            sm62_values: [0, 0, 20, 1, 1, 2, 1, 20, 1, 1],
+            confirmed_sm62_values: [0, 0, 20, 1, 1, 2, 1, 20, 1, 1],
+            sm62_stars_supported: false,
+            sm62_stars_values: [1, 1],
+            confirmed_sm62_stars_values: [1, 1],
+            sm62_screens_off_supported: false,
+            sm62_screens_off_values: [0, 0],
+            confirmed_sm62_screens_off_values: [0, 0],
+            sm62_language_supported: false,
+            sm62_language_values: [1, 1],
+            confirmed_sm62_language_values: [1, 1],
+            sm62_date_supported: false,
+            sm62_hold_supported: false,
+            sm62_hold_ms: [200; 2],
+            confirmed_sm62_hold_ms: [200; 2],
+            sm62_date_values: [1, 1],
+            confirmed_sm62_date_values: [1, 1],
             date_supported: false,
             standby_controls_supported: false,
             date: DATE_DEFAULT,
@@ -2680,6 +2717,7 @@ impl Default for DisplaySettingsState {
             clock_colon_blink_supported: false,
             clock_colon_blink: false,
             confirmed_clock_colon_blink: false,
+            display_timeout_supported: false,
             display_timeout: 4,
             confirmed_display_timeout: 4,
             #[cfg(not(target_arch = "wasm32"))]
@@ -2706,6 +2744,57 @@ pub(crate) fn load_display_settings(
     dev_conn: &crate::hid::HidDevice,
     supported_qmk_settings: &[u16],
 ) -> anyhow::Result<DisplaySettingsState> {
+    if (230..=239).all(|qsid| supported_qmk_settings.contains(&qsid)) {
+        let mut state = DisplaySettingsState::default();
+        state.sm62_supported = true;
+        state.supported = true;
+        state.display_timeout_supported = supported_qmk_settings.contains(&DISPLAY_TIMEOUT_QSID);
+        if state.display_timeout_supported {
+            let timeout = read_display_setting_u8(dev_conn, DISPLAY_TIMEOUT_QSID)?;
+            anyhow::ensure!(timeout <= 7, "Invalid SM62 display timeout index: {timeout}");
+            state.display_timeout = timeout;
+            state.confirmed_display_timeout = timeout;
+        }
+        for (index, qsid) in (230..=239).enumerate() {
+            state.sm62_values[index] = read_display_setting_u8(dev_conn, qsid)?;
+        }
+        state.confirmed_sm62_values = state.sm62_values;
+        state.sm62_stars_supported = [246, 247].iter().all(|q| supported_qmk_settings.contains(q));
+        state.sm62_screens_off_supported = [248, 249].iter().all(|q| supported_qmk_settings.contains(q));
+        if state.sm62_stars_supported {
+            for side in 0..2 { state.sm62_stars_values[side] = read_display_setting_u8(dev_conn, 246 + side as u16)?; }
+            state.confirmed_sm62_stars_values = state.sm62_stars_values;
+        }
+        if state.sm62_screens_off_supported {
+            for side in 0..2 { state.sm62_screens_off_values[side] = read_display_setting_u8(dev_conn, 248 + side as u16)?; }
+            state.confirmed_sm62_screens_off_values = state.sm62_screens_off_values;
+        }
+        state.sm62_language_supported = [244, 245].iter().all(|qsid| supported_qmk_settings.contains(qsid));
+        if state.sm62_language_supported {
+            for (side, qsid) in [244, 245].iter().enumerate() {
+                state.sm62_language_values[side] = read_display_setting_u8(dev_conn, *qsid)?;
+            }
+            state.confirmed_sm62_language_values = state.sm62_language_values;
+        }
+        state.sm62_date_supported = [240, 241].iter().all(|qsid| supported_qmk_settings.contains(qsid));
+        if state.sm62_date_supported {
+            for (side, qsid) in [240, 241].iter().enumerate() {
+                state.sm62_date_values[side] = read_display_setting_u8(dev_conn, *qsid)?;
+            }
+            state.confirmed_sm62_date_values = state.sm62_date_values;
+        }
+        if [242, 243].iter().all(|qsid| supported_qmk_settings.contains(qsid)) {
+            let hold = [242, 243].map(|qsid| dev_conn.get_qmk_setting_u16(qsid));
+            if let [Ok(left), Ok(right)] = hold {
+                if left <= 10_000 && right <= 10_000 {
+                    state.sm62_hold_supported = true;
+                    state.sm62_hold_ms = [left, right];
+                    state.confirmed_sm62_hold_ms = [left, right];
+                }
+            }
+        }
+        return Ok(state);
+    }
     if !DISPLAY_COLOR_QSIDS
         .iter()
         .all(|qsid| supported_qmk_settings.contains(qsid))
@@ -2930,6 +3019,24 @@ pub(crate) fn load_display_settings(
         }
     }
     let mut state = DisplaySettingsState {
+        sm62_supported: false,
+        sm62_values: [0, 0, 20, 1, 1, 2, 1, 20, 1, 1],
+        confirmed_sm62_values: [0, 0, 20, 1, 1, 2, 1, 20, 1, 1],
+        sm62_stars_supported: false,
+            sm62_stars_values: [1, 1],
+            confirmed_sm62_stars_values: [1, 1],
+            sm62_screens_off_supported: false,
+            sm62_screens_off_values: [0, 0],
+            confirmed_sm62_screens_off_values: [0, 0],
+            sm62_language_supported: false,
+            sm62_language_values: [1, 1],
+            confirmed_sm62_language_values: [1, 1],
+            sm62_date_supported: false,
+        sm62_hold_supported: false,
+        sm62_hold_ms: [200; 2],
+        confirmed_sm62_hold_ms: [200; 2],
+        sm62_date_values: [1, 1],
+        confirmed_sm62_date_values: [1, 1],
         date_supported,
         standby_controls_supported: DATE_QSIDS
             .iter()
@@ -3009,6 +3116,7 @@ pub(crate) fn load_display_settings(
         confirmed_clock_colon_blink: clock_colon_blink,
         display_timeout,
         confirmed_display_timeout: display_timeout,
+        display_timeout_supported: clock_settings_supported,
         #[cfg(not(target_arch = "wasm32"))]
         pictograms: PictogramSettingsState::default(),
     };
@@ -3027,6 +3135,67 @@ pub(crate) fn load_display_settings(
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod display_settings_load_tests {
     use super::*;
+
+    #[test]
+    fn sm62_timeout_loads_saved_index_without_generic_clock_bundle() {
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        hid.set_qmk_setting_u8(DISPLAY_TIMEOUT_QSID, 6).unwrap();
+        let qsids: Vec<_> = (230..=249).chain([DISPLAY_TIMEOUT_QSID]).collect();
+        let state = load_display_settings(&hid, &qsids).unwrap();
+        assert_eq!(state.display_timeout, 6);
+        assert_eq!(state.confirmed_display_timeout, 6);
+        assert!(!state.clock_settings_supported);
+        assert!(!recorder.requests().is_empty());
+    }
+
+    #[test]
+    fn sm62_defaults_layout_hold_to_200ms_on_both_halves() {
+        let state = DisplaySettingsState::default();
+        assert_eq!(state.sm62_hold_ms, [200; 2]);
+        assert_eq!(state.confirmed_sm62_hold_ms, [200; 2]);
+        let (hid, _) = crate::hid::HidDevice::test_device();
+        let state = load_display_settings(&hid, &(230..=239).collect::<Vec<_>>()).unwrap();
+        assert_eq!(state.sm62_hold_ms, [200; 2]);
+        assert!(!state.sm62_hold_supported);
+    }
+
+    #[test]
+    fn sm62_reads_independent_left_and_right_display_settings() {
+        let (hid, _) = crate::hid::HidDevice::test_device();
+        let expected = [0, 0, 20, 1, 1, 2, 1, 45, 0, 0];
+        for (index, value) in expected.iter().enumerate() {
+            hid.set_qmk_setting_u8(230 + index as u16, *value).unwrap();
+        }
+        hid.set_qmk_setting_u8(240, 1).unwrap();
+        hid.set_qmk_setting_u8(241, 0).unwrap();
+        hid.set_qmk_setting_u16(242, 125).unwrap();
+        hid.set_qmk_setting_u16(243, 2_500).unwrap();
+        hid.set_qmk_setting_u8(244, 0).unwrap();
+        hid.set_qmk_setting_u8(245, 1).unwrap();
+        hid.set_qmk_setting_u8(246, 0).unwrap();
+        hid.set_qmk_setting_u8(247, 1).unwrap();
+        hid.set_qmk_setting_u8(248, 1).unwrap();
+        hid.set_qmk_setting_u8(249, 0).unwrap();
+        let mut qsids: Vec<u16> = (230..=239).collect();
+        qsids.extend([240, 241, 242, 243, 244, 245, 246, 247, 248, 249]);
+        let state = load_display_settings(&hid, &qsids).unwrap();
+        assert!(state.sm62_supported);
+        assert!(state.sm62_date_supported);
+        assert!(state.supported);
+        assert_eq!(state.sm62_values, expected);
+        assert_eq!(state.confirmed_sm62_values, expected);
+        assert_eq!(state.sm62_date_values, [1, 0]);
+        assert_eq!(state.confirmed_sm62_date_values, [1, 0]);
+        assert!(state.sm62_hold_supported);
+        assert_eq!(state.sm62_hold_ms, [125, 2_500]);
+        assert_eq!(state.confirmed_sm62_hold_ms, [125, 2_500]);
+        assert!(state.sm62_language_supported);
+        assert_eq!(state.sm62_language_values, [0, 1]);
+        assert_eq!(state.confirmed_sm62_language_values, [0, 1]);
+        assert!(state.sm62_stars_supported && state.sm62_screens_off_supported);
+        assert_eq!(state.sm62_stars_values,[0,1]); assert_eq!(state.confirmed_sm62_stars_values,[0,1]);
+        assert_eq!(state.sm62_screens_off_values,[1,0]); assert_eq!(state.confirmed_sm62_screens_off_values,[1,0]);
+    }
 
     #[test]
     fn first_transport_timeout_stops_the_display_batch() {
@@ -3264,6 +3433,12 @@ pub(crate) fn is_alt_repeat_keycode(kc: u16) -> bool {
 
 #[derive(Clone, Debug)]
 pub(super) enum UndoAction {
+    ApplicationLayoutLayer {
+        device_key: String,
+        layout_id: String,
+        layer: usize,
+        old_keycodes: [u16; crate::application_layouts::APPLICATION_LAYOUT_CONTROL_COUNT],
+    },
     ApplicationLayoutControl {
         device_key: String,
         layout_id: String,
@@ -3374,7 +3549,7 @@ pub(crate) const TYPING_TRAINER_DURATIONS: [u32; 4] = [15, 30, 60, 120];
 pub(crate) const TYPING_TRAINER_WORD_COUNTS: [usize; 4] = [10, 25, 50, 100];
 pub(crate) const TYPING_TRAINER_HISTORY_LIMIT: usize = 20;
 const TYPING_TRAINER_DEFAULT_TEXT_WORDS: usize = 72;
-pub(crate) use super::typing_trainer_words::{TypingTrainerLanguage, TYPING_TRAINER_LANGUAGES};
+pub(crate) use super::typing_trainer_words::{TYPING_TRAINER_LANGUAGES, TypingTrainerLanguage};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -4942,10 +5117,12 @@ mod typing_trainer_tests {
         state.set_language(TypingTrainerLanguage::Russian);
 
         assert_eq!(state.language, TypingTrainerLanguage::Russian);
-        assert!(state
-            .target_text
-            .chars()
-            .any(|ch| ('а'..='я').contains(&ch)));
+        assert!(
+            state
+                .target_text
+                .chars()
+                .any(|ch| ('а'..='я').contains(&ch))
+        );
         assert!(!state.target_text.chars().any(|ch| ch.is_ascii_alphabetic()));
     }
 
@@ -4981,10 +5158,12 @@ mod typing_trainer_tests {
 
         state.set_punctuation_enabled(true);
         assert!(state.punctuation_enabled);
-        assert!(state
-            .target_text
-            .chars()
-            .any(|ch| ch.is_ascii_punctuation()));
+        assert!(
+            state
+                .target_text
+                .chars()
+                .any(|ch| ch.is_ascii_punctuation())
+        );
 
         state.set_numbers_enabled(true);
         assert!(state.numbers_enabled);

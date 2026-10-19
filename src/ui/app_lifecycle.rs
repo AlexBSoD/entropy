@@ -119,6 +119,26 @@ fn connection_replaces_layout_canvas(connect_state: &ConnectState, layout_loaded
 }
 
 impl EntropyApp {
+    /// Shared ownership gate for shortcuts on pages behind app modals.
+    pub(super) fn modal_or_popup_open(&self, ctx: &egui::Context) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        let import_pending = self.import_pending();
+        #[cfg(target_arch = "wasm32")]
+        let import_pending = false;
+        self.application_categories_open
+            || self.application_picker_open
+            || self.text_expander_rule_editor.is_some()
+            || self.keycode_picker.open
+            || self.unlock_open
+            || self.vial_unlock_polling
+            || self.close_to_tray_prompt_open
+            || self.import_report_open
+            || self.typing_trainer_history_open
+            || import_pending
+            || self.top_dropdown_open(ctx)
+            || egui::Popup::is_any_open(ctx)
+    }
+
     fn maybe_open_macro_unlock_preflight(&mut self) {
         if !self.keycode_picker.open || self.keycode_picker.selected_tab != KeycodeTab::Macro {
             self.macro_auto_unlock_cancelled = false;
@@ -1420,22 +1440,7 @@ impl eframe::App for EntropyApp {
         self.tour_target_rects.clear();
 
         let keyboard_input_wanted_at_frame_start = ctx.egui_wants_keyboard_input();
-        #[cfg(not(target_arch = "wasm32"))]
-        let import_pending_at_frame_start = self.import_pending();
-        #[cfg(target_arch = "wasm32")]
-        let import_pending_at_frame_start = false;
-        let modal_or_popup_open_at_frame_start = self.application_categories_open
-            || self.application_picker_open
-            || self.text_expander_rule_editor.is_some()
-            || self.keycode_picker.open
-            || self.unlock_open
-            || self.vial_unlock_polling
-            || self.close_to_tray_prompt_open
-            || self.import_report_open
-            || self.typing_trainer_history_open
-            || import_pending_at_frame_start
-            || self.top_dropdown_open(ctx)
-            || egui::Popup::is_any_open(ctx);
+        let modal_or_popup_open_at_frame_start = self.modal_or_popup_open(ctx);
 
         // Auto-scan for device connect/disconnect changes.
         self.secondary_click_handled = false;

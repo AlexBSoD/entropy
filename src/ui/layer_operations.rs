@@ -397,6 +397,17 @@ struct LayerWriteContext {
     total: usize,
     undo_behavior: LayerUndoBehavior,
     is_default_layout_sync: bool,
+    default_target: Option<DefaultLayerWriteTarget>,
+}
+
+// Bind completion to the profile and control mapping present when the write
+// started, not whichever application/device happens to be selected on completion.
+#[cfg(not(target_arch = "wasm32"))]
+struct DefaultLayerWriteTarget {
+    device_key: String,
+    before: [u16; crate::application_layouts::APPLICATION_LAYOUT_CONTROL_COUNT],
+    key_controls: Vec<Option<usize>>,
+    encoder_controls: Vec<Option<usize>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -524,6 +535,10 @@ impl EntropyApp {
             .into();
             return;
         };
+        let rendered = self
+            .application_layouts_supported()
+            .then(|| self.application_layout_rendered_copy(layout));
+        let layout = rendered.as_ref().unwrap_or(layout);
         let Some(clipboard) = capture_clipboard(layout, self.selected_layer) else {
             self.status_msg = crate::i18n::tr_catalog(
                 self.app_settings.language,
@@ -546,10 +561,25 @@ impl EntropyApp {
         self.apply_layer_snapshot(self.selected_layer, desired, "layer_actions.paste");
     }
 
+    fn layer_operation_source(&self) -> Option<KeyboardLayout> {
+        let layout = self.layout.as_ref()?;
+        let profile_selected = self.application_layout_editor_active
+            && self.application_layouts_supported()
+            && self.application_layout_settings().is_some_and(|settings| {
+                settings.active_layout_id
+                    != crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID
+            });
+        Some(if profile_selected {
+            self.application_layout_rendered_copy(layout)
+        } else {
+            layout.clone()
+        })
+    }
+
     fn fill_selected_layer(&mut self, keycode: u16) {
         let target_layer = self.selected_layer;
         let desired = self
-            .layout
+            .layer_operation_source()
             .as_ref()
             .and_then(|layout| filled_layer_snapshot(layout, target_layer, keycode));
         let Some(desired) = desired else {
@@ -566,7 +596,7 @@ impl EntropyApp {
 
     fn mirror_selected_layer(&mut self, mapping: &[usize]) {
         let desired = self
-            .layout
+            .layer_operation_source()
             .as_ref()
             .ok_or(LayerOperationError::MissingLayer)
             .and_then(|layout| {
@@ -607,8 +637,13 @@ impl EntropyApp {
         menu_width: f32,
     ) -> bool {
         let language = self.app_settings.language;
-        let [copy_label, paste_label, mirror_label, fill_none_label, fill_inherit_label] =
-            layer_operation_menu_labels(language);
+        let [
+            copy_label,
+            paste_label,
+            mirror_label,
+            fill_none_label,
+            fill_inherit_label,
+        ] = layer_operation_menu_labels(language);
         let paste_snapshot = self.layer_paste_snapshot();
         let mirror_mapping = self
             .layout
@@ -756,12 +791,113 @@ impl EntropyApp {
         }
     }
 
+    // Application profiles live in host settings, not in the firmware-owned
+    // Default keymap. Route the complete operation before borrowing a HID owner.
+    fn apply_application_profile_layer_snapshot(
+        &mut self,
+        layer: usize,
+        desired: &LayerSnapshot,
+        action_key: &'static str,
+    ) -> bool {
+        use crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID;
+        if action_key == "layer_actions.save_default_to_device"
+            || !self.application_layout_editor_active
+            || !self.application_layouts_supported()
+        {
+            return false;
+        }
+        let Some(settings) = self.application_layout_settings() else {
+            return false;
+        };
+        let layout_id = settings.active_layout_id.clone();
+        if layout_id == DEFAULT_APPLICATION_LAYOUT_ID {
+            return false;
+        }
+        let Some(device_key) = self.application_layout_device_key() else {
+            return true;
+        };
+        let Some(layout) = self.layout.as_ref() else {
+            return true;
+        };
+        if desired.keycodes.len() != layout.keys.len()
+            || desired.encoder_keycodes.len() != layout.encoders.len()
+        {
+            self.report_layer_operation_error(LayerOperationError::IncompatibleGeometry);
+            return true;
+        }
+        let updates =
+            desired
+                .keycodes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, binding)| {
+                    Self::application_control_for_key(layout, index)
+                        .map(|control| (control, binding.vial_keycode()))
+                })
+                .chain(desired.encoder_keycodes.iter().enumerate().filter_map(
+                    |(index, keycode)| {
+                        Self::application_control_for_encoder(layout, index)
+                            .map(|control| (control, *keycode))
+                    },
+                ))
+                .collect::<Vec<_>>();
+        let Some(profile) = self
+            .app_settings
+            .application_layouts
+            .get_mut(&device_key)
+            .and_then(|settings| settings.layouts.get_mut(&layout_id))
+        else {
+            return true;
+        };
+        let Some(old_keycodes) = profile.layers.get(layer).copied() else {
+            return true;
+        };
+        let mut count = 0;
+        for (control, keycode) in updates {
+            if profile.set_keycode(layer, control, keycode) {
+                count += 1;
+            }
+        }
+        let changed = count != 0;
+        let count = count.to_string();
+        if changed {
+            self.undo_stack.push(UndoAction::ApplicationLayoutLayer {
+                device_key,
+                layout_id,
+                layer,
+                old_keycodes,
+            });
+            save_app_settings(&self.app_settings);
+            self.refresh_layer_picker_content_flags();
+        }
+        self.status_msg = crate::i18n::tr_catalog_format(
+            self.app_settings.language,
+            if changed {
+                "layer_actions.saved_status"
+            } else {
+                "layer_actions.no_changes"
+            },
+            &[
+                ("layer", &layer.to_string()),
+                ("count", &count),
+                (
+                    "action",
+                    crate::i18n::tr_catalog(self.app_settings.language, action_key),
+                ),
+            ],
+        );
+        true
+    }
+
     pub(super) fn apply_layer_snapshot(
         &mut self,
         layer: usize,
         desired: LayerSnapshot,
         action_key: &'static str,
     ) {
+        if self.apply_application_profile_layer_snapshot(layer, &desired, action_key) {
+            return;
+        }
         #[cfg(not(target_arch = "wasm32"))]
         self.apply_layer_snapshot_with_behavior(
             layer,
@@ -787,6 +923,84 @@ impl EntropyApp {
             "layer_actions.undo",
             LayerUndoBehavior::RetryDesired { requires_firmware },
         );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn default_layer_write_target(&self, layer: usize) -> Option<DefaultLayerWriteTarget> {
+        let device_key = self.application_layout_device_key()?;
+        let profile = self
+            .app_settings
+            .application_layouts
+            .get(&device_key)?
+            .layouts
+            .get(crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID)?;
+        let layout = self.layout.as_ref()?;
+        Some(DefaultLayerWriteTarget {
+            device_key,
+            before: *profile.layers.get(layer)?,
+            key_controls: (0..layout.keys.len())
+                .map(|i| Self::application_control_for_key(layout, i))
+                .collect(),
+            encoder_controls: (0..layout.encoders.len())
+                .map(|i| Self::application_control_for_encoder(layout, i))
+                .collect(),
+        })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn reconcile_layer_write_default(
+        &mut self,
+        target: Option<&DefaultLayerWriteTarget>,
+        layer: usize,
+        key_updates: &[(usize, crate::keyboard::KeyBinding)],
+        encoder_updates: &[(usize, u16)],
+    ) {
+        let Some(target) = target else {
+            return;
+        };
+        let Some(profile) = self
+            .app_settings
+            .application_layouts
+            .get_mut(&target.device_key)
+            .and_then(|s| {
+                s.layouts
+                    .get_mut(crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID)
+            })
+        else {
+            return;
+        };
+        let mut changed = false;
+        for (control, keycode) in key_updates
+            .iter()
+            .filter_map(|(i, binding)| {
+                target
+                    .key_controls
+                    .get(*i)
+                    .copied()
+                    .flatten()
+                    .map(|c| (c, binding.vial_keycode()))
+            })
+            .chain(encoder_updates.iter().filter_map(|(i, code)| {
+                target
+                    .encoder_controls
+                    .get(*i)
+                    .copied()
+                    .flatten()
+                    .map(|c| (c, *code))
+            }))
+        {
+            // An edit made while the HID owner was borrowed remains authoritative.
+            if profile
+                .layers
+                .get(layer)
+                .is_some_and(|codes| codes[control] == target.before[control])
+            {
+                changed |= profile.set_keycode(layer, control, keycode);
+            }
+        }
+        if changed {
+            save_app_settings(&self.app_settings);
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -863,10 +1077,57 @@ impl EntropyApp {
                     .map(|encoder| (idx, encoder.encoder_idx, encoder.direction, keycode))
             })
             .collect();
+        let is_default_layout_sync = action_key == "layer_actions.save_default_to_device";
+        let default_target = (!is_default_layout_sync)
+            .then(|| self.default_layer_write_target(layer))
+            .flatten();
+        // Undo restores what Default displayed, which can include pending edits.
+        let undo_old = default_target
+            .as_ref()
+            .map(|target| {
+                let profile = &self.app_settings.application_layouts[&target.device_key].layouts
+                    [crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID];
+                capture_layer(
+                    &Self::application_layout_rendered_copy_for_profile(layout, Some(profile)),
+                    layer,
+                )
+                .unwrap()
+            })
+            .unwrap_or_else(|| old.clone());
+        // Values already equal in firmware are confirmed without another write.
+        let unchanged_keys = desired
+            .keycodes
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(i, code)| old.keycodes.get(*i) == Some(code))
+            .collect::<Vec<_>>();
+        let unchanged_encoders = desired
+            .encoder_keycodes
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(i, code)| old.encoder_keycodes.get(*i) == Some(code))
+            .collect::<Vec<_>>();
         let total = key_changes.len() + encoder_changes.len();
         let action = crate::i18n::tr_catalog(self.app_settings.language, action_key).to_owned();
         let layer_text = layer.to_string();
         if total == 0 {
+            let profile_changed = undo_old != desired;
+            self.reconcile_layer_write_default(
+                default_target.as_ref(),
+                layer,
+                &unchanged_keys,
+                &unchanged_encoders,
+            );
+            if profile_changed && matches!(undo_behavior, LayerUndoBehavior::RecordOld) {
+                self.undo_stack.push(UndoAction::Layer {
+                    layer,
+                    old: undo_old,
+                    requires_firmware: false,
+                });
+            }
+            self.refresh_layer_picker_content_flags();
             self.status_msg = crate::i18n::tr_catalog_format(
                 self.app_settings.language,
                 "layer_actions.no_changes",
@@ -910,10 +1171,22 @@ impl EntropyApp {
             if matches!(undo_behavior, LayerUndoBehavior::RecordOld) {
                 self.undo_stack.push(UndoAction::Layer {
                     layer,
-                    old,
+                    old: undo_old,
                     requires_firmware: false,
                 });
             }
+            self.reconcile_layer_write_default(
+                default_target.as_ref(),
+                layer,
+                &key_updates,
+                &encoder_updates,
+            );
+            self.reconcile_layer_write_default(
+                default_target.as_ref(),
+                layer,
+                &unchanged_keys,
+                &unchanged_encoders,
+            );
             self.refresh_layer_picker_content_flags();
             self.status_msg = crate::i18n::tr_catalog_format(
                 self.app_settings.language,
@@ -944,12 +1217,13 @@ impl EntropyApp {
         };
         let context = LayerWriteContext {
             layer,
-            old,
+            old: undo_old,
             desired,
             action,
             total,
             undo_behavior,
-            is_default_layout_sync: action_key == "layer_actions.save_default_to_device",
+            is_default_layout_sync,
+            default_target,
         };
         let (sender, receiver) = std::sync::mpsc::channel();
         let layer_u8 = layer as u8;
@@ -957,7 +1231,7 @@ impl EntropyApp {
             #[cfg(target_os = "macos")]
             let _hid_lock = hid_device.macos_hid_operation_lock();
 
-            let progress = run_layer_writes(
+            let mut progress = run_layer_writes(
                 &key_changes,
                 &encoder_changes,
                 |row, col, binding| match binding {
@@ -984,6 +1258,10 @@ impl EntropyApp {
                         .map_err(|error| error.to_string())
                 },
             );
+            if context.default_target.is_some() {
+                progress.key_updates.extend(unchanged_keys);
+                progress.encoder_updates.extend(unchanged_encoders);
+            }
             let hid_device = if progress.disconnect {
                 None
             } else {
@@ -1088,8 +1366,26 @@ impl EntropyApp {
             );
         }
 
-        let touched =
-            !result.progress.key_updates.is_empty() || !result.progress.encoder_updates.is_empty();
+        self.reconcile_layer_write_default(
+            result.context.default_target.as_ref(),
+            result.context.layer,
+            &result.progress.key_updates,
+            &result.progress.encoder_updates,
+        );
+        let touched = if result.context.default_target.is_some() {
+            result
+                .progress
+                .key_updates
+                .iter()
+                .any(|(i, code)| result.context.old.keycodes.get(*i) != Some(code))
+                || result
+                    .progress
+                    .encoder_updates
+                    .iter()
+                    .any(|(i, code)| result.context.old.encoder_keycodes.get(*i) != Some(code))
+        } else {
+            !result.progress.key_updates.is_empty() || !result.progress.encoder_updates.is_empty()
+        };
         let failed = result.progress.error.is_some();
         if let Some((old, requires_firmware)) =
             undo_after_layer_write(&result.context, touched, failed)
@@ -1271,6 +1567,720 @@ mod tests {
             firmware: FirmwareProtocol::Vial,
             live_features: Default::default(),
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn macropad_fixture() -> (EntropyApp, crate::hid::TestHidRecorder, egui::Context) {
+        let ctx = egui::Context::default();
+        let mut app = EntropyApp::new_inert_for_test();
+        let device = crate::device::Device {
+            name: "M4CR0Pad v3".into(),
+            vendor_id: 0xe126,
+            product_id: 0x0042,
+            manufacturer: "Ergohaven".into(),
+            serial_number: "layer-paste-test".into(),
+            bus_type: "Usb".into(),
+            path: "inert-layer-paste".into(),
+            instance_token: "layer-paste-test".into(),
+            firmware: FirmwareProtocol::Vial,
+        };
+        app.device_about_info = Some(DeviceAboutInfo {
+            supports_application_layouts: true,
+            vendor_id: device.vendor_id,
+            product_id: device.product_id,
+            path: device.path.clone(),
+            ..Default::default()
+        });
+        app.device_manager.replace_devices(vec![device]);
+        app.selected_device = Some(0);
+        app.current_keyboard_id = Some(42);
+        // The Macropad definition used by production connection/geometry tests:
+        // 12 keys, encoder press and both directions in visual storage order.
+        let mut board = KeyboardLayout::from_vial_json(&serde_json::json!({
+            "name": "M4CR0Pad v3", "matrix": { "rows": 5, "cols": 3 },
+            "layouts": { "keymap": [
+                [{ "x": 1.25 }, "1,0", "1,1", "1,2"],
+                ["0,1\n\n\n\n\n\n\n\n\ne", { "x": 0.25 }, "2,0", "2,1", "2,2"],
+                ["0,2", { "x": 0.25 }, "3,0", "3,1", "3,2"],
+                ["0,0\n\n\n\n\n\n\n\n\ne", { "x": 0.25 }, "4,0", "4,1", "4,2"]
+            ] }
+        }))
+        .unwrap();
+        assert_eq!(board.keys.len(), 13);
+        assert_eq!(board.encoders.len(), 2);
+        board.layers = vec![bindings(&[4; 13]), bindings(&[5; 13])];
+        board.encoder_layers = vec![vec![6, 7], vec![8, 9]];
+        let key = app.application_layout_device_key().unwrap();
+        let mut settings = crate::application_layouts::DeviceApplicationLayouts::default();
+        settings.create_for_application(&crate::application_layouts::DetectedApplication {
+            executable: "fixture-app".into(),
+            display_name: "Fixture".into(),
+            ..Default::default()
+        });
+        let profile = settings
+            .layouts
+            .get_mut(crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID)
+            .unwrap();
+        profile.layers[0] = [4; 15];
+        profile.layers[1] = [5; 15];
+        for (i, _) in board.encoders.iter().enumerate() {
+            let control = EntropyApp::application_control_for_encoder(&board, i).unwrap();
+            profile.layers[0][control] = board.encoder_layers[0][i];
+            profile.layers[1][control] = board.encoder_layers[1][i];
+        }
+        // Whole-layer operations retain profile metadata and encoder stacks.
+        for profile in settings.layouts.values_mut() {
+            profile.set_encoder_stack(
+                0,
+                vec![
+                    crate::application_layouts::EncoderStackAction {
+                        name: "Volume".into(),
+                        counter_clockwise: 6,
+                        clockwise: 7,
+                    },
+                    crate::application_layouts::EncoderStackAction {
+                        name: "Scroll".into(),
+                        counter_clockwise: 16,
+                        clockwise: 17,
+                    },
+                ],
+            );
+        }
+        settings.editor_layout_id =
+            crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID.into();
+        app.app_settings.application_layouts.insert(key, settings);
+        app.layout = Some(board);
+        app.default_layout_device_reconciled = true;
+        app.application_layout_editor_active = true;
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        let mut codes = std::collections::BTreeMap::new();
+        recorder.respond_by(move |request| match request[0] {
+            0x05 => {
+                codes.insert(
+                    (request[1], request[2], request[3]),
+                    [request[4], request[5]],
+                );
+                Some(Ok(*request))
+            }
+            0x04 => {
+                let mut reply = *request;
+                reply[4..6]
+                    .copy_from_slice(codes.get(&(request[1], request[2], request[3])).unwrap());
+                Some(Ok(reply))
+            }
+            _ => None,
+        });
+        app.hid_device = Some(hid);
+        (app, recorder, ctx)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn drain_layer_write(app: &mut EntropyApp, ctx: &egui::Context) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while app.layer_write_task.is_some() {
+            app.poll_layer_write(ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn click_layer_menu(app: &mut EntropyApp, ctx: &egui::Context, item: usize) {
+        let draw = |app: &mut EntropyApp, events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 600.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    app.draw_layer_operations_submenu(ui, 240.0);
+                },
+            )
+        };
+        let _ = draw(app, vec![]);
+        let output = draw(app, vec![]);
+        let label = layer_operation_menu_labels(app.app_settings.language)[item].clone();
+        let pos = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == label => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("visible production submenu item");
+        for pressed in [true, false] {
+            let _ = draw(
+                app,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn macropad_default_paste_updates_rendered_layer_after_confirmed_hid_write() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (mut app, recorder, ctx) = macropad_fixture();
+        let before = app.application_layout_settings().unwrap().clone();
+        app.selected_layer = 0;
+        click_layer_menu(&mut app, &ctx, 0);
+        assert!(app.layer_clipboard.is_some());
+        app.selected_layer = 1;
+        click_layer_menu(&mut app, &ctx, 1);
+        assert!(app.layer_write_task.is_some());
+        drain_layer_write(&mut app, &ctx);
+        assert!(
+            recorder
+                .requests()
+                .iter()
+                .any(|p| p[..6] == [0x05, 1, 1, 0, 0, 4])
+        );
+        assert_eq!(
+            app.layout.as_ref().unwrap().get_keycode(1, 0),
+            4,
+            "confirmed firmware map"
+        );
+        let visible = app.application_layout_rendered_copy(app.layout.as_ref().unwrap());
+        assert_eq!(
+            visible.get_keycode(1, 0),
+            4,
+            "Default still renders old assignment after successful paste"
+        );
+        assert_eq!(visible.get_encoder_keycode(1, 0), 6);
+        let key = app.application_layout_device_key().unwrap();
+        let reloaded = crate::app::load_app_settings();
+        assert_eq!(
+            reloaded.application_layouts[&key],
+            *app.application_layout_settings().unwrap()
+        );
+        let after = app.application_layout_settings().unwrap();
+        assert_eq!(
+            after.layouts[crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID].encoder_stacks,
+            before.layouts[crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID]
+                .encoder_stacks
+        );
+        for (id, profile) in &before.layouts {
+            if id != crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID {
+                assert_eq!(&after.layouts[id], profile);
+            }
+        }
+        assert_eq!(
+            after.layouts[crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID].layers[0],
+            before.layouts[crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID].layers[0]
+        );
+        assert_eq!(app.layout.as_ref().unwrap().get_keycode(0, 0), 4);
+        let UndoAction::Layer {
+            layer,
+            old,
+            requires_firmware,
+        } = app.undo_stack.pop().unwrap()
+        else {
+            panic!("layer undo");
+        };
+        app.undo_layer_snapshot(layer, old, requires_firmware);
+        drain_layer_write(&mut app, &ctx);
+        let mut restored = app.application_layout_settings().unwrap().clone();
+        let id = crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID;
+        assert!(restored.layouts[id].revision > before.layouts[id].revision);
+        restored.layouts.get_mut(id).unwrap().revision = before.layouts[id].revision;
+        assert_eq!(restored, before);
+        assert_eq!(app.layout.as_ref().unwrap().get_keycode(1, 0), 5);
+        assert_eq!(
+            crate::app::load_app_settings().application_layouts[&key],
+            *app.application_layout_settings().unwrap()
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn macropad_profile_paste_matrix_persists_without_firmware_or_default_mutation() {
+        use crate::application_layouts::{
+            DEFAULT_APPLICATION_LAYOUT_ID as DEFAULT, DetectedApplication,
+        };
+        for source in [DEFAULT, "fixture_app_1", "other_app_2"] {
+            for target in ["fixture_app_1", "other_app_2"] {
+                let _storage = crate::app::app_storage::ScopedTempConfig::new();
+                let (mut app, recorder, ctx) = macropad_fixture();
+                let device_key = app.application_layout_device_key().unwrap();
+                let settings = app.application_layout_settings_mut().unwrap();
+                settings.create_for_application(&DetectedApplication {
+                    executable: "other-app".into(),
+                    display_name: "Other".into(),
+                    ..Default::default()
+                });
+                assert!(settings.layouts.contains_key("other_app_2"));
+                for (index, profile) in settings.layouts.values_mut().enumerate() {
+                    profile.layers[0] = [40 + index as u16; 15];
+                    profile.layers[1] = [70 + index as u16; 15];
+                }
+                settings.active_layout_id = source.into();
+                settings.editor_layout_id = source.into();
+                let before = settings.clone();
+                let raw = app.layout.clone().unwrap();
+                app.selected_layer = 0;
+                click_layer_menu(&mut app, &ctx, 0);
+                let desired = app.layer_clipboard.as_ref().unwrap().snapshot.clone();
+                let settings = app.application_layout_settings_mut().unwrap();
+                settings.active_layout_id = target.into();
+                settings.editor_layout_id = target.into();
+                app.selected_layer = 1;
+                click_layer_menu(&mut app, &ctx, 1);
+                drain_layer_write(&mut app, &ctx);
+                let visible = app.application_layout_rendered_copy(app.layout.as_ref().unwrap());
+                assert_eq!(
+                    capture_layer(&visible, 1).unwrap(),
+                    desired,
+                    "source={source} target={target}"
+                );
+                assert!(
+                    recorder.requests().is_empty(),
+                    "profile paste must not write firmware Default"
+                );
+                assert_eq!(app.layout.as_ref().unwrap().layers, raw.layers);
+                assert_eq!(
+                    app.layout.as_ref().unwrap().encoder_layers,
+                    raw.encoder_layers
+                );
+                let after = app.application_layout_settings().unwrap();
+                assert_eq!(after.layouts[DEFAULT], before.layouts[DEFAULT]);
+                for (id, profile) in &before.layouts {
+                    if id != target {
+                        assert_eq!(after.layouts[id], *profile);
+                    }
+                }
+                assert_eq!(
+                    after.layouts[target].encoder_stacks,
+                    before.layouts[target].encoder_stacks
+                );
+                assert_eq!(
+                    crate::app::load_app_settings().application_layouts[&device_key],
+                    *after
+                );
+                let (mut restarted, _, _) = macropad_fixture();
+                restarted.app_settings = crate::app::load_app_settings();
+                let reloaded =
+                    restarted.application_layout_rendered_copy(restarted.layout.as_ref().unwrap());
+                assert_eq!(capture_layer(&reloaded, 1).unwrap(), desired);
+                // Changing the selected profile after Paste cannot redirect Undo.
+                app.application_layout_settings_mut()
+                    .unwrap()
+                    .active_layout_id = DEFAULT.into();
+                app.undo(&ctx);
+                let after_undo = app.application_layout_settings().unwrap();
+                assert_eq!(
+                    after_undo.layouts[target].layers,
+                    before.layouts[target].layers
+                );
+                assert_eq!(after_undo.active_layout_id, DEFAULT);
+                assert!(recorder.requests().is_empty());
+                assert_eq!(
+                    crate::app::load_app_settings().application_layouts[&device_key],
+                    *after_undo
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn macropad_profile_to_default_paste_preserves_source_and_encoders() {
+        use crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID as DEFAULT;
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (mut app, recorder, ctx) = macropad_fixture();
+        let settings = app.application_layout_settings_mut().unwrap();
+        let source = settings.layouts.get_mut("fixture_app_1").unwrap();
+        source.layers[0] = [42; 15];
+        let source = source.clone();
+        settings.active_layout_id = "fixture_app_1".into();
+        app.selected_layer = 0;
+        click_layer_menu(&mut app, &ctx, 0);
+        let desired = app.layer_clipboard.as_ref().unwrap().snapshot.clone();
+        app.application_layout_settings_mut()
+            .unwrap()
+            .active_layout_id = DEFAULT.into();
+        app.selected_layer = 1;
+        click_layer_menu(&mut app, &ctx, 1);
+        drain_layer_write(&mut app, &ctx);
+        let visible = app.application_layout_rendered_copy(app.layout.as_ref().unwrap());
+        assert_eq!(capture_layer(&visible, 1).unwrap(), desired);
+        assert_eq!(
+            app.application_layout_settings().unwrap().layouts["fixture_app_1"],
+            source
+        );
+        assert!(!recorder.requests().is_empty());
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn macropad_profile_fill_keeps_visible_encoder_bindings() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (mut app, recorder, ctx) = macropad_fixture();
+        let settings = app.application_layout_settings_mut().unwrap();
+        settings.active_layout_id = "fixture_app_1".into();
+        settings.layouts.get_mut("fixture_app_1").unwrap().layers[0] = [42; 15];
+        app.selected_layer = 0;
+        click_layer_menu(&mut app, &ctx, 3);
+        let visible = app.application_layout_rendered_copy(app.layout.as_ref().unwrap());
+        assert_eq!(visible.get_keycode(0, 0), 0);
+        assert_eq!(visible.get_encoder_keycode(0, 0), 42);
+        assert_eq!(visible.get_encoder_keycode(0, 1), 42);
+        assert!(recorder.requests().is_empty());
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn macropad_layer_copy_captures_visible_profile_not_stale_firmware() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (mut app, _, _) = macropad_fixture();
+        app.application_layout_settings_mut()
+            .unwrap()
+            .layouts
+            .get_mut(crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID)
+            .unwrap()
+            .layers[0][0] = 42;
+        app.copy_selected_layer();
+        assert_eq!(
+            app.layer_clipboard.as_ref().unwrap().snapshot.keycodes[0],
+            42.into()
+        );
+        assert_eq!(app.layout.as_ref().unwrap().get_keycode(0, 0), 4);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn macropad_partial_layer_paste_preserves_unwritten_controls_on_mismatch_and_failure() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        for disconnect in [false, true] {
+            let (mut app, recorder, ctx) = macropad_fixture();
+            let mut codes = std::collections::BTreeMap::new();
+            recorder.respond_by(move |request| match request[0] {
+                0x05 if request[2..4] == [1, 1] && disconnect => {
+                    Some(Err("injected write failure".into()))
+                }
+                0x05 => {
+                    codes.insert(
+                        (request[1], request[2], request[3]),
+                        [request[4], request[5]],
+                    );
+                    Some(Ok(*request))
+                }
+                0x04 => {
+                    let mut reply = *request;
+                    reply[4..6]
+                        .copy_from_slice(codes.get(&(request[1], request[2], request[3])).unwrap());
+                    if request[2..4] == [1, 1] {
+                        reply[4..6].copy_from_slice(&99u16.to_be_bytes());
+                    }
+                    Some(Ok(reply))
+                }
+                _ => None,
+            });
+            app.copy_selected_layer();
+            app.selected_layer = 1;
+            app.paste_selected_layer(app.layer_paste_snapshot().unwrap());
+            drain_layer_write(&mut app, &ctx);
+            let expected_second = if disconnect { 5 } else { 99 };
+            let visible = app.application_layout_rendered_copy(app.layout.as_ref().unwrap());
+            assert_eq!(visible.get_keycode(1, 0), 4);
+            assert_eq!(visible.get_keycode(1, 1), expected_second);
+            assert_eq!(visible.get_keycode(1, 2), 5);
+            assert_eq!(visible.get_encoder_keycode(1, 0), 8);
+            assert_eq!(
+                app.layout.as_ref().unwrap().get_keycode(1, 1),
+                expected_second
+            );
+            assert_eq!(app.hid_device.is_none(), disconnect);
+            assert!(
+                !recorder
+                    .requests()
+                    .iter()
+                    .any(|r| r[0] == 0x05 && r[2..4] == [0, 2])
+            );
+            let key = app.application_layout_device_key().unwrap();
+            assert_eq!(
+                crate::app::load_app_settings().application_layouts[&key],
+                *app.application_layout_settings().unwrap()
+            );
+            let UndoAction::Layer {
+                layer,
+                old,
+                requires_firmware,
+            } = app.undo_stack.pop().unwrap()
+            else {
+                panic!("partial write undo");
+            };
+            assert_eq!(layer, 1);
+            assert_eq!(old.keycodes, bindings(&[5; 13]));
+            assert!(requires_firmware);
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn macropad_layer_completion_preserves_later_pending_edit_and_profile_selection() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (mut app, _, ctx) = macropad_fixture();
+        app.default_layout_pending_layers = 1 << 1;
+        app.copy_selected_layer();
+        app.selected_layer = 1;
+        app.paste_selected_layer(app.layer_paste_snapshot().unwrap());
+        // The completion is not polled until the following edit and selection.
+        let settings = app.application_layout_settings_mut().unwrap();
+        settings
+            .layouts
+            .get_mut(crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID)
+            .unwrap()
+            .set_keycode(1, 0, 42);
+        settings.active_layout_id = "fixture_app_1".into();
+        settings.editor_layout_id = "fixture_app_1".into();
+        let other = settings.layouts["fixture_app_1"].clone();
+        drain_layer_write(&mut app, &ctx);
+        let settings = app.application_layout_settings().unwrap();
+        assert_eq!(
+            settings.layouts[crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID].layers[1]
+                [0],
+            42
+        );
+        assert_eq!(
+            settings.layouts[crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID].layers[1]
+                [1],
+            4
+        );
+        assert_eq!(settings.layouts["fixture_app_1"], other);
+        assert_eq!(settings.active_layout_id, "fixture_app_1");
+        assert_eq!(app.default_layout_pending_layers, 1 << 1);
+        let key = app.application_layout_device_key().unwrap();
+        assert_eq!(
+            crate::app::load_app_settings().application_layouts[&key],
+            *settings
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn macropad_noop_firmware_paste_reconciles_stale_default_and_undo() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (mut app, recorder, ctx) = macropad_fixture();
+        app.layout.as_mut().unwrap().layers[1] = bindings(&[4; 13]);
+        app.layout.as_mut().unwrap().encoder_layers[1] = vec![6, 7];
+        app.copy_selected_layer();
+        app.selected_layer = 1;
+        app.paste_selected_layer(app.layer_paste_snapshot().unwrap());
+        assert!(app.layer_write_task.is_none());
+        assert!(recorder.requests().is_empty());
+        assert_eq!(
+            app.application_layout_settings().unwrap().layouts
+                [crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID]
+                .layers[1][0],
+            4
+        );
+        let UndoAction::Layer {
+            layer,
+            old,
+            requires_firmware,
+        } = app.undo_stack.pop().unwrap()
+        else {
+            panic!("host change undo");
+        };
+        app.undo_layer_snapshot(layer, old, requires_firmware);
+        drain_layer_write(&mut app, &ctx);
+        assert_eq!(
+            app.application_layout_settings().unwrap().layouts
+                [crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID]
+                .layers[1][0],
+            5
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn non_macropad_layer_paste_keeps_raw_path_and_profiles_unchanged() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (mut app, _, ctx) = macropad_fixture();
+        let mut device = app.device_manager.devices()[0].clone();
+        device.product_id = 0x0074;
+        device.name = "K:04".into();
+        app.device_manager.replace_devices(vec![device]);
+        assert!(!app.application_layouts_supported());
+        let before = app.app_settings.application_layouts.clone();
+        app.copy_selected_layer();
+        app.selected_layer = 1;
+        app.paste_selected_layer(app.layer_paste_snapshot().unwrap());
+        drain_layer_write(&mut app, &ctx);
+        assert_eq!(app.layout.as_ref().unwrap().get_keycode(1, 0), 4);
+        assert_eq!(app.app_settings.application_layouts, before);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn macropad_layer_paste_survives_native_background_reconciliation() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (mut app, recorder, ctx) = macropad_fixture();
+        // Make every non-target binding explicit: runtime UNSET seeding is not
+        // a layer-paste mutation. Allow normal preset migration before snapshot.
+        for profile in app
+            .application_layout_settings_mut()
+            .unwrap()
+            .layouts
+            .values_mut()
+        {
+            for codes in &mut profile.layers {
+                for code in codes {
+                    if *code == u16::MAX {
+                        *code = 0;
+                    }
+                }
+            }
+        }
+        app.tick_layout_import_lifecycle_for_test(&ctx, 0.1);
+        let before = app.application_layout_settings().unwrap().clone();
+        app.selected_layer = 0;
+        click_layer_menu(&mut app, &ctx, 0);
+        app.selected_layer = 1;
+        click_layer_menu(&mut app, &ctx, 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while app.layer_write_task.is_some() {
+            app.tick_layout_import_lifecycle_for_test(&ctx, 0.2);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        app.tick_layout_import_lifecycle_for_test(&ctx, 0.3);
+        let after = app.application_layout_settings().unwrap();
+        let id = crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID;
+        assert_eq!(after.layouts[id].layers[1], before.layouts[id].layers[0]);
+        assert_eq!(after.layouts[id].layers[0], before.layouts[id].layers[0]);
+        for (profile_id, profile) in &before.layouts {
+            if profile_id != id {
+                assert_eq!(&after.layouts[profile_id], profile);
+            }
+        }
+        assert!(
+            app.layer_write_task.is_none(),
+            "background did not replay stale Default"
+        );
+        assert_eq!(
+            app.application_layout_rendered_copy(app.layout.as_ref().unwrap())
+                .get_keycode(1, 0),
+            4
+        );
+        assert_eq!(app.layout.as_ref().unwrap().get_keycode(1, 0), 4);
+        assert!(
+            recorder
+                .requests()
+                .iter()
+                .any(|r| r[..6] == [5, 1, 1, 0, 0, 4])
+        );
+        let key = app.application_layout_device_key().unwrap();
+        assert_eq!(
+            crate::app::load_app_settings().application_layouts[&key],
+            *after
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn macropad_default_sync_mismatch_keeps_pending_desired_profile() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (mut app, recorder, ctx) = macropad_fixture();
+        app.default_layout_pending_layers = 1 << 1;
+        let desired = capture_layer(app.layout.as_ref().unwrap(), 0).unwrap();
+        let profile = app
+            .application_layout_settings_mut()
+            .unwrap()
+            .layouts
+            .get_mut(crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID)
+            .unwrap();
+        profile.layers[1] = profile.layers[0];
+        let before = profile.clone();
+        recorder.respond_by(|request| match request[0] {
+            5 => Some(Ok(*request)),
+            4 => {
+                let mut reply = *request;
+                reply[4..6].copy_from_slice(&99u16.to_be_bytes());
+                Some(Ok(reply))
+            }
+            _ => None,
+        });
+        app.apply_layer_snapshot(1, desired, "layer_actions.save_default_to_device");
+        drain_layer_write(&mut app, &ctx);
+        assert_eq!(
+            app.application_layout_settings().unwrap().layouts
+                [crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID],
+            before
+        );
+        assert_eq!(app.default_layout_pending_layers, 1 << 1);
+        assert!(app.default_layout_sync_retry_after.is_some());
+        assert_eq!(app.layout.as_ref().unwrap().get_keycode(1, 0), 99);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn k04_native_layer_paste_keeps_rmk_actions_and_profiles_unchanged() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (mut app, recorder, ctx) = macropad_fixture();
+        let mut device = app.device_manager.devices()[0].clone();
+        device.product_id = 0x0074;
+        device.name = "K:04".into();
+        app.device_manager.replace_devices(vec![device]);
+        let action = rmk_types::action::KeyAction::Single(rmk_types::action::Action::LayerOn(2));
+        let board = app.layout.as_mut().unwrap();
+        board.layers[0] = vec![KeyBinding::Rmk(action); 13];
+        board.encoder_layers[1] = board.encoder_layers[0].clone();
+        let before = app.app_settings.application_layouts.clone();
+        let mut native_codes = std::collections::BTreeMap::new();
+        recorder.respond_by(move |request| {
+            if request[1..4] != [0xe8, 3, 1] {
+                return None;
+            }
+            let mut reply = *request;
+            match request[0] {
+                7 => {
+                    native_codes.insert(
+                        (request[4], request[5], request[6]),
+                        request[8..8 + request[7] as usize].to_vec(),
+                    );
+                    reply[4] = 0;
+                }
+                8 => {
+                    let payload = &native_codes[&(request[4], request[5], request[6])];
+                    reply[4] = 0;
+                    reply[5] = payload.len() as u8;
+                    reply[6..6 + payload.len()].copy_from_slice(payload);
+                }
+                _ => return None,
+            }
+            Some(Ok(reply))
+        });
+        app.copy_selected_layer();
+        assert_eq!(
+            app.layer_clipboard.as_ref().unwrap().snapshot.keycodes,
+            vec![KeyBinding::Rmk(action); 13]
+        );
+        app.selected_layer = 1;
+        app.paste_selected_layer(app.layer_paste_snapshot().unwrap());
+        drain_layer_write(&mut app, &ctx);
+        assert!(app.hid_device.is_some());
+        assert_eq!(
+            app.layout.as_ref().unwrap().layers[1],
+            vec![KeyBinding::Rmk(action); 13]
+        );
+        assert_eq!(recorder.requests().iter().filter(|r| r[0] == 7).count(), 13);
+        assert_eq!(recorder.requests().iter().filter(|r| r[0] == 8).count(), 13);
+        assert_eq!(app.app_settings.application_layouts, before);
     }
 
     #[test]
@@ -1618,6 +2628,7 @@ mod tests {
                 requires_firmware: true,
             },
             is_default_layout_sync: false,
+            default_target: None,
         };
 
         assert_eq!(
@@ -1645,6 +2656,7 @@ mod tests {
             total: 2,
             undo_behavior: LayerUndoBehavior::RecordOld,
             is_default_layout_sync: false,
+            default_target: None,
         };
 
         assert_eq!(

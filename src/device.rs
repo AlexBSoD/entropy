@@ -4,8 +4,18 @@ const ERGOHAVEN_VENDOR_ID: u16 = 0xE126;
 const ERGOHAVEN_DISPLAY_MACROPAD_PRODUCT_IDS: [u16; 2] = [0x0041, 0x0042];
 const M4CR0PAD_V2_PRODUCT_ID: u16 = 0x0041;
 const M4CR0PAD_V3_PRODUCT_ID: u16 = 0x0042;
+const SM62_PRODUCT_ID: u16 = 0x00B2;
 const K04_QUBE_PRODUCT_ID_START: u16 = 0x0071;
 const K04_QUBE_PRODUCT_ID_END: u16 = 0x0073;
+
+/// UI product label only. Keep reported names unchanged for identity and storage.
+pub(crate) fn product_display_name(vendor_id: u16, product_id: u16, reported: &str) -> &str {
+    if vendor_id == ERGOHAVEN_VENDOR_ID && product_id == M4CR0PAD_V3_PRODUCT_ID {
+        "Macropad"
+    } else {
+        reported
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DeviceIdentity {
@@ -336,7 +346,10 @@ impl Device {
         if self.vendor_id == ERGOHAVEN_VENDOR_ID {
             match self.product_id {
                 M4CR0PAD_V2_PRODUCT_ID => return "Macropad v2".to_owned(),
-                M4CR0PAD_V3_PRODUCT_ID => return "Macropad".to_owned(),
+                M4CR0PAD_V3_PRODUCT_ID => {
+                    return product_display_name(self.vendor_id, self.product_id, display_name)
+                        .to_owned();
+                }
                 _ => {}
             }
         }
@@ -355,6 +368,10 @@ impl Device {
     pub(crate) fn is_ergohaven_display_macropad(&self) -> bool {
         self.vendor_id == ERGOHAVEN_VENDOR_ID
             && ERGOHAVEN_DISPLAY_MACROPAD_PRODUCT_IDS.contains(&self.product_id)
+    }
+
+    pub(crate) fn is_ergohaven_sm62(&self) -> bool {
+        self.vendor_id == ERGOHAVEN_VENDOR_ID && self.product_id == SM62_PRODUCT_ID
     }
 
     pub(crate) fn is_m4cr0pad_v3(&self) -> bool {
@@ -509,7 +526,21 @@ impl DeviceManager {
         #[cfg(target_os = "macos")]
         let _hid_lock = crate::hid::macos_hid_operation_lock();
         let api = hidapi::HidApi::new().map_err(|error| format!("HID scan failed: {error}"))?;
+        let mut sm62_interfaces = 0usize;
+        let mut sm62_vial_interfaces = 0usize;
         for info in api.device_list() {
+            if info.vendor_id() == ERGOHAVEN_VENDOR_ID && info.product_id() == SM62_PRODUCT_ID {
+                sm62_interfaces += 1;
+                let vial_interface = info.usage_page() == 0xFF60 && info.usage() == 0x61;
+                if vial_interface {
+                    sm62_vial_interfaces += 1;
+                }
+                log::info!(
+                    "SM62 HID scan: usage_page=0x{:04X} usage=0x{:04X} interface={} vial={} path={}",
+                    info.usage_page(), info.usage(), info.interface_number(),
+                    vial_interface, info.path().to_string_lossy()
+                );
+            }
             // Filter: Vial usage page 0xFF60, usage 0x61
             if info.usage_page() == 0xFF60 && info.usage() == 0x61 {
                 let path = info.path().to_string_lossy().to_string();
@@ -530,6 +561,10 @@ impl DeviceManager {
                 device.normalize_discovered_identity();
                 devices.push(device);
             }
+        }
+
+        if sm62_interfaces > 0 && sm62_vial_interfaces == 0 {
+            log::warn!("SM62 USB interfaces are present, but none expose the Vial usage 0xFF60:0x0061");
         }
 
         #[cfg(target_os = "linux")]
@@ -832,6 +867,33 @@ mod tests {
     }
 
     #[test]
+    fn macropad_product_label_does_not_change_identity_or_storage_keys() {
+        let mut device = test_device("Usb", "/dev/hidraw4");
+        device.vendor_id = ERGOHAVEN_VENDOR_ID;
+        device.product_id = M4CR0PAD_V3_PRODUCT_ID;
+        device.name = "M4CR0Pad v3".to_owned();
+        let identity = device.stable_identity();
+        let key = device.display_name_cache_key();
+        for reported in ["M4CR0Pad v3", "Macropad v3", "Ль", ""] {
+            assert_eq!(
+                product_display_name(device.vendor_id, device.product_id, reported),
+                "Macropad"
+            );
+            assert_eq!(device.display_name_with_transport(reported), "Macropad");
+        }
+        assert_eq!(device.name, "M4CR0Pad v3");
+        assert_eq!(device.stable_identity(), identity);
+        assert_eq!(device.display_name_cache_key(), key);
+        assert!(identity.matches(&device));
+        for (vendor, product) in [(0xE126, 0x0041), (0xE126, 0x0074), (0x1234, 0x0042)] {
+            assert_eq!(
+                product_display_name(vendor, product, "Original name"),
+                "Original name"
+            );
+        }
+    }
+
+    #[test]
     fn m4cr0pad_v2_uses_revision_name_when_usb_product_string_is_corrupt() {
         let mut device = test_device("Usb", "/dev/hidraw4");
         device.name = "Ль".to_owned();
@@ -853,6 +915,17 @@ mod tests {
 
         assert!(device.is_m4cr0pad_v3());
         assert_eq!(device.display_name_with_transport(&device.name), "Macropad");
+    }
+
+    #[test]
+    fn sm62_is_identified_by_usb_identity_even_with_an_unexpected_name() {
+        let mut device = test_device("Usb", "/dev/hidraw4");
+        device.name = "Unknown keyboard".to_owned();
+        device.vendor_id = ERGOHAVEN_VENDOR_ID;
+        device.product_id = SM62_PRODUCT_ID;
+        assert!(device.is_ergohaven_sm62());
+        device.product_id = M4CR0PAD_V3_PRODUCT_ID;
+        assert!(!device.is_ergohaven_sm62());
     }
 
     #[cfg(target_os = "linux")]
