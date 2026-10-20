@@ -5117,7 +5117,7 @@ mod tests {
                 let expected_center=width/2.0-9.0;
                 assert!((center-expected_center).abs()<2.0,"half heading must center within the bounded column: width={width}, got={center}");
                 if width>=1000.0 {
-                    let frame=top.shapes.iter().find_map(|s|match &s.shape {egui::Shape::Rect(r) if r.fill==Color32::from_gray(24)&&r.stroke.color==Color32::from_gray(75)=>Some(r.rect),_=>None}).unwrap();
+                    let frame=top.shapes.iter().find_map(|s|match &s.shape {egui::Shape::Rect(r) if r.fill==Color32::from_rgb(7,7,5)&&r.stroke.color==Color32::from_gray(75)=>Some(r.rect),_=>None}).unwrap();
                     assert!((frame.left()-(width-918.0)/2.0).abs()<2.0,"preview must align with centered block left: {frame:?}");
                 }
                 let (id,max)=ctx.data(|d|d.get_temp::<(egui::Id,f32)>(egui::Id::new("sm62_scroll_fixture"))).unwrap();

@@ -335,6 +335,8 @@ impl EntropyApp {
             #[cfg(not(target_arch = "wasm32"))]
             retiring_connects: Vec::new(),
             #[cfg(all(test, not(target_arch = "wasm32")))]
+            test_device_scan_requests: None,
+            #[cfg(all(test, not(target_arch = "wasm32")))]
             test_connect_requests: None,
             #[cfg(all(test, not(target_arch = "wasm32")))]
             test_connect_hid: None,

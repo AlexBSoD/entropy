@@ -46,8 +46,14 @@ impl EntropyApp {
                     }).response.on_disabled_hover_text(if lang == crate::i18n::Language::Russian {
                         "Для этой настройки обновите прошивку SM62"
                     } else { "Update SM62 firmware to enable this setting" });
-                    self.draw_settings_write_status(ui, DISPLAY_TIMEOUT_QSID,
-                        crate::ui_style::ResponsiveMetrics::from_ctx(ui.ctx()), false);
+                    // This shared control needs progress/errors, not a persistent
+                    // success check. Keep the confirmed write state unchanged.
+                    if self.pending_settings_write_value(DISPLAY_TIMEOUT_QSID).is_some()
+                        || !matches!(self.settings_write_status(DISPLAY_TIMEOUT_QSID),
+                            Some(super::settings_write_queue::SettingsWriteStatus::Saved)) {
+                        self.draw_settings_write_status(ui, DISPLAY_TIMEOUT_QSID,
+                            crate::ui_style::ResponsiveMetrics::from_ctx(ui.ctx()), false);
+                    }
                 });
             });
         // Only explicit edits enqueue a write. A failed/unconfirmed request must

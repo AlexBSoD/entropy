@@ -1279,6 +1279,7 @@ pub(crate) enum DeviceScanState {
         started_at: std::time::Instant,
         generation: u64,
         timeout_logged: bool,
+        usb_only: bool,
     },
 }
 
@@ -5405,6 +5406,8 @@ pub struct EntropyApp {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) retiring_connects: Vec<RetiringConnect>,
     /// Deterministic worker-launch seam: tests supply completions without HID I/O.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) test_device_scan_requests: Option<mpsc::Sender<(bool, mpsc::Sender<Result<Vec<Device>, String>>)>>,
     #[cfg(all(test, not(target_arch = "wasm32")))]
     pub(crate) test_connect_requests:
         Option<mpsc::Sender<(Device, mpsc::Sender<ConnectTaskMessage>)>>,

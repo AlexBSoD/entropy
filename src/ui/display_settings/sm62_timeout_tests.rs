@@ -65,9 +65,11 @@ fn sm62_timeout_failed_set_get_and_mismatch_never_confirm_requested_value() {
         assert_ne!(app.display_settings.confirmed_display_timeout, 6);
         let count = recorder.requests().len();
         for _ in 0..3 {
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| app.draw_sm62_timeout_control(ui));
             });
+            assert!(output.shapes.iter().any(|s| matches!(&s.shape,
+                egui::Shape::Text(t) if t.galley.job.text == "!")), "SM62 timeout failure remains visible");
         }
         assert_eq!(recorder.requests().len(), count, "painting a failure must not retry");
     }
@@ -146,4 +148,46 @@ fn sm62_timeout_real_dropdown_queues_each_index_and_reloads_without_other_writes
             assert_eq!(loaded.sm62_values, values);
         }
     }
+}
+
+
+#[test]
+fn sm62_timeout_saved_check_is_hidden_but_generic_saved_status_is_retained() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
+    let ctx = egui::Context::default();
+    let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+    let mut app = EntropyApp::new(&cc);
+    let (hid, _) = crate::hid::HidDevice::test_device();
+    app.hid_device = Some(hid);
+    app.display_settings.sm62_supported = true;
+    app.display_settings.display_timeout_supported = true;
+    app.queue_display_setting_write("timeout".into(), DISPLAY_TIMEOUT_QSID, 0, 1);
+    // Do not poll completion yet: the real queue must still paint progress.
+    for _ in 0..2 {
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.draw_sm62_timeout_control(ui));
+        });
+        assert!(output.shapes.iter().any(|s| matches!(&s.shape,
+            egui::Shape::Path(p) if p.stroke.width == 3.0 && p.points.len() >= 8)), "pending spinner remains visible");
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while app.qmk_settings_write_busy() && Instant::now() < deadline {
+        app.poll_settings_write(&ctx);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(matches!(app.settings_write_status(DISPLAY_TIMEOUT_QSID), Some(super::super::settings_write_queue::SettingsWriteStatus::Saved)));
+    let draw = |app: &mut EntropyApp, timeout: bool| ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if timeout { app.draw_sm62_timeout_control(ui); }
+            else { app.draw_settings_write_status(ui, DISPLAY_TIMEOUT_QSID, crate::ui_style::ResponsiveMetrics::from_ctx(ctx), false); }
+        });
+    });
+    let checks = |out: &egui::FullOutput| out.shapes.iter().filter(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.job.text == "\u{2713}")).count();
+    draw(&mut app, true);
+    let output = draw(&mut app, true);
+    assert_eq!(checks(&output), 0, "SM62 timeout must not paint a green Saved check");
+    draw(&mut app, false);
+    assert_eq!(checks(&draw(&mut app, false)), 1, "generic status renderer must retain Saved checks");
+    assert_eq!(app.display_settings.confirmed_display_timeout, 1);
+    assert!(matches!(app.settings_write_status(DISPLAY_TIMEOUT_QSID), Some(super::super::settings_write_queue::SettingsWriteStatus::Saved)), "hide presentation only; retain confirmed state");
 }

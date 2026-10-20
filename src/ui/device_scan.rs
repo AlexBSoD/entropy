@@ -49,7 +49,28 @@ impl EntropyApp {
         }
     }
 
+    pub(super) fn bluetooth_discovery_owner_active(&self) -> bool {
+        let selected_bluetooth = self.selected_device.and_then(|i| self.device_manager.devices().get(i))
+            .is_some_and(Device::is_bluetooth_transport);
+        (selected_bluetooth && (self.hid_device.is_some() || self.hid_write_task_owner_active()))
+            || matches!(&self.connect_state, ConnectState::Loading { device, .. } if device.is_bluetooth_transport())
+            || self.retiring_connects.iter().any(|owner| owner.device.is_bluetooth_transport())
+            || self.qmk_hid_hosts.values().any(|bridge| bridge.device().is_bluetooth_transport())
+    }
+
     pub(super) fn start_device_scan(&mut self) {
+        // All entrypoints (including reconnect/manual refresh) obey the actual
+        // transport-owner fence, not just the periodic scheduler.
+        let usb_only = self.bluetooth_discovery_owner_active();
+        if usb_only && !cfg!(any(target_os="linux",target_os="windows")) { return; }
+        self.start_device_scan_kind(usb_only);
+    }
+
+    pub(super) fn start_usb_device_scan(&mut self) {
+        self.start_device_scan_kind(true);
+    }
+
+    fn start_device_scan_kind(&mut self, usb_only: bool) {
         if !matches!(self.device_scan_state, DeviceScanState::Idle) {
             return;
         }
@@ -68,9 +89,16 @@ impl EntropyApp {
             started_at: std::time::Instant::now(),
             generation: self.connection_generation,
             timeout_logged: false,
+        usb_only,
         };
+        #[cfg(test)]
+        if let Some(requests) = &self.test_device_scan_requests {
+            let _ = requests.send((usb_only, tx));
+            return;
+        }
         std::thread::spawn(move || {
-            let result = DeviceManager::scan_devices();
+            let result = if usb_only { DeviceManager::scan_usb_devices() }
+                else { DeviceManager::scan_devices() };
             if let Ok(devices) = &result {
                 log::debug!(
                     "HID scan completed with {} Vial endpoint(s): {}",
@@ -98,8 +126,9 @@ impl EntropyApp {
                 started_at,
                 generation,
                 timeout_logged,
+                usb_only,
             } => match rx.try_recv() {
-                Ok(result) => Some((*generation, result)),
+                Ok(result) => Some((*generation, *usb_only, result)),
                 Err(mpsc::TryRecvError::Empty) => {
                     if started_at.elapsed() >= DEVICE_SCAN_TIMEOUT && !*timeout_logged {
                         log::warn!(
@@ -113,13 +142,14 @@ impl EntropyApp {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => Some((
                     *generation,
+                    *usb_only,
                     Err("HID device scan worker stopped".to_owned()),
                 )),
             },
         };
 
         self.device_scan_state = DeviceScanState::Idle;
-        if let Some((generation, result)) = completed {
+        if let Some((generation, usb_only, result)) = completed {
             if generation != self.connection_generation {
                 log::debug!(
                     "Ignoring HID scan from connection generation {generation}; current generation is {}",
@@ -128,7 +158,16 @@ impl EntropyApp {
                 return;
             }
             match result {
-                Ok(devices) => self.apply_device_scan_result(devices),
+                Ok(devices) => {
+                    if usb_only {
+                        // A USB-only snapshot is not evidence of Bluetooth removal.
+                        // Keep retained transports in order so the selected index stays stable.
+                        let mut merged: Vec<_> = self.device_manager.devices().iter()
+                            .filter(|d| d.is_bluetooth_transport()).cloned().collect();
+                        merged.extend(devices.into_iter().filter(|d| !d.is_bluetooth_transport()));
+                        self.apply_device_scan_result_inner(merged, false);
+                    } else { self.apply_device_scan_result(devices); }
+                },
                 Err(error) => log::warn!("{error}; preserving the previous device list"),
             }
         }
@@ -136,6 +175,36 @@ impl EntropyApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn apply_device_scan_result(&mut self, devices: Vec<Device>) {
+        self.apply_device_scan_result_inner(devices, true);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn apply_device_scan_result_inner(&mut self, devices: Vec<Device>, allow_discovery_connect: bool) {
+        if !allow_discovery_connect {
+            // Inventory is not permission to retry/open any transport. Keep the
+            // chosen endpoint by identity; only retire an actually removed or
+            // re-enumerated selected USB owner. Bluetooth absence cannot be
+            // inferred from a partial USB snapshot.
+            let previous = self.selected_device.and_then(|i| self.device_manager.devices().get(i)).cloned();
+            self.device_manager.replace_devices(devices);
+            if let Some(previous) = previous {
+                let selected = self.device_manager.devices().iter().position(|d| d.stable_identity() == previous.stable_identity());
+                let changed = selected.is_some_and(|i| usb_endpoint_was_reenumerated(&previous, &self.device_manager.devices()[i]));
+                if !previous.is_bluetooth_transport() && (selected.is_none() || changed) {
+                    // Normal unplug/re-enumeration is not an open failure.
+                    // Return to the neutral picker; real connection errors keep
+                    // their own status and existing error presentation.
+                    // The USB-only merge may have moved a Bluetooth device
+                    // into the old USB index. Do not let disconnect cleanup
+                    // interpret that stale index as the owner being retired.
+                    self.selected_device = None;
+                    self.clear_connected_keyboard_state("");
+                }
+                self.selected_device = selected;
+            }
+            self.retain_connected_qmk_hid_host_bridges();
+            return;
+        }
         if let ConnectState::Reconnecting(reconnect) = &self.connect_state {
             let reconnect = reconnect.clone();
             let reconnect_device_index =
@@ -363,6 +432,7 @@ mod tests {
             started_at: std::time::Instant::now(),
             generation: old_generation,
             timeout_logged: false,
+        usb_only: false,
         };
 
         // Exercise the real completed-scan lifecycle, not a manual device switch.
@@ -580,6 +650,7 @@ mod tests {
             started_at: std::time::Instant::now() - DEVICE_SCAN_TIMEOUT,
             generation: app.connection_generation,
             timeout_logged: false,
+        usb_only: false,
         };
 
         app.poll_device_scan(&ctx);
@@ -619,6 +690,7 @@ mod tests {
             started_at: std::time::Instant::now(),
             generation: old_generation,
             timeout_logged: false,
+        usb_only: false,
         };
         app.connection_generation = app.connection_generation.wrapping_add(1);
 
@@ -692,6 +764,7 @@ mod tests {
             started_at: std::time::Instant::now(),
             generation: app.connection_generation,
             timeout_logged: false,
+        usb_only: false,
         };
         app.poll_device_scan(&ctx);
         assert_eq!(app.device_manager.devices().len(), 1);

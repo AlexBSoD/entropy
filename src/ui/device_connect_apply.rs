@@ -610,6 +610,7 @@ mod tests {
             started_at: std::time::Instant::now(),
             generation: app.connection_generation,
             timeout_logged: false,
+        usb_only: false,
         };
         scan_tx
             .send(Ok(vec![connection_device("B"), connection_device("A")]))
@@ -642,6 +643,7 @@ mod tests {
             started_at: std::time::Instant::now(),
             generation: app.connection_generation,
             timeout_logged: false,
+        usb_only: false,
         };
         a_tx.send(ConnectTaskMessage::Done(Box::new(Ok(connection_result(
             "Wrong A",

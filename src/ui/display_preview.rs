@@ -98,17 +98,14 @@ fn paint_sm62_screen(ui: &egui::Ui, screen: egui::Rect, settings: &[u8], scene: 
 pub(super) fn draw_sm62_preview(ui: &mut egui::Ui, settings: &[u8], scene: u8, date_enabled: bool, max_height: f32, side: usize, language: Option<&str>, stars_enabled: bool, screens_off: bool, clock_live: bool) {
     let size = fitted_display_size((ui.available_width() - 14.0).min(240.0), max_height - 14.0);
     let (outer, _) = ui.allocate_exact_size(size + egui::vec2(14.0, 14.0), Sense::hover());
-    let ship = !screens_off && sm62_preview_mode(settings, scene) == 2;
+    // Extend the display background through the former bezel without changing
+    // the firmware-pixel content rectangle, outer dimensions or rounded outline.
     ui.painter().rect(outer, display_corner_radius(size.x) + 7.0,
-        if ship { Color32::from_rgb(7, 7, 5) } else { Color32::from_gray(24) },
+        if screens_off { Color32::BLACK } else { Color32::from_rgb(7, 7, 5) },
         Stroke::new(1.0_f32, Color32::from_gray(75)),
         egui::StrokeKind::Inside);
     let screen = egui::Rect::from_center_size(outer.center(), size);
     paint_sm62_screen(ui, screen, settings, scene, date_enabled, side, language, stars_enabled, screens_off, clock_live);
-    if !ship {
-        ui.painter().rect_stroke(screen, display_corner_radius(size.x),
-            Stroke::new(1.0_f32, Color32::from_gray(8)), egui::StrokeKind::Inside);
-    }
 }
 
 // Mirrors keyboards/ergohaven/macropad/screen_layout.c in 240×280 source pixels.
@@ -1981,3 +1978,6 @@ mod tests {
         assert_eq!(animation_frame_index(&delays, 2, 200, 50), 1);
     }
 }
+
+#[cfg(test)]
+include!("sm62_preview_edge_tests.rs");

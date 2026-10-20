@@ -197,22 +197,31 @@ impl EntropyApp {
             self.poll_device_scan(ctx);
             self.maybe_start_bluetooth_reconnect_scan(ctx);
 
-            let hid_session_active = self.hid_device.is_some();
+            // A worker temporarily borrows the handle; it is still the same
+            // active transport and must not authorize full Bluetooth enumeration.
+            let hid_session_active = self.hid_device.is_some()
+                || self.hid_write_task_owner_active()
+                || matches!(self.connect_state, ConnectState::Loading { .. });
+            let bluetooth_busy = (selected_device_is_bluetooth && hid_session_active)
+                || self.bluetooth_discovery_owner_active();
+            // USB-only metadata enumeration is implemented without Bluetooth
+            // device opens on these platforms. Keep the old fail-safe elsewhere.
+            let usb_only = bluetooth_busy && cfg!(any(target_os = "linux", target_os = "windows"));
             let has_discovered_devices = !self.device_manager.devices().is_empty();
-            // Keep the common discovery loop alive even when the selected
-            // keyboard is Bluetooth; otherwise newly attached USB keyboards
-            // never enter the device menu.
-            if (self.last_device_scan_at == 0.0
-                || now - self.last_device_scan_at
-                    >= periodic_device_scan_interval_secs(
-                        hid_session_active,
-                        has_discovered_devices,
-                    ))
-                && periodic_device_scan_allowed(selected_device_is_bluetooth, hid_session_active)
-            {
-                self.scan_frame = self.scan_frame.wrapping_add(1);
-                self.last_device_scan_at = now;
-                self.start_device_scan();
+            let interval = if usb_only { 2.0 } else {
+                periodic_device_scan_interval_secs(hid_session_active, has_discovered_devices)
+            };
+            if usb_only || periodic_device_scan_allowed(bluetooth_busy, hid_session_active || bluetooth_busy) {
+                if self.last_device_scan_at == 0.0 || now - self.last_device_scan_at >= interval {
+                    self.scan_frame = self.scan_frame.wrapping_add(1);
+                    self.last_device_scan_at = now;
+                    if usb_only { self.start_usb_device_scan(); }
+                    else { self.start_device_scan(); }
+                }
+                if usb_only {
+                    ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+                        (interval - (now - self.last_device_scan_at)).clamp(0.025, interval)));
+                }
             }
         }
 
@@ -2149,3 +2158,6 @@ impl eframe::App for EntropyApp {
         self.pause_typing_trainer_if_inactive(std::time::Instant::now());
     }
 }
+
+#[cfg(all(test, any(target_os="linux",target_os="windows")))]
+include!("usb_hotplug_tests.rs");

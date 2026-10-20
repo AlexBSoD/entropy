@@ -576,7 +576,6 @@ impl EntropyApp {
         self.settings_write_queue.pending_value(qsid)
     }
 
-    #[cfg(test)]
     pub(super) fn settings_write_status(&self, qsid: u16) -> Option<&SettingsWriteStatus> {
         self.settings_write_queue.status(qsid)
     }

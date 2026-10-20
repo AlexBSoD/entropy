@@ -1,3 +1,6 @@
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "usb_discovery.rs"]
+mod usb_discovery;
 use crate::firmware::FirmwareProtocol;
 
 const ERGOHAVEN_VENDOR_ID: u16 = 0xE126;
@@ -513,6 +516,9 @@ impl DeviceManager {
             Self { devices: vec![] }
         }
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn scan_usb_devices() -> Result<Vec<Device>, String> { usb_discovery::scan() }
 
     #[cfg(not(target_arch = "wasm32"))]
     pub fn scan_devices() -> Result<Vec<Device>, String> {
