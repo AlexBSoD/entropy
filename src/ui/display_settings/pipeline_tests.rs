@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 
 #[path = "tap_dance_tests.rs"]
 mod tap_dance_tests;
+#[path = "delete_catalog_tests.rs"]
+mod delete_catalog_tests;
 
 fn pictogram_canvas_rect(output: &egui::FullOutput) -> egui::Rect {
     let lines: Vec<_> = output
@@ -494,6 +496,7 @@ fn historical_promoted_stock_snapshot(language: crate::i18n::Language) -> Vec<Sa
     records.extend(
         BUILTIN_PICTOGRAM_KEYS
             .iter()
+            .take(pre_thinning.len() / PICTOGRAM_BYTES)
             .enumerate()
             .map(|(index, key)| SavedPictogram {
                 origin: PictogramOrigin::Legacy,

@@ -19,10 +19,10 @@ mod usb_hotplug_tests {
         let (hid, recorder) = crate::hid::HidDevice::test_device();
         let mut app = app;
         app.device_manager
-            .replace_devices(vec![device("K04", "Bluetooth")]);
+            .replace_devices(vec![device("Generic BT keyboard", "Bluetooth")]);
         app.selected_device = Some(0);
         app.layout = Some(KeyboardLayout {
-            name: "K04 fixture".into(),
+            name: "Generic BT keyboard fixture".into(),
             rows: 0,
             cols: 0,
             keys: vec![],
@@ -37,10 +37,195 @@ mod usb_hotplug_tests {
             lighting_mode: None,
             firmware: FirmwareProtocol::Vial,
         });
-        app.current_device_name = "K04".into();
+        app.current_device_name = "Generic BT keyboard".into();
         app.hid_device = Some(hid);
         app.last_device_scan_at = 10.0;
+        app.last_full_device_scan_at = 10.0;
         (app, ctx, recorder)
+    }
+    #[test]
+    fn usb_hotplug_duplicate_identity_preserves_exact_owner_through_production_tick() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        for platform in ["linux", "windows", "macos"] {
+            for serial in ["", "duplicated-serial"] {
+                for old_reversed in [false, true] {
+                    for new_reversed in [false, true] {
+                        for change in ["unchanged", "unplug", "reenumerated"] {
+                            let (mut app, ctx, recorder) = fixture();
+                            let mut a = device("Same model", "Usb");
+                            a.serial_number = serial.into();
+                            a.path = "/nonexistent/duplicate-a".into();
+                            a.instance_token = "instance-a".into();
+                            let mut b = a.clone();
+                            b.path = "/nonexistent/duplicate-b".into();
+                            b.instance_token = "instance-b".into();
+                            assert_eq!(a.stable_identity(), b.stable_identity());
+                            let mut old = vec![a.clone(), b.clone()];
+                            if old_reversed { old.reverse(); }
+                            app.selected_device = Some(if old_reversed { 0 } else { 1 });
+                            app.device_manager.replace_devices(old);
+                            app.qmk_hid_hosts.insert(a.path.clone(), crate::qmk_hid_host::QmkHidHostBridge::test_inert(
+                                a.clone(), Default::default(), None, crate::qmk_hid_host::HostProtocol::Discover));
+                            let generation = app.connection_generation;
+                            let (tx, rx) = mpsc::channel(); app.test_device_scan_requests = Some(tx);
+                            let (tx, connects) = mpsc::channel(); app.test_connect_requests = Some(tx);
+                            app.update_native_background_for_platform(&ctx, 12.0, false, false, platform);
+                            let (usb, complete) = rx.try_recv().unwrap(); assert!(usb);
+                            let mut snapshot = vec![a.clone()];
+                            if change != "unplug" {
+                                let mut current = b.clone();
+                                if change == "reenumerated" { current.instance_token = "new-b".into(); }
+                                snapshot.push(current);
+                            }
+                            if new_reversed { snapshot.reverse(); }
+                            complete.send(Ok(snapshot)).unwrap();
+                            app.update_native_background_for_platform(&ctx, 12.1, false, false, platform);
+                            assert!(app.qmk_hid_hosts.contains_key(&a.path), "unrelated background owner survives {change}");
+                            if change == "unchanged" {
+                                assert!(app.hid_device.is_some(), "unchanged exact owner lost: {platform}, serial={serial:?}, old_reversed={old_reversed}, new_reversed={new_reversed}");
+                                assert!(app.layout.is_some());
+                                assert_eq!(app.connection_generation, generation);
+                                assert_eq!(app.device_manager.devices()[app.selected_device.unwrap()].path, b.path);
+                            } else {
+                                assert!(app.hid_device.is_none()); assert!(app.layout.is_none());
+                                assert!(!app.selected_device.is_some_and(|i| app.device_manager.devices()[i].path == a.path), "never substitute indistinguishable background endpoint");
+                            }
+                            assert!(connects.try_recv().is_err()); assert!(recorder.requests().is_empty());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_usb_metadata_errors_preserve_selected_and_background_owners_through_production_tick() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        for platform in ["linux", "windows", "macos"] {
+            for case in (1..=17).chain(22..=32) {
+                if [12, 13, 14].contains(&case) { continue; }
+                let (mut app, ctx, recorder) = fixture();
+                let selected = device("Selected USB", "Usb");
+                let background = device("Background USB", "Usb");
+                app.device_manager.replace_devices(vec![selected.clone(), background.clone()]);
+                app.qmk_hid_hosts.insert(background.path.clone(), crate::qmk_hid_host::QmkHidHostBridge::test_inert(
+                    background.clone(), Default::default(), None, crate::qmk_hid_host::HostProtocol::Discover));
+                let generation = app.connection_generation;
+                let (tx, rx) = mpsc::channel(); app.test_device_scan_requests = Some(tx);
+                let (tx, connects) = mpsc::channel(); app.test_connect_requests = Some(tx);
+                app.update_native_background_for_platform(&ctx, 12.0, false, false, platform);
+                let (usb, complete) = rx.try_recv().unwrap(); assert!(usb);
+                complete.send(DeviceManager::test_linux_usb_metadata_snapshot(case)).unwrap();
+                app.update_native_background_for_platform(&ctx, 12.1, false, false, platform);
+                assert!(app.hid_device.is_some(), "Linux incomplete metadata case {case} retired selected owner on {platform} policy");
+                assert!(app.layout.is_some()); assert_eq!(app.selected_device, Some(0));
+                assert_eq!(app.connection_generation, generation);
+                assert_eq!(app.device_manager.devices()[0].path, selected.path);
+                assert_eq!(app.device_manager.devices()[1].path, background.path);
+                assert!(app.qmk_hid_hosts.contains_key(&background.path));
+                assert!(connects.try_recv().is_err()); assert!(recorder.requests().is_empty());
+            }
+        }
+    }
+    #[test]
+    fn macos_usb_hotplug_admits_metadata_scan_through_production_tick() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (mut app, ctx, recorder) = fixture();
+        let generation = app.connection_generation;
+        let (tx, rx) = mpsc::channel();
+        app.test_device_scan_requests = Some(tx);
+        app.update_native_background_for_platform(&ctx, 12.0, false, true, "macos");
+        let (usb_only, complete) = rx.try_recv().expect("macOS must admit USB metadata scan while Generic BT keyboard Bluetooth owner is active");
+        assert!(usb_only);
+        complete.send(Ok(vec![device("Macropad", "Usb")])).unwrap();
+        app.update_native_background_for_platform(&ctx, 12.1, false, true, "macos");
+        assert_eq!(app.device_manager.devices().len(), 2);
+        assert_eq!(app.selected_device, Some(0));
+        assert!(app.hid_device.is_some());
+        assert_eq!(app.connection_generation, generation);
+        assert!(recorder.requests().is_empty());
+    }
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn macos_usb_hotplug_registry_failures_preserve_inventory_through_production_tick() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        for platform in ["macos", "windows", "linux"] {
+            let (mut app, ctx, recorder) = fixture();
+            let generation = app.connection_generation;
+            let (tx, rx) = mpsc::channel(); app.test_device_scan_requests = Some(tx);
+            let (tx, connections) = mpsc::channel(); app.test_connect_requests = Some(tx);
+            app.update_native_background_for_platform(&ctx, 12.0, false, true, platform);
+            let (usb, complete) = rx.try_recv().unwrap(); assert!(usb);
+            complete.send(DeviceManager::test_macos_usb_registry_snapshot(0)).unwrap();
+            app.update_native_background_for_platform(&ctx, 12.1, false, true, platform);
+            assert_eq!(app.device_manager.devices()[1].path, "DevSrvsID:4294968123");
+            let identity = app.device_manager.devices()[1].stable_identity();
+            for case in 1..=6 {
+                let now = 12.0 + f64::from(case) * 2.0;
+                app.update_native_background_for_platform(&ctx, now, false, true, platform);
+                let (usb, complete) = rx.try_recv().unwrap(); assert!(usb);
+                complete.send(DeviceManager::test_macos_usb_registry_snapshot(case)).unwrap();
+                app.update_native_background_for_platform(&ctx, now + 0.1, false, true, platform);
+                assert_eq!(app.device_manager.devices().len(), 2);
+                assert_eq!(app.device_manager.devices()[1].stable_identity(), identity);
+                assert_eq!(app.connection_generation, generation);
+                assert!(app.hid_device.is_some()); assert_eq!(app.selected_device, Some(0));
+            }
+            assert!(connections.try_recv().is_err()); assert!(recorder.requests().is_empty());
+        }
+    }
+    #[test]
+    fn macos_usb_hotplug_generic_background_owners_survive_usb_selection_changes() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        for usb_first in [false, true] {
+            let (mut app, ctx, recorder) = fixture();
+            let bt1 = device("Unrelated vendor BLE keyboard", "Bluetooth");
+            let bt2 = device("Second generic BT keyboard", "Bluetooth");
+            let usb = device("Generic wired USB keyboard", "Usb");
+            app.device_manager.replace_devices(if usb_first {
+                vec![usb, bt1.clone(), bt2.clone()]
+            } else { vec![bt1.clone(), bt2.clone(), usb] });
+            app.selected_device = Some(if usb_first { 0 } else { 2 });
+            for bt in [&bt1, &bt2] {
+                app.qmk_hid_hosts.insert(bt.path.clone(), crate::qmk_hid_host::QmkHidHostBridge::test_inert(
+                    bt.clone(), Default::default(), None, crate::qmk_hid_host::HostProtocol::Discover));
+            }
+            let (tx, rx) = mpsc::channel(); app.test_device_scan_requests = Some(tx);
+            let (tx, connects) = mpsc::channel(); app.test_connect_requests = Some(tx);
+            app.update_native_background_for_platform(&ctx, 12.0, false, false, "macos");
+            let (usb_only, done) = rx.try_recv().expect("any background Bluetooth owners permit USB metadata discovery");
+            assert!(usb_only); done.send(Ok(vec![])).unwrap();
+            app.update_native_background_for_platform(&ctx, 12.1, false, false, "macos");
+            assert!(app.layout.is_none()); assert!(app.selected_device.is_none());
+            assert!(app.status_msg.is_empty()); assert_eq!(app.device_manager.devices().len(), 2);
+            for bt in [&bt1, &bt2] { assert!(app.qmk_hid_hosts.contains_key(&bt.path)); }
+            assert!(connects.try_recv().is_err()); assert!(recorder.requests().is_empty());
+        }
+    }
+    #[test]
+    fn usb_hotplug_all_platforms_no_bluetooth_control_keeps_normal_scan_admission() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        for platform in ["windows", "linux", "macos"] {
+        let (mut app, ctx, _) = fixture();
+        app.device_manager.replace_devices(vec![device("Ordinary wired keyboard", "Usb")]);
+        let (tx, rx) = mpsc::channel(); app.test_device_scan_requests = Some(tx);
+        // USB metadata refresh is fast without any BT owner too; full HID
+        // discovery retains its existing low-frequency cadence independently.
+        app.update_native_background_for_platform(&ctx, 11.9, false, false, platform);
+        assert!(rx.try_recv().is_err());
+        app.update_native_background_for_platform(&ctx, 12.0, false, false, platform);
+        let (usb_only, complete) = rx.try_recv().expect("no-BT USB discovery at two seconds");
+        assert!(usb_only);
+        complete.send(Ok(app.device_manager.devices().to_vec())).unwrap();
+        app.update_native_background_for_platform(&ctx, 12.1, false, false, platform);
+        app.update_native_background_for_platform(&ctx, 40.0, false, false, platform);
+        let (usb_only, complete) = rx.try_recv().expect("no BT owner must not suppress ordinary full enumeration");
+        assert!(!usb_only);
+        complete.send(Ok(app.device_manager.devices().to_vec())).unwrap();
+        app.update_native_background_for_platform(&ctx, 40.1, false, false, platform);
+        app.update_native_background_for_platform(&ctx, 42.0, false, false, platform);
+        assert!(rx.try_recv().expect("ordinary Mac USB hotplug must refresh at two seconds without any Bluetooth keyboard").0);
+        }
     }
     #[test]
     fn usb_hotplug_unplug_first_usb_does_not_retire_retained_bluetooth_bridge() {
@@ -145,7 +330,7 @@ mod usb_hotplug_tests {
                 assert!(!labels.iter().any(|s| s.contains("Не удалось открыть")
                     || s.contains("Could not open")
                     || s.contains("USB device changed")));
-                assert!(labels.iter().any(|s| s.contains("K04")));
+                assert!(labels.iter().any(|s| s.contains("Generic BT keyboard")));
                 assert!(connect_rx.try_recv().is_err());
                 // Real open failures still retain the error heading and detail.
                 app.status_msg = "Open failed: fixture access denied".into();
@@ -211,7 +396,7 @@ mod usb_hotplug_tests {
             }
             let (tx, rx) = mpsc::channel();
             app.test_device_scan_requests = Some(tx);
-            app.update_native_background(&ctx, 12.0, false, false);
+            app.update_native_background_for_platform(&ctx, 12.0, false, false, "macos");
             let (usb_only, _) = rx.try_recv().expect(
                 "the actual Bluetooth owner, not editor selection, determines USB-only scanning",
             );
@@ -282,7 +467,7 @@ mod usb_hotplug_tests {
         let generation = app.connection_generation;
         let (tx, rx) = mpsc::channel();
         app.test_device_scan_requests = Some(tx);
-        app.update_native_background(&ctx, 12.0, false, true);
+        app.update_native_background_for_platform(&ctx, 12.0, false, true, "macos");
         let (usb_only, complete) = rx
             .try_recv()
             .expect("worker-borrowed BT owner still permits USB discovery only");
@@ -293,7 +478,7 @@ mod usb_hotplug_tests {
         assert!(app.settings_write_task.is_some());
         assert_eq!(
             app.device_manager.devices()[app.selected_device.unwrap()].name,
-            "K04"
+            "Generic BT keyboard"
         );
         release_tx.send(()).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -363,7 +548,7 @@ mod usb_hotplug_tests {
         assert_eq!(app.device_manager.devices().len(), 2);
         assert_eq!(
             app.device_manager.devices()[app.selected_device.unwrap()].name,
-            "K04"
+            "Generic BT keyboard"
         );
         assert_eq!(app.connection_generation, old_generation);
         assert!(app.hid_device.is_some());

@@ -183,6 +183,18 @@ impl EntropyApp {
         main_window_hidden_to_tray: bool,
         selected_device_is_bluetooth: bool,
     ) {
+        self.update_native_background_for_platform(ctx, now, main_window_hidden_to_tray,
+            selected_device_is_bluetooth, std::env::consts::OS);
+    }
+
+    // OS policy is explicit so foreign admission can be exercised through the
+    // complete production tick without pretending Linux is a native Mac.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn update_native_background_for_platform(
+        &mut self, ctx: &egui::Context, now: f64,
+        main_window_hidden_to_tray: bool, selected_device_is_bluetooth: bool,
+        discovery_platform: &str,
+    ) {
         self.poll_vial_hid_task(ctx);
         self.poll_sticky_layout_background(ctx);
         self.poll_settings_write(ctx);
@@ -206,19 +218,26 @@ impl EntropyApp {
                 || self.bluetooth_discovery_owner_active();
             // USB-only metadata enumeration is implemented without Bluetooth
             // device opens on these platforms. Keep the old fail-safe elsewhere.
-            let usb_only = bluetooth_busy && cfg!(any(target_os = "linux", target_os = "windows"));
             let has_discovered_devices = !self.device_manager.devices().is_empty();
-            let interval = if usb_only { 2.0 } else {
-                periodic_device_scan_interval_secs(hid_session_active, has_discovered_devices)
-            };
+            let full_interval = periodic_device_scan_interval_secs(hid_session_active, has_discovered_devices);
+            // USB hotplug on every supported OS must not wait for global HID
+            // refresh even with no Bluetooth keyboards. Keep full discovery for
+            // cold startup/new Bluetooth devices, only when every owner allows it.
+            let usb_metadata_supported = matches!(discovery_platform, "linux" | "windows" | "macos");
+            let full_due = self.last_full_device_scan_at == 0.0
+                || now - self.last_full_device_scan_at >= full_interval;
+            let usb_only = usb_metadata_supported && (bluetooth_busy || !full_due);
+            let interval = if usb_only || usb_metadata_supported { 2.0 } else { full_interval };
             if usb_only || periodic_device_scan_allowed(bluetooth_busy, hid_session_active || bluetooth_busy) {
-                if self.last_device_scan_at == 0.0 || now - self.last_device_scan_at >= interval {
+                if (self.last_device_scan_at == 0.0 || now - self.last_device_scan_at >= interval)
+                    && (!usb_metadata_supported || matches!(self.device_scan_state, DeviceScanState::Idle)) {
                     self.scan_frame = self.scan_frame.wrapping_add(1);
                     self.last_device_scan_at = now;
+                    if !usb_only { self.last_full_device_scan_at = now; }
                     if usb_only { self.start_usb_device_scan(); }
                     else { self.start_device_scan(); }
                 }
-                if usb_only {
+                if usb_only || usb_metadata_supported {
                     ctx.request_repaint_after(std::time::Duration::from_secs_f64(
                         (interval - (now - self.last_device_scan_at)).clamp(0.025, interval)));
                 }
@@ -2159,5 +2178,5 @@ impl eframe::App for EntropyApp {
     }
 }
 
-#[cfg(all(test, any(target_os="linux",target_os="windows")))]
+#[cfg(all(test, any(target_os="linux",target_os="windows",target_os="macos")))]
 include!("usb_hotplug_tests.rs");

@@ -27,7 +27,7 @@ const LAYOUT_RESEND_INTERVAL: Duration = Duration::from_secs(10);
 const MEDIA_POLL_INTERVAL: Duration = Duration::from_millis(500);
 #[cfg(not(target_os = "windows"))]
 const MEDIA_POLL_INTERVAL: Duration = Duration::from_secs(1);
-// One process-wide desktop sampler, not one uninterruptible query thread per
+// One process-wide desktop service with bounded independent polling lanes, not one query thread per
 // bridge/reconnect. It never owns HID or a host-output lease. Demand and cached
 // results share one short-held lock; no desktop call executes under that lock.
 static HOST_DATA_SERVICE: OnceLock<HostDataService> = OnceLock::new();
@@ -198,7 +198,7 @@ impl Drop for DesktopOwner {
     fn drop(&mut self) {
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         state.stopped = true;
-        self.shared.wake.notify_one();
+        self.shared.wake.notify_all();
     }
 }
 
@@ -248,13 +248,17 @@ impl DesktopSource for NativeDesktopSource {
 }
 
 impl HostDataService {
-    fn start<S: DesktopSource + 'static>(source: impl FnOnce() -> S + Send + 'static) -> Self {
+    fn start<S: DesktopSource + 'static>(source: impl Fn() -> S + Send + Sync + 'static) -> Self {
         let shared = Arc::new(DesktopShared::default());
-        let worker = shared.clone();
-        // Construct platform objects on their owning thread (not all desktop
-        // handles are Send). One sampler lives for the production process;
-        // when idle it waits for subscribers, without any OS polling.
-        thread::spawn(move || run_desktop_service(worker, source()));
+        let source = Arc::new(source);
+        // One process-wide service, three bounded lanes. Construct platform
+        // handles on their owning thread; no OS query or source owns HID.
+        // A slow layout/media API must never freeze fresh volume feedback.
+        for index in 0..3 {
+            let worker = shared.clone();
+            let source = source.clone();
+            thread::spawn(move || run_desktop_service(worker, source(), index));
+        }
         Self {
             owner: Arc::new(DesktopOwner { shared }),
         }
@@ -276,7 +280,7 @@ impl HostDataService {
                 state.demand[index] += 1;
             }
         }
-        self.owner.shared.wake.notify_one();
+        self.owner.shared.wake.notify_all();
         DesktopSubscription {
             service: self.clone(),
             enabled,
@@ -318,41 +322,26 @@ impl Drop for DesktopSubscription {
                 }
             }
         }
-        shared.wake.notify_one();
+        shared.wake.notify_all();
     }
 }
 
-fn run_desktop_service(shared: Arc<DesktopShared>, mut source: impl DesktopSource) {
-    let intervals = [
-        VOLUME_POLL_INTERVAL,
-        Duration::from_millis(100),
-        MEDIA_POLL_INTERVAL,
-    ];
-    let mut last_poll = [Instant::now() - Duration::from_secs(60); 3];
-    let mut last_epoch = [0; 3];
+fn run_desktop_service(shared: Arc<DesktopShared>, mut source: impl DesktopSource, index: usize) {
+    let interval = [VOLUME_POLL_INTERVAL, Duration::from_millis(100), MEDIA_POLL_INTERVAL][index];
+    let mut last_poll = Instant::now() - Duration::from_secs(60);
+    let mut last_epoch = 0;
     loop {
         let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        while !state.stopped && state.demand == [0; 3] {
+        while !state.stopped && state.demand[index] == 0 {
             state = shared.wake.wait(state).unwrap_or_else(|e| e.into_inner());
         }
-        if state.stopped {
-            break;
-        }
+        if state.stopped { return; }
+        let epoch = state.epoch[index];
+        let due = last_epoch != epoch || last_poll.elapsed() >= interval;
         drop(state);
-        for index in 0..3 {
-            let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.stopped {
-                return;
-            }
-            let epoch = state.epoch[index];
-            let due = state.demand[index] > 0
-                && (last_epoch[index] != epoch || last_poll[index].elapsed() >= intervals[index]);
-            drop(state);
-            if !due {
-                continue;
-            }
-            last_epoch[index] = epoch;
-            last_poll[index] = Instant::now();
+        if due {
+            last_epoch = epoch;
+            last_poll = Instant::now();
             let started = Instant::now();
             let mut sample = DesktopSnapshot::default();
             match index {
@@ -365,10 +354,8 @@ fn run_desktop_service(shared: Arc<DesktopShared>, mut source: impl DesktopSourc
                 }
             }
             let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.stopped {
-                return;
-            }
-            // A completed old query may not populate a newly enabled session.
+            if state.stopped { return; }
+            // Old in-flight queries cannot populate a re-enabled session.
             if state.demand[index] > 0 && state.epoch[index] == epoch {
                 match index {
                     0 => state.snapshot.volume = sample.volume,
@@ -382,9 +369,7 @@ fn run_desktop_service(shared: Arc<DesktopShared>, mut source: impl DesktopSourc
             }
         }
         let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.stopped {
-            break;
-        }
+        if state.stopped { return; }
         let _ = shared.wake.wait_timeout(state, Duration::from_millis(20));
     }
 }
@@ -1123,7 +1108,13 @@ impl QmkHidHostBridge {
             mode,
             shared_output,
             protocol,
-            HostDataService::start(move || TestMediaSource(media_source)),
+            HostDataService::start({
+                let source = Arc::new(Mutex::new(media_source));
+                move || {
+                    let source = source.clone();
+                    TestMediaSource(move || (source.lock().unwrap_or_else(|e| e.into_inner()))())
+                }
+            }),
             open_hid,
         )
     }

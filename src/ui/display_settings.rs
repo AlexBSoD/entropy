@@ -351,7 +351,7 @@ fn pictogram_sort_key(key: &str) -> String {
         "home end page_up page_down insert bookmark history search web_search focus zoom_out zoom_in move_left move_right move_up move_down move_horizontal move_vertical move link panel_left panel_right panel_bottom view_front view_right view_top send_to_back control_panel",
         "undo redo select_all text_cursor_input type replace scissors eraser delete",
         "brightness_down brightness_up computer settings control_panel calculator screenshot lock",
-        "single_tap double_tap hold plus maximize expand corner_up_left corner_up_right scan scan_line scan_dashed square_dashed list_filter list_restart route hand box bandage line_squiggle incognito bring_to_front",
+        "single_tap double_tap hold plus maximize expand corner_up_left corner_up_right scan scan_line scan_dashed square_dashed list_filter list_restart route hand box bandage line_squiggle incognito bring_to_front backspace delete",
         "previous_track next_track skip_back skip_forward",
         "step_back step_forward flag flag_triangle_right",
         "volume_down volume volume_2 mute volume_x headphones",
@@ -395,6 +395,11 @@ const PICTOGRAM_GROUP_KEYS: [&str; 22] = [
 
 #[cfg(not(target_arch = "wasm32"))]
 fn pictogram_group(key: &str) -> usize {
+    // Keep the two native deletion keys together in Backspace's existing group.
+    // The generic eraser/delete action keeps its own established placement.
+    if matches!(key, "display_settings.pictogram_firmware_backspace" | "display_settings.pictogram_firmware_delete") {
+        return 13;
+    }
     if key.contains("pictogram_firmware_layer_") {
         return 0;
     }
@@ -5624,12 +5629,15 @@ mod icon_catalog_tests {
                 ..firmware_start + crate::firmware_builtin_icons::FIRMWARE_ICON_COUNT],
             &crate::firmware_builtin_icons::FIRMWARE_ICON_KEYS,
         );
+        let appended_start = firmware_start
+            + crate::firmware_builtin_icons::FIRMWARE_ICON_COUNT
+            + crate::integration_icons::INTEGRATION_ICON_COUNT;
         assert_eq!(
-            BUILTIN_PICTOGRAM_KEYS.len(),
-            firmware_start
-                + crate::firmware_builtin_icons::FIRMWARE_ICON_COUNT
-                + crate::integration_icons::INTEGRATION_ICON_COUNT,
+            &BUILTIN_PICTOGRAM_KEYS[appended_start..],
+            &["display_settings.pictogram_firmware_delete"],
+            "native additions must be append-only after the unchanged source families",
         );
+        assert_eq!(BUILTIN_PICTOGRAM_KEYS.len(), appended_start + 1);
     }
 
     #[test]

@@ -41,11 +41,11 @@ pub(super) fn is_known_migrated_stock_pictogram(icon: &SavedPictogram) -> bool {
                 // Exact source/artifact-backed older stroke revisions. Names
                 // alone are not provenance: unknown/edited pixels stay visible.
                 let offset = index * PICTOGRAM_BYTES;
-                bitmaps.push(
-                    pre_thinning[offset..offset + PICTOGRAM_BYTES]
-                        .try_into()
-                        .unwrap(),
-                );
+                // This immutable historical snapshot predates append-only
+                // catalog additions; do not index or invent old artwork for them.
+                if let Some(old) = pre_thinning.get(offset..offset + PICTOGRAM_BYTES) {
+                    bitmaps.push(old.try_into().unwrap());
+                }
                 if (firmware_start + 20..firmware_start + 22).contains(&index) {
                     let offset = (index - firmware_start - 20) * PICTOGRAM_BYTES;
                     bitmaps.push(
@@ -80,6 +80,17 @@ pub(super) fn is_known_migrated_stock_pictogram(icon: &SavedPictogram) -> bool {
             let new_name = crate::i18n::tr_catalog(language, "display_settings.pictogram_firmware_backspace");
             if let Some(masks) = records.get(new_name).cloned() {
                 records.entry(old_name.to_owned()).or_default().extend(masks);
+            }
+        }
+        // Disambiguated native Page key captions must still recognize exact
+        // Russian stock records from older libraries, never authored/edited art.
+        for (old_name, key) in [
+            ("Страница вверх", "display_settings.pictogram_firmware_page_up"),
+            ("Страница вниз", "display_settings.pictogram_firmware_page_down"),
+        ] {
+            let name = crate::i18n::tr_catalog(crate::i18n::Language::Russian, key);
+            if let Some(masks) = records.get(name).cloned() {
+                records.entry(old_name.into()).or_default().extend(masks);
             }
         }
         records

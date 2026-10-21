@@ -1,6 +1,12 @@
 #[cfg(not(target_arch = "wasm32"))]
 #[path = "usb_discovery.rs"]
 mod usb_discovery;
+#[cfg(any(target_os = "macos", test))]
+#[path = "macos_usb_metadata.rs"]
+pub(crate) mod macos_usb_metadata;
+#[cfg(any(target_os = "macos", test))]
+#[path = "macos_usb_discovery.rs"]
+mod macos_usb_discovery;
 use crate::firmware::FirmwareProtocol;
 
 const ERGOHAVEN_VENDOR_ID: u16 = 0xE126;
@@ -517,6 +523,11 @@ impl DeviceManager {
         }
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn test_linux_usb_metadata_snapshot(case: u8) -> Result<Vec<Device>, String> {
+        usb_discovery::linux_fixture_snapshot(case)
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     pub fn scan_usb_devices() -> Result<Vec<Device>, String> { usb_discovery::scan() }
 
@@ -593,6 +604,11 @@ impl DeviceManager {
         }
 
         log::info!("Found {} Vial device(s)", self.devices.len());
+    }
+
+    #[cfg(all(test, not(target_os = "macos")))]
+    pub(crate) fn test_macos_usb_registry_snapshot(case: u8) -> Result<Vec<Device>, String> {
+        macos_usb_discovery::registry_tests::snapshot(case)
     }
 
     pub fn replace_devices(&mut self, devices: Vec<Device>) {

@@ -8,7 +8,7 @@ pub(super) fn scan() -> Result<Vec<Device>, String> {
     // descriptors only (no hidraw open/ioctl). Do not call scan_devices(): it
     // additionally enters BlueZ. Return USB endpoints only.
     let api = hidapi::HidApi::new().map_err(|e| format!("USB metadata scan failed: {e}"))?;
-    Ok(api
+    validate_linux_snapshot(std::path::Path::new("/sys/class/hidraw"), api
         .device_list()
         .filter(|i| {
             matches!(i.bus_type(), hidapi::BusType::Usb)
@@ -34,6 +34,17 @@ pub(super) fn scan() -> Result<Vec<Device>, String> {
         .collect())
 }
 
+#[cfg(target_os = "linux")]
+#[path = "linux_usb_metadata.rs"]
+mod linux_metadata;
+
+// hidapi 2.6.6 swallows class enumeration, identity and descriptor errors.
+// Its Ok result authorizes removals only after independent sysfs validation.
+#[cfg(target_os = "linux")]
+fn validate_linux_snapshot(root: &std::path::Path, devices: Vec<Device>) -> Result<Vec<Device>, String> {
+    linux_metadata::validate(root, devices)
+}
+
 // Stop before an adapter's USB ancestor: Bluetooth peripherals often sit under
 // an USB Bluetooth radio. Only USB VID/PID ancestors prove a USB peripheral.
 #[cfg(any(target_os = "windows", test))]
@@ -55,7 +66,12 @@ pub(super) fn scan() -> Result<Vec<Device>, String> {
     windows_usb::scan()
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(target_os = "macos")]
+pub(super) fn scan() -> Result<Vec<Device>, String> {
+    super::macos_usb_discovery::scan()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 pub(super) fn scan() -> Result<Vec<Device>, String> {
     Err("USB-only discovery is not available on this platform; Bluetooth protection remains enabled".into())
 }
@@ -263,9 +279,125 @@ mod windows_usb {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn linux_fixture_snapshot(case: u8) -> Result<Vec<Device>, String> {
+    use std::{fs, os::unix::{fs::{symlink, MetadataExt}}};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("class/hidraw");
+    let usb = temp.path().join("devices/usb1/1-1");
+    let hid = usb.join("1-1:1.0/0003:FFFF:FFFF.0001");
+    let raw = root.join("hidraw0");
+    fs::create_dir_all(&raw).unwrap(); fs::create_dir_all(&hid).unwrap();
+    symlink(&hid, raw.join("device")).unwrap();
+    fs::write(hid.join("uevent"), "HID_ID=0003:0000FFFF:0000FFFF\nHID_NAME=Fixture keyboard\nHID_UNIQ=\n").unwrap();
+    fs::write(hid.join("report_descriptor"), [0x06, 0x60, 0xff, 0x09, 0x61, 0xa1, 0x01, 0xc0]).unwrap();
+    for (file, value) in [("idVendor", "ffff\n"), ("idProduct", "ffff\n"), ("product", "Fixture keyboard\n"), ("manufacturer", "Fixture\n")] {
+        fs::write(usb.join(file), value).unwrap();
+    }
+    let mut usb_descriptor = [18, 1, 0, 2, 0, 0, 0, 64, 0xff, 0xff, 0xff, 0xff, 0, 1, 1, 2, 0, 1];
+    fs::write(usb.join("descriptors"), usb_descriptor).unwrap();
+    let metadata = fs::metadata(&hid).unwrap();
+    let mut devices = vec![Device {
+        name: "Fixture keyboard".into(), manufacturer: "Fixture".into(), serial_number: "".into(),
+        vendor_id: 0xffff, product_id: 0xffff, bus_type: "Usb".into(), path: "/dev/hidraw0".into(),
+        instance_token: format!("sysfs:{}:{}:{}", hid.display(), metadata.dev(), metadata.ino()),
+        firmware: FirmwareProtocol::Vial,
+    }];
+    match case {
+        0 => {},
+        1 => { return validate_linux_snapshot(&root.join("missing"), vec![]); },
+        2 => { fs::remove_dir_all(&hid).unwrap(); },
+        3 => { fs::remove_file(hid.join("uevent")).unwrap(); },
+        4 => { fs::write(hid.join("uevent"), "HID_ID=broken\n").unwrap(); },
+        5 => { fs::remove_file(hid.join("report_descriptor")).unwrap(); },
+        6 => { fs::write(hid.join("report_descriptor"), [0x06, 0x60]).unwrap(); },
+        7 => { fs::remove_file(usb.join("manufacturer")).unwrap(); },
+        8 => { fs::remove_file(usb.join("product")).unwrap(); },
+        9 => { fs::write(hid.join("uevent"), "HID_ID=0003:0000FFFF:0000FFFF\nHID_NAME=Fixture keyboard\n").unwrap(); },
+        10 => { devices.clear(); }, // hidapi swallowed endpoint/descriptor failure
+        11 => { devices[0].manufacturer.clear(); },
+        12 => { fs::remove_dir_all(&raw).unwrap(); devices.clear(); },
+        13 => { // Bluetooth bus stops before descriptor/USB ancestors.
+            fs::write(hid.join("uevent"), "HID_ID=0005:0000FFFF:0000FFFF\n").unwrap();
+            fs::remove_file(hid.join("report_descriptor")).unwrap(); devices.clear();
+        },
+        14 => { fs::write(hid.join("report_descriptor"), [0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0xc0]).unwrap(); devices.clear(); },
+        15 => { devices[0].instance_token.clear(); },
+        16 => { fs::remove_file(usb.join("idVendor")).unwrap(); },
+        17 => { devices[0].serial_number = "invented".into(); },
+        18..=20 => { // USB index zero proves legitimate omitted identity strings.
+            if case != 19 {
+                usb_descriptor[14] = 0;
+                fs::remove_file(usb.join("manufacturer")).unwrap();
+                devices[0].manufacturer.clear();
+            }
+            if case != 18 {
+                usb_descriptor[15] = 0;
+                fs::remove_file(usb.join("product")).unwrap();
+                devices[0].name = "Unknown Keyboard".into();
+            }
+            fs::write(usb.join("descriptors"), usb_descriptor).unwrap();
+        },
+        21 => { fs::write(usb.join("product"), "\n").unwrap(); devices[0].name.clear(); },
+        22 => { fs::remove_file(usb.join("descriptors")).unwrap(); },
+        23 => { fs::write(usb.join("descriptors"), &usb_descriptor[..17]).unwrap(); },
+        24..=27 => {
+            let index = match case { 24 => 0, 25 => 1, 26 => 8, _ => 10 };
+            usb_descriptor[index] = 0;
+            fs::write(usb.join("descriptors"), usb_descriptor).unwrap();
+        },
+        28..=29 => {
+            let field = if case == 28 { "manufacturer" } else { "product" };
+            fs::remove_file(usb.join(field)).unwrap();
+            fs::create_dir(usb.join(field)).unwrap();
+        },
+        30 => { fs::write(usb.join("product"), [0xff]).unwrap(); },
+        31..=32 => { // An index-zero claim contradicting a present sysfs string.
+            usb_descriptor[if case == 31 { 14 } else { 15 }] = 0;
+            fs::write(usb.join("descriptors"), usb_descriptor).unwrap();
+        },
+        _ => panic!("unknown Linux metadata fixture"),
+    }
+    validate_linux_snapshot(&root, devices)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_usb_metadata_accepts_descriptor_proven_omitted_identity_strings() {
+        for case in 18..=20 {
+            let devices = linux_fixture_snapshot(case).unwrap();
+            assert_eq!(devices.len(), 1);
+            assert_eq!(devices[0].manufacturer, if case == 19 { "Fixture" } else { "" });
+            assert_eq!(devices[0].name, if case == 18 { "Fixture keyboard" } else { "Unknown Keyboard" });
+        }
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_usb_metadata_preserves_present_empty_product() {
+        let devices = linux_fixture_snapshot(21).unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "");
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_usb_metadata_rejects_invalid_usb_identity_evidence() {
+        for case in 22..=32 {
+            assert!(linux_fixture_snapshot(case).is_err(), "invalid USB identity evidence case {case}");
+        }
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_usb_metadata_rejects_incomplete_or_degraded_snapshots() {
+        for case in 1..=17 {
+            if [12, 13, 14].contains(&case) { continue; }
+            assert!(linux_fixture_snapshot(case).is_err(), "incomplete Linux metadata case {case} must not authorize removal");
+        }
+        assert_eq!(linux_fixture_snapshot(0).unwrap().len(), 1);
+        for case in [12, 13, 14] { assert!(linux_fixture_snapshot(case).unwrap().is_empty()); }
+    }
     #[test]
     fn usb_hotplug_windows_filters_bluetooth_before_any_hid_open() {
         let cases: &[(&[&str], bool)] = &[

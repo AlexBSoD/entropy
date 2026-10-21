@@ -443,6 +443,8 @@ pub(crate) const BUILTIN_PICTOGRAM_KEYS: &[&str] = &[
     "display_settings.pictogram_integration_obs_visible",
     "display_settings.pictogram_integration_obs_studio",
     "display_settings.pictogram_integration_obs_refresh",
+    // Append-only: stock indices are persisted in pictograms.json.
+    "display_settings.pictogram_firmware_delete",
 ];
 
 struct PictogramCanvas {
@@ -887,6 +889,11 @@ pub(crate) fn builtin_pictogram_bitmap(index: usize) -> [u8; PICTOGRAM_BYTES] {
 }
 
 fn render_builtin_pictogram_bitmap(index: usize) -> [u8; PICTOGRAM_BYTES] {
+    if BUILTIN_PICTOGRAM_KEYS.get(index) == Some(&"display_settings.pictogram_firmware_delete") {
+        // The approved native mask is shared with the default-key preview.
+        // It is outside the legacy generated table so none of its indices move.
+        return *include_bytes!("../assets/display-delete-right.bin");
+    }
     if index
         >= 38
             + crate::action_icons::ACTION_ICON_COUNT

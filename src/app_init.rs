@@ -160,6 +160,7 @@ impl EntropyApp {
             layer_clipboard: None,
             scan_frame: 0,
             last_device_scan_at: 0.0,
+            last_full_device_scan_at: 0.0,
             #[cfg(not(target_arch = "wasm32"))]
             next_battery_refresh_at: None,
             hover_layer: None,

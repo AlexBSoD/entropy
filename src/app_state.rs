@@ -5518,6 +5518,8 @@ pub struct EntropyApp {
     pub(crate) scan_frame: u32,
     /// Last device scan timestamp in egui seconds
     pub(crate) last_device_scan_at: f64,
+    /// Full HID discovery stays low-frequency; USB metadata has its own fast cadence on all supported OSes.
+    pub(crate) last_full_device_scan_at: f64,
     /// Next low-frequency battery refresh for supported devices.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) next_battery_refresh_at: Option<std::time::Instant>,

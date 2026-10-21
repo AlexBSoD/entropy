@@ -62,7 +62,7 @@ impl EntropyApp {
         // All entrypoints (including reconnect/manual refresh) obey the actual
         // transport-owner fence, not just the periodic scheduler.
         let usb_only = self.bluetooth_discovery_owner_active();
-        if usb_only && !cfg!(any(target_os="linux",target_os="windows")) { return; }
+        if usb_only && !cfg!(any(target_os="linux",target_os="windows",target_os="macos")) { return; }
         self.start_device_scan_kind(usb_only);
     }
 
@@ -186,10 +186,30 @@ impl EntropyApp {
             // re-enumerated selected USB owner. Bluetooth absence cannot be
             // inferred from a partial USB snapshot.
             let previous = self.selected_device.and_then(|i| self.device_manager.devices().get(i)).cloned();
+            // Stable identity need not be unique (missing or duplicated serials).
+            // Prefer the actual retained enumeration, never the first same-model
+            // endpoint. Only an unambiguous old AND new identity may fall back.
+            let selected = previous.as_ref().and_then(|previous| {
+                let identity = previous.stable_identity();
+                devices.iter().position(|d| {
+                    d.path == previous.path && d.instance_token == previous.instance_token
+                        && d.stable_identity() == identity
+                }).or_else(|| {
+                    let old_unique = self.device_manager.devices().iter()
+                        .filter(|d| d.stable_identity() == identity).count() == 1;
+                    if !old_unique { return None; }
+                    let mut matches = devices.iter().enumerate()
+                        .filter_map(|(i, d)| (d.stable_identity() == identity).then_some(i));
+                    let first = matches.next()?;
+                    matches.next().is_none().then_some(first)
+                })
+            });
             self.device_manager.replace_devices(devices);
             if let Some(previous) = previous {
-                let selected = self.device_manager.devices().iter().position(|d| d.stable_identity() == previous.stable_identity());
-                let changed = selected.is_some_and(|i| usb_endpoint_was_reenumerated(&previous, &self.device_manager.devices()[i]));
+                let changed = selected.is_some_and(|i| {
+                    let current = &self.device_manager.devices()[i];
+                    previous.path != current.path || usb_endpoint_was_reenumerated(&previous, current)
+                });
                 if !previous.is_bluetooth_transport() && (selected.is_none() || changed) {
                     // Normal unplug/re-enumeration is not an open failure.
                     // Return to the neutral picker; real connection errors keep
