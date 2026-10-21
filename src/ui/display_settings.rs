@@ -5792,6 +5792,9 @@ include!("sm62_shared_settings.rs");
 #[cfg(test)]
 #[path = "display_settings/sm62_shared_write_tests.rs"]
 mod sm62_shared_write_tests;
+#[cfg(test)]
+#[path = "display_settings/sm62_review_controls_tests.rs"]
+mod sm62_review_controls_tests;
 include!("sm62_scroll.rs");
 
 const STANDBY_DELAY_KEYS: [&str; 8] = [
@@ -5840,20 +5843,26 @@ fn sm62_display_controls(
         else { ["Clock", "Player", "Spaceship", "Layout"] })
         .into_iter().map(str::to_owned).collect();
     let mut mode = values[base].min(3);
+    let mut mode_edited = false;
     display_settings_row(ui, width, row_height,
         if russian { "Режим по умолчанию" } else { "Default mode" },
         true, control_width, |ui| {
             let (_, picked) = crate::ui_style::modern_dropdown_select_sized(
                 ui, ui.make_persistent_id(("sm62_mode", side)), &modes,
                 mode as usize, control_width, 34.0, 12.0);
-            if let Some(picked) = picked { mode = picked as u8; }
+            if let Some(picked) = picked {
+                mode = picked as u8;
+                mode_edited = ui.is_enabled();
+            }
         });
-    sm62_apply_mode_change(values, changed, side, mode);
-    // Layout is already visible by default in this mode. Keep the stored
-    // option consistent so a key press can restore it after idle animation.
-    if mode == 3 && values[base + 3] == 0 {
-        values[base + 3] = 1;
-        changed.push(base + 3);
+    if mode_edited {
+        sm62_apply_mode_change(values, changed, side, mode);
+        // Couple this option only to an explicit enabled mode selection.
+        // Stored Layout/keypress=0 is valid input to a read-only render.
+        if mode == 3 && values[base + 3] == 0 {
+            values[base + 3] = 1;
+            changed.push(base + 3);
+        }
     }
 
     let language = if russian { crate::i18n::Language::Russian } else { crate::i18n::Language::English };
@@ -5900,19 +5909,20 @@ fn sm62_display_controls(
     ] {
         let locked_layout = offset == 3 && mode == 3;
         let locked_ship = offset == 1 && mode == 2;
-        let mut enabled = locked_layout || locked_ship || values[base + offset] != 0;
+        let mut enabled = values[base + offset] != 0;
+        let mut edited = false;
         display_settings_row(ui, width, row_height,
             if russian { label_ru } else { label_en },
             true, control_width, |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_enabled_ui(!locked_layout && !locked_ship, |ui| {
-                        crate::ui_style::settings_switch_sized_stable(
+                        edited = crate::ui_style::settings_switch_sized_stable(
                             ui, ("sm62_switch", side, offset), &mut enabled,
-                            Vec2::new(46.0, 24.0));
+                            Vec2::new(46.0, 24.0)).clicked();
                     });
                 });
             });
-        if u8::from(enabled) != values[base + offset] {
+        if edited && u8::from(enabled) != values[base + offset] {
             values[base + offset] = u8::from(enabled);
             changed.push(base + offset);
         }
@@ -6039,7 +6049,7 @@ impl EntropyApp {
             (screens_off_supported,screens_off_values,before_shared.1,confirmed_screens_off,248u16,"screens off"),
         ] {
             if ready && supported { for side in 0..2 {
-                if values[side] != before[side] && values[side] as u16 != self.pending_settings_write_value(qsid+side as u16).unwrap_or(confirmed[side] as u16) {
+                if values[side] != before[side] && self.explicit_display_setting_needs_write(qsid+side as u16, confirmed[side] as u16, values[side] as u16) {
                     self.queue_display_setting_write(format!("SM62 {} {}",if side==0 {"left"} else {"right"},label),
                         qsid+side as u16,confirmed[side] as u16,values[side] as u16);
                 }
@@ -6047,7 +6057,7 @@ impl EntropyApp {
         }
         if ready && language_supported {
             for side in 0..2 {
-                if language_values[side] != before_shared.2[side] && language_values[side] as u16 != self.pending_settings_write_value(244+side as u16).unwrap_or(confirmed_language[side] as u16) {
+                if language_values[side] != before_shared.2[side] && self.explicit_display_setting_needs_write(244+side as u16, confirmed_language[side] as u16, language_values[side] as u16) {
                     self.queue_display_setting_write(format!("SM62 {} language", if side == 0 { "left" } else { "right" }),
                         244 + side as u16, confirmed_language[side] as u16, language_values[side] as u16);
                 }
@@ -6056,7 +6066,7 @@ impl EntropyApp {
         self.display_settings.sm62_hold_ms = hold_values;
         if ready && hold_supported {
             for side in 0..2 {
-                if hold_values[side] != before_shared.3[side] && hold_values[side] != self.pending_settings_write_value(242+side as u16).unwrap_or(confirmed_hold[side]) {
+                if hold_values[side] != before_shared.3[side] && self.explicit_display_setting_needs_write(242+side as u16, confirmed_hold[side], hold_values[side]) {
                     self.queue_display_setting_write(
                         format!("SM62 {} layout hold", if side == 0 { "left" } else { "right" }),
                         242 + side as u16, confirmed_hold[side], hold_values[side],
@@ -6066,7 +6076,7 @@ impl EntropyApp {
         }
         if ready && date_supported {
             for side in 0..2 {
-                if date_values[side] != before_shared.4[side] && date_values[side] as u16 != self.pending_settings_write_value(240+side as u16).unwrap_or(confirmed_date[side] as u16) {
+                if date_values[side] != before_shared.4[side] && self.explicit_display_setting_needs_write(240+side as u16, confirmed_date[side] as u16, date_values[side] as u16) {
                     self.queue_display_setting_write(
                         format!("SM62 {} date", if side == 0 { "left" } else { "right" }),
                         240 + side as u16, confirmed_date[side] as u16, date_values[side] as u16,

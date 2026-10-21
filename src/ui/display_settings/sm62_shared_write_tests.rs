@@ -1,11 +1,11 @@
 use super::*;
 use std::time::{Duration, Instant};
 
-fn frame(app: &mut EntropyApp, ctx: &egui::Context) {
+pub(super) fn frame(app: &mut EntropyApp, ctx: &egui::Context) {
     frame_events(app, ctx, vec![]);
 }
 
-fn frame_events(
+pub(super) fn frame_events(
     app: &mut EntropyApp,
     ctx: &egui::Context,
     events: Vec<egui::Event>,
@@ -27,7 +27,7 @@ fn frame_events(
     )
 }
 
-fn drain(app: &mut EntropyApp, ctx: &egui::Context) {
+pub(super) fn drain(app: &mut EntropyApp, ctx: &egui::Context) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while app.qmk_settings_write_busy() && Instant::now() < deadline {
         app.poll_settings_write(ctx);
@@ -173,7 +173,7 @@ fn shared_sm62_exhausted_get_failure_is_stable_until_explicit_retry() {
     failed_shared_write_does_not_restart_on_repaint(0x0A);
 }
 
-fn click_shared(app: &mut EntropyApp, ctx: &egui::Context, label: &str) {
+pub(super) fn click_shared(app: &mut EntropyApp, ctx: &egui::Context, label: &str) {
     frame(app, ctx);
     let output = frame_events(app, ctx, vec![]);
     let y = output

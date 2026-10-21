@@ -77,7 +77,14 @@ impl MediaProgressClock {
         duration: Option<u32>,
         now: Instant,
     ) -> Option<u32> {
+        // A newer valid publication can be a seek back to the same raw
+        // position. Missing/stale/regressing timeline identity is not a seek.
+        let fresh_timeline = sample_age.is_some()
+            && last_updated_ticks.is_some_and(|ticks| {
+                ticks > 0 && self.last_updated_ticks.is_none_or(|previous| ticks > previous)
+            });
         if self.anchor.is_none()
+            || fresh_timeline
             || self.identity != identity
             || self.raw_position != raw_position
             || self.playing != playing
@@ -890,6 +897,7 @@ impl HostOutputLease {
                 let removed = HostDataMode {
                     time: old.mode.time && !self.footprint.mode.time,
                     media: old.mode.media && !self.footprint.mode.media,
+                    layout: old.mode.layout && !self.footprint.mode.layout,
                     ..Default::default()
                 };
                 for clear in shutdown_payloads_for_device(removed, old.extended, old.sm62) {
@@ -921,6 +929,7 @@ impl HostOutputLease {
         if let Some(old) = *active {
             mode.time |= old.mode.time;
             mode.media |= old.mode.media;
+            mode.layout |= old.mode.layout;
             extended |= old.extended;
             sm62 |= old.sm62;
         }
@@ -1436,6 +1445,8 @@ fn run_bridge(
                 Ordering::Release,
             );
             device = Some(HostDataHid::Dedicated(hid));
+            first_write_failure_at = None;
+            consecutive_write_failures = 0;
             extended_protocol = mode.time && selected_extended;
             protocol = HostProtocol::Discover;
             last_time = None;
@@ -1482,6 +1493,8 @@ fn run_bridge(
                 })
                 .ok();
             if let Some(dev) = device.as_ref() {
+                first_write_failure_at = None;
+                consecutive_write_failures = 0;
                 if let HostDataHid::Dedicated(hid) = dev {
                     // Also discard any UI grant made while endpoint acquisition
                     // was in flight; it cannot identify this newly opened owner.
@@ -1550,6 +1563,7 @@ fn run_bridge(
         }
 
         let mut write_failed = false;
+        let mut write_attempted = false;
         let sm62 = target.is_ergohaven_sm62();
 
         if application_layouts_enabled.load(Ordering::Acquire) {
@@ -1568,7 +1582,7 @@ fn run_bridge(
                 for packet in application_layout_transmission.packets(&application_layout) {
                     match write_application_layout_payload(&application_layout_snapshot,
                         &application_layout, generation, &packet, |p| write_payload_with_retry(dev, p, sm62)) {
-                        Ok(true) => {},
+                        Ok(true) => { write_attempted = true; },
                         Ok(false) => { sent = false; break; },
                         Err(_) => { sent = false; write_failed = true; break; },
                     }
@@ -1582,7 +1596,7 @@ fn run_bridge(
                 match write_application_layout_payload(&application_layout_snapshot,
                     &application_layout, generation, &application_layout.keepalive_packet(),
                     |p| write_payload_with_retry(dev, p, sm62)) {
-                    Ok(true) => last_application_layout_send = Instant::now(),
+                    Ok(true) => { write_attempted = true; last_application_layout_send = Instant::now(); },
                     Ok(false) => continue,
                     Err(_) => write_failed = true,
                 }
@@ -1592,6 +1606,7 @@ fn run_bridge(
         if mode.time && last_time_poll.elapsed() >= Duration::from_secs(1) {
             last_time_poll = Instant::now();
             if extended_protocol {
+                write_attempted = true;
                 let started = Instant::now();
                 let heartbeat = write_payload_with_retry(dev, &[DATA_HOST_STATUS, 1], sm62);
                 log::debug!(
@@ -1603,6 +1618,7 @@ fn run_bridge(
             }
             let now = current_time_payload();
             if last_time != Some(now) {
+                write_attempted = true;
                 last_time = Some(now);
                 write_failed |= write_payload_with_retry(dev, &[DATA_TIME, now.0, now.1], sm62).is_err();
                 pause_between_packets();
@@ -1639,6 +1655,7 @@ fn run_bridge(
                     break;
                 }
                 if last_volume != Some(volume) {
+                    write_attempted = true;
                     last_volume = Some(volume);
                     write_failed |= write_payload_with_retry(dev, &[DATA_VOLUME, volume], sm62).is_err();
                     pause_between_packets();
@@ -1653,6 +1670,7 @@ fn run_bridge(
                     break;
                 }
                 if layout_needs_send(last_layout, last_layout_full_send.elapsed(), layout) {
+                    write_attempted = true;
                     last_layout = Some(layout);
                     let layout_write = write_layout_snapshot(dev, layout, &layout_snapshot, sm62);
                     write_failed |= layout_write.is_err();
@@ -1683,16 +1701,19 @@ fn run_bridge(
             }
             let full_resend = last_media_full_send.elapsed() >= Duration::from_secs(10);
             if full_resend || artist != &last_artist {
+                write_attempted = true;
                 last_artist = artist.clone();
                 write_failed |= write_text_payload(dev, DATA_MEDIA_ARTIST, artist, sm62).is_err();
                 pause_between_packets();
             }
             if full_resend || title != &last_title {
+                write_attempted = true;
                 last_title = title.clone();
                 write_failed |= write_text_payload(dev, DATA_MEDIA_TITLE, title, sm62).is_err();
                 pause_between_packets();
             }
             if supports_sm62_media_progress(&target) {
+                write_attempted = true;
                 write_failed |= write_payload_with_retry(dev, &media.progress_payload(), sm62).is_err();
                 pause_between_packets();
             }
@@ -1703,8 +1724,11 @@ fn run_bridge(
 
         if write_failed {
             consecutive_write_failures = consecutive_write_failures.saturating_add(1);
-            let failure_started = *first_write_failure_at.get_or_insert_with(Instant::now);
-            if sm62 && failure_started.elapsed() < Duration::from_secs(5) {
+            let failure_now = Instant::now();
+            #[cfg(test)]
+            let failure_now = review_regressions::failure_now(failure_now);
+            let failure_started = *first_write_failure_at.get_or_insert(failure_now);
+            if sm62 && failure_now.duration_since(failure_started) < Duration::from_secs(5) {
                 // A display transition can temporarily reject an output report
                 // while the selected USB HID owner is still alive. Keep the
                 // bridge/host status and retry cached data on the next pass.
@@ -1740,8 +1764,10 @@ fn run_bridge(
             last_artist.clear();
             last_title.clear();
             last_media_full_send = Instant::now() - Duration::from_secs(60);
-        } else {
+        } else if write_attempted {
             consecutive_write_failures = 0;
+            // Idle passes are not evidence of transport recovery.
+            first_write_failure_at = None;
         }
 
         thread::sleep(Duration::from_millis(20));
@@ -1899,6 +1925,10 @@ fn pause_between_packets() {
 }
 
 fn write_payload(device: &HostDataHid, payload: &[u8]) -> anyhow::Result<()> {
+    #[cfg(test)]
+    if let Some(result) = review_regressions::scripted_write(payload) {
+        result?;
+    }
     device.write_output_report(payload)
 }
 
@@ -4392,6 +4422,9 @@ pub(crate) fn test_open_selected_owner(
 ) -> anyhow::Result<()> {
     open_host_data_hid(target, Some(output)).map(|_| ())
 }
+
+#[cfg(test)]
+mod review_regressions;
 
 #[cfg(test)]
 mod sm62_timeline_tests {

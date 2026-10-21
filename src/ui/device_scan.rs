@@ -160,11 +160,12 @@ impl EntropyApp {
             match result {
                 Ok(devices) => {
                     if usb_only {
-                        // A USB-only snapshot is not evidence of Bluetooth removal.
-                        // Keep retained transports in order so the selected index stays stable.
+                        // Only the USB scope is authoritative for removals. Retain
+                        // every other transport, including unknown/future HID buses.
+                        // All USB metadata backends publish the canonical "Usb" bus.
                         let mut merged: Vec<_> = self.device_manager.devices().iter()
-                            .filter(|d| d.is_bluetooth_transport()).cloned().collect();
-                        merged.extend(devices.into_iter().filter(|d| !d.is_bluetooth_transport()));
+                            .filter(|d| d.bus_type != "Usb").cloned().collect();
+                        merged.extend(devices.into_iter().filter(|d| d.bus_type == "Usb"));
                         self.apply_device_scan_result_inner(merged, false);
                     } else { self.apply_device_scan_result(devices); }
                 },

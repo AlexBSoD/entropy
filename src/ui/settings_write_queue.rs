@@ -576,6 +576,20 @@ impl EntropyApp {
         self.settings_write_queue.pending_value(qsid)
     }
 
+    // Only call for an explicit UI edit. Failed SET/readback leaves device
+    // state uncertain: the last confirmed value is not a safe equality gate.
+    // Keep Pending coalescing, and never turn this into a repaint retry.
+    pub(super) fn explicit_display_setting_needs_write(
+        &self, qsid: u16, confirmed: u16, requested: u16,
+    ) -> bool {
+        if let Some(pending) = self.pending_settings_write_value(qsid) {
+            requested != pending
+        } else {
+            matches!(self.settings_write_status(qsid), Some(SettingsWriteStatus::Failed(_)))
+                || requested != confirmed
+        }
+    }
+
     pub(super) fn settings_write_status(&self, qsid: u16) -> Option<&SettingsWriteStatus> {
         self.settings_write_queue.status(qsid)
     }

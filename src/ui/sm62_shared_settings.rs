@@ -61,7 +61,7 @@ impl EntropyApp {
         if let Some(index) = picked {
             let old = self.display_settings.confirmed_display_timeout;
             self.display_settings.display_timeout = index as u8;
-            if index as u16 != self.pending_settings_write_value(DISPLAY_TIMEOUT_QSID).unwrap_or(old as u16) {
+            if self.explicit_display_setting_needs_write(DISPLAY_TIMEOUT_QSID, old as u16, index as u16) {
                 self.queue_display_setting_write(
                     crate::i18n::tr_catalog(lang, "display_settings.display_timeout").to_owned(),
                     DISPLAY_TIMEOUT_QSID, old as u16, index as u16);

@@ -44,6 +44,115 @@ mod usb_hotplug_tests {
         (app, ctx, recorder)
     }
     #[test]
+    fn usb_hotplug_retains_all_non_usb_owners_through_production_tick() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        for platform in ["linux", "windows", "macos"] {
+            for bus in ["I2c", "Spi", "Unknown", "", "FutureTransport", "Bluetooth"] {
+                for attach_usb in [false, true] {
+                    let (mut app, ctx, recorder) = fixture();
+                    let selected = device("Selected non-USB", bus);
+                    let backgrounds: Vec<_> = ["I2c", "Spi", "Unknown", "", "FutureTransport", "Bluetooth"]
+                        .into_iter().enumerate()
+                        .map(|(i, bus)| device(&format!("Background {i}"), bus)).collect();
+                    // USB first forces selection to move when its absence is authoritative.
+                    let mut inventory = vec![device("Removed USB", "Usb"), selected.clone()];
+                    inventory.extend(backgrounds.clone());
+                    app.device_manager.replace_devices(inventory);
+                    app.selected_device = Some(1);
+                    for background in &backgrounds {
+                        app.qmk_hid_hosts.insert(background.path.clone(), crate::qmk_hid_host::QmkHidHostBridge::test_inert(
+                            background.clone(), Default::default(), None, crate::qmk_hid_host::HostProtocol::Discover));
+                    }
+                    let layout = format!("{:?}", app.layout);
+                    let generation = app.connection_generation;
+                    let (tx, scans) = mpsc::channel(); app.test_device_scan_requests = Some(tx);
+                    let (tx, connects) = mpsc::channel(); app.test_connect_requests = Some(tx);
+                    app.update_native_background_for_platform(&ctx, 12.0, false, false, platform);
+                    let (usb_only, complete) = scans.try_recv().unwrap();
+                    assert!(usb_only);
+                    let added = device("Added USB", "Usb");
+                    complete.send(Ok(if attach_usb { vec![added.clone()] } else { vec![] })).unwrap();
+                    app.update_native_background_for_platform(&ctx, 12.1, false, false, platform);
+                    assert!(app.hid_device.is_some(), "USB-only completion retired {bus:?} selected owner on {platform}");
+                    assert_eq!(format!("{:?}", app.layout), layout);
+                    assert_eq!(app.connection_generation, generation);
+                    let actual = &app.device_manager.devices()[app.selected_device.unwrap()];
+                    assert_eq!(actual.path, selected.path);
+                    assert_eq!(actual.instance_token, selected.instance_token);
+                    assert_eq!(actual.bus_type, selected.bus_type);
+                    let mut expected_paths = vec![selected.path.clone()];
+                    expected_paths.extend(backgrounds.iter().map(|d| d.path.clone()));
+                    if attach_usb { expected_paths.push(added.path); }
+                    assert_eq!(app.device_manager.devices().iter().map(|d| d.path.clone()).collect::<Vec<_>>(), expected_paths);
+                    for background in &backgrounds {
+                        assert!(app.qmk_hid_hosts.contains_key(&background.path), "lost background {:?} on {platform}", background.bus_type);
+                    }
+                    assert!(connects.try_recv().is_err());
+                    assert!(recorder.requests().is_empty());
+                }
+            }
+        }
+    }
+    #[test]
+    fn usb_hotplug_full_snapshot_still_removes_non_usb_owners_through_production_tick() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        for platform in ["linux", "windows", "macos"] {
+            for bus in ["I2c", "Spi", "Unknown", "", "FutureTransport", "Bluetooth", "Usb"] {
+                let (mut app, ctx, recorder) = fixture();
+                let selected = device("Removed selected", bus);
+                let background = device("Removed background", bus);
+                app.device_manager.replace_devices(vec![selected, background.clone()]);
+                app.qmk_hid_hosts.insert(background.path.clone(), crate::qmk_hid_host::QmkHidHostBridge::test_inert(
+                    background.clone(), Default::default(), None, crate::qmk_hid_host::HostProtocol::Discover));
+                let (tx, connects) = mpsc::channel(); app.test_connect_requests = Some(tx);
+                // Inject only discovery completion; production tick applies the full
+                // snapshot even when a Bluetooth owner would fence a new full scan.
+                let (tx, rx) = mpsc::channel();
+                tx.send(Ok(vec![])).unwrap();
+                app.device_scan_state = DeviceScanState::Scanning {
+                    rx, started_at: std::time::Instant::now(),
+                    generation: app.connection_generation, timeout_logged: false, usb_only: false,
+                };
+                app.update_native_background_for_platform(&ctx, 10.1, false, false, platform);
+                assert!(app.device_manager.devices().is_empty(), "full snapshot must remove {bus:?} on {platform}");
+                assert!(app.selected_device.is_none());
+                assert!(app.hid_device.is_none()); assert!(app.layout.is_none());
+                assert!(!app.qmk_hid_hosts.contains_key(&background.path));
+                assert!(connects.try_recv().is_err()); assert!(recorder.requests().is_empty());
+            }
+        }
+    }
+    #[test]
+    fn usb_hotplug_failed_or_stale_partial_snapshot_preserves_every_transport() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        for platform in ["linux", "windows", "macos"] {
+            for bus in ["I2c", "Spi", "Unknown", "", "FutureTransport", "Bluetooth", "Usb"] {
+                for stale in [false, true] {
+                    let (mut app, ctx, recorder) = fixture();
+                    let selected = device("Selected", bus);
+                    let background = device("Background", bus);
+                    app.device_manager.replace_devices(vec![selected.clone(), background.clone()]);
+                    app.qmk_hid_hosts.insert(background.path.clone(), crate::qmk_hid_host::QmkHidHostBridge::test_inert(
+                        background.clone(), Default::default(), None, crate::qmk_hid_host::HostProtocol::Discover));
+                    let (tx, scans) = mpsc::channel(); app.test_device_scan_requests = Some(tx);
+                    let (tx, connects) = mpsc::channel(); app.test_connect_requests = Some(tx);
+                    app.update_native_background_for_platform(&ctx, 12.0, false, false, platform);
+                    let (usb, complete) = scans.try_recv().unwrap(); assert!(usb);
+                    if stale { app.connection_generation = app.connection_generation.wrapping_add(1); }
+                    let generation = app.connection_generation;
+                    complete.send(if stale { Ok(vec![]) } else { Err("discovery boundary failed".into()) }).unwrap();
+                    app.update_native_background_for_platform(&ctx, 12.1, false, false, platform);
+                    assert_eq!(app.device_manager.devices().iter().map(|d| d.path.clone()).collect::<Vec<_>>(), vec![selected.path, background.path.clone()]);
+                    assert_eq!(app.selected_device, Some(0));
+                    assert!(app.hid_device.is_some()); assert!(app.layout.is_some());
+                    assert_eq!(app.connection_generation, generation);
+                    assert!(app.qmk_hid_hosts.contains_key(&background.path));
+                    assert!(connects.try_recv().is_err()); assert!(recorder.requests().is_empty());
+                }
+            }
+        }
+    }
+    #[test]
     fn usb_hotplug_duplicate_identity_preserves_exact_owner_through_production_tick() {
         let _storage = crate::app::app_storage::ScopedTempConfig::new();
         for platform in ["linux", "windows", "macos"] {
