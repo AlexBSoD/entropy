@@ -5,6 +5,21 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="${APP_NAME:-Entropy}"
 BUNDLE_ID="${BUNDLE_ID:-com.ergohaven.entropy}"
 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
+source "$ROOT/scripts/macos_stable_signing.sh"
+REQUIRE_STABLE_SIGNING="${REQUIRE_STABLE_SIGNING:-0}"
+macos_validate_stable_signing_configuration "$CODESIGN_IDENTITY" \
+    "$REQUIRE_STABLE_SIGNING" "$MACOS_RELEASE_CERTIFICATE_SHA1" "$BUNDLE_ID"
+if [[ "$CODESIGN_IDENTITY" != "-" ]]; then
+    [[ "$CODESIGN_IDENTITY" == "$MACOS_RELEASE_CERTIFICATE_SHA1" &&
+       "$BUNDLE_ID" == com.ergohaven.entropy ]] || {
+        echo 'Stable signing requires the pinned certificate and bundle ID' >&2; exit 1;
+    }
+fi
+[[ "${SKIP_BUILD:-0}" == 0 || "${SKIP_BUILD:-0}" == 1 ]] || exit 1
+if [[ "$REQUIRE_STABLE_SIGNING" == 1 && "${SKIP_BUILD:-0}" != 1 ]]; then
+    echo 'Build before importing release credentials; set SKIP_BUILD=1 for packaging' >&2
+    exit 1
+fi
 MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-10.15}"
 export MACOSX_DEPLOYMENT_TARGET
 
@@ -66,6 +81,8 @@ else
 fi
 
 DIST_DIR="$ROOT/dist/macos"
+DMG_STAGING="$DIST_DIR/dmg-staging"
+trap 'rm -rf "$DMG_STAGING"' EXIT
 APP_PATH="$DIST_DIR/$APP_NAME.app"
 CONTENTS_DIR="$APP_PATH/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
@@ -81,17 +98,26 @@ sign_app_bundle() {
 	fi
 
 	if ! command -v codesign >/dev/null 2>&1; then
+        [[ "$REQUIRE_STABLE_SIGNING" != 1 ]] || { echo 'codesign is required' >&2; exit 1; }
 		echo "codesign not found; skipped app bundle signing"
 		return
 	fi
 
 	local codesign_args=(--force --sign "$CODESIGN_IDENTITY")
-	if [[ "$CODESIGN_IDENTITY" == "-" ]]; then
-		codesign_args+=(--timestamp=none)
-	fi
-
-	codesign "${codesign_args[@]}" "$APP_PATH"
-	codesign --verify --strict "$APP_PATH"
+    codesign_args+=(--timestamp=none)
+    if [[ "$CODESIGN_IDENTITY" != "-" ]]; then
+        : "${CODESIGN_KEYCHAIN:?Set the temporary signing keychain}"
+        codesign_args+=(--keychain "$CODESIGN_KEYCHAIN" --options runtime
+            --identifier "$BUNDLE_ID" --requirements
+            "$(macos_stable_designated_requirement "$MACOS_RELEASE_CERTIFICATE_SHA1" "$BUNDLE_ID")")
+        codesign "${codesign_args[@]}" "$MACOS_DIR/entropy"
+        macos_verify_stable_signature "$MACOS_DIR/entropy" "$MACOS_RELEASE_CERTIFICATE_SHA1" "$BUNDLE_ID"
+    fi
+    codesign "${codesign_args[@]}" "$APP_PATH"
+    codesign --verify --strict "$APP_PATH"
+    if [[ "$CODESIGN_IDENTITY" != "-" ]]; then
+        macos_verify_stable_signature "$APP_PATH" "$MACOS_RELEASE_CERTIFICATE_SHA1" "$BUNDLE_ID"
+    fi
 }
 
 create_dmg_with_retries() {
@@ -103,15 +129,16 @@ create_dmg_with_retries() {
 		rm -f "$DMG_PATH"
 		if hdiutil create \
 			-volname "$APP_NAME" \
-			-srcfolder "$APP_PATH" \
+			-srcfolder "$DMG_STAGING" \
 			-ov \
 			-format UDZO \
 			"$DMG_PATH" >/dev/null; then
 			echo "Built $DMG_PATH"
 			return 0
-		fi
+        else
+            status=$?
+        fi
 
-		status=$?
 		if ((attempt == max_attempts)); then
 			echo "hdiutil create failed after $max_attempts attempts" >&2
 			return "$status"
@@ -126,7 +153,8 @@ create_dmg_with_retries() {
 }
 
 cd "$ROOT"
-cargo build "${BUILD_ARGS[@]}"
+if [[ "${SKIP_BUILD:-0}" != 1 ]]; then cargo build "${BUILD_ARGS[@]}"; fi
+[[ -x "$BIN" ]] || { echo 'Prebuilt binary is missing' >&2; exit 1; }
 validate_binary_arch
 
 rm -rf "$APP_PATH" "$ZIP_PATH" "$DMG_PATH"
@@ -187,7 +215,12 @@ else
 fi
 
 if command -v hdiutil >/dev/null 2>&1; then
+    rm -rf "$DMG_STAGING"
+    mkdir -p "$DMG_STAGING"
+    ditto "$APP_PATH" "$DMG_STAGING/$APP_NAME.app"
+    ln -s /Applications "$DMG_STAGING/Applications"
 	create_dmg_with_retries
+    hdiutil verify "$DMG_PATH" >/dev/null
 else
 	echo "hdiutil not found; skipped DMG build"
 fi

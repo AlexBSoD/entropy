@@ -52,11 +52,13 @@ and firmware settings from one coherent interface.
 | --- | --- | --- |
 | Linux x86_64 | Primary target | AppImage |
 | Windows x86_64 | Release target | Portable EXE |
-| macOS arm64 (Apple Silicon) | Release target | Unsigned DMG |
-| macOS x86_64 (Intel) | Release target | Unsigned DMG |
+| macOS arm64 (Apple Silicon) | Release target | DMG |
+| macOS x86_64 (Intel) | Release target | DMG |
 
-Public builds are published for Linux, Windows, and macOS. macOS builds are
-unsigned and not notarized for now.
+Public builds are published for Linux, Windows, and macOS. The macOS release
+workflow uses a stable project-owned self-signed certificate, not Apple Developer
+ID signing or notarization. Existing older releases are unsigned/ad-hoc signed;
+the stable identity applies only to releases built with this workflow.
 
 ## Downloads
 
@@ -75,23 +77,25 @@ a GitHub prerelease.
 Windows builds are unsigned for now, so Windows SmartScreen may warn before
 launching the app.
 
-macOS DMG builds are unsigned and not notarized for now. On Apple Silicon,
-use the `macos-arm64` build; the `macos-x86_64` build is for Intel Macs. To run
-a downloaded DMG on macOS:
+### macOS installation and updates
 
-1. Open the `.dmg`
-2. Drag `Entropy.app` to `/Applications`
-3. Remove the quarantine flag:
+Use `macos-arm64` for Apple Silicon or `macos-x86_64` for Intel. Self-signing
+preserves the app's permission identity across updates; it does **not** remove
+Gatekeeper warnings or provide Apple notarization.
 
-```sh
-xattr -dr com.apple.quarantine /Applications/Entropy.app
-```
+1. Open the `.dmg` and drag **Entropy.app** onto **Applications** in the same window.
+2. Eject the disk image, then open Entropy from Applications.
+3. If macOS blocks it, click **Done**, open **System Settings → Privacy & Security**,
+   scroll to **Security**, and click **Open Anyway**. Confirm opening Entropy.
+4. For Text Expander, allow Entropy in **Accessibility** and **Input Monitoring**
+   under Privacy & Security. Fully quit with **⌘Q** and reopen Entropy.
 
-4. Launch Entropy:
-
-```sh
-open /Applications/Entropy.app
-```
+To update, quit Entropy with **⌘Q**, open the new DMG, and drag Entropy onto
+Applications, choosing **Replace**. Eject the image and launch the installed app.
+Use **Open Anyway** again if macOS asks. Do not toggle, remove, or re-add existing
+Accessibility/Input Monitoring grants during a normal update. The first move
+from an older unsigned/ad-hoc build may require granting access once to the
+new stable identity.
 
 ## Quick Start
 
