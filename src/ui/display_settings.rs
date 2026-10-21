@@ -5789,6 +5789,9 @@ mod icon_catalog_tests {
 
 // Shared with the macropad standby dropdown. SM62 sends seconds, not enum IDs.
 include!("sm62_shared_settings.rs");
+#[cfg(test)]
+#[path = "display_settings/sm62_shared_write_tests.rs"]
+mod sm62_shared_write_tests;
 include!("sm62_scroll.rs");
 
 const STANDBY_DELAY_KEYS: [&str; 8] = [
@@ -5944,6 +5947,9 @@ impl EntropyApp {
         let hold_supported = self.display_settings.sm62_hold_supported;
         let mut hold_values = self.display_settings.sm62_hold_ms;
         let confirmed_hold = self.display_settings.confirmed_sm62_hold_ms;
+        // Enqueue only edits made by this frame's controls, not an older
+        // optimistic value left unconfirmed after bounded worker retries.
+        let before_shared = (stars_values, screens_off_values, language_values, hold_values, date_values);
         let mut changed = Vec::new();
         crate::ui_style::allocate_ui_at_rect(ui, content_rect, |ui| {
             ui.vertical_centered(|ui| {
@@ -6028,29 +6034,29 @@ impl EntropyApp {
         self.display_settings.sm62_language_values = language_values;
         self.display_settings.sm62_stars_values = stars_values;
         self.display_settings.sm62_screens_off_values = screens_off_values;
-        for (supported, values, confirmed, qsid, label) in [
-            (stars_supported,stars_values,confirmed_stars,246u16,"stars"),
-            (screens_off_supported,screens_off_values,confirmed_screens_off,248u16,"screens off"),
+        for (supported, values, before, confirmed, qsid, label) in [
+            (stars_supported,stars_values,before_shared.0,confirmed_stars,246u16,"stars"),
+            (screens_off_supported,screens_off_values,before_shared.1,confirmed_screens_off,248u16,"screens off"),
         ] {
-            if supported { for side in 0..2 {
-                if values[side] as u16 != self.pending_settings_write_value(qsid+side as u16).unwrap_or(confirmed[side] as u16) {
+            if ready && supported { for side in 0..2 {
+                if values[side] != before[side] && values[side] as u16 != self.pending_settings_write_value(qsid+side as u16).unwrap_or(confirmed[side] as u16) {
                     self.queue_display_setting_write(format!("SM62 {} {}",if side==0 {"left"} else {"right"},label),
                         qsid+side as u16,confirmed[side] as u16,values[side] as u16);
                 }
             } }
         }
-        if language_supported {
+        if ready && language_supported {
             for side in 0..2 {
-                if language_values[side] as u16 != self.pending_settings_write_value(244+side as u16).unwrap_or(confirmed_language[side] as u16) {
+                if language_values[side] != before_shared.2[side] && language_values[side] as u16 != self.pending_settings_write_value(244+side as u16).unwrap_or(confirmed_language[side] as u16) {
                     self.queue_display_setting_write(format!("SM62 {} language", if side == 0 { "left" } else { "right" }),
                         244 + side as u16, confirmed_language[side] as u16, language_values[side] as u16);
                 }
             }
         }
         self.display_settings.sm62_hold_ms = hold_values;
-        if hold_supported {
+        if ready && hold_supported {
             for side in 0..2 {
-                if hold_values[side] != self.pending_settings_write_value(242+side as u16).unwrap_or(confirmed_hold[side]) {
+                if hold_values[side] != before_shared.3[side] && hold_values[side] != self.pending_settings_write_value(242+side as u16).unwrap_or(confirmed_hold[side]) {
                     self.queue_display_setting_write(
                         format!("SM62 {} layout hold", if side == 0 { "left" } else { "right" }),
                         242 + side as u16, confirmed_hold[side], hold_values[side],
@@ -6058,9 +6064,9 @@ impl EntropyApp {
                 }
             }
         }
-        if date_supported {
+        if ready && date_supported {
             for side in 0..2 {
-                if date_values[side] as u16 != self.pending_settings_write_value(240+side as u16).unwrap_or(confirmed_date[side] as u16) {
+                if date_values[side] != before_shared.4[side] && date_values[side] as u16 != self.pending_settings_write_value(240+side as u16).unwrap_or(confirmed_date[side] as u16) {
                     self.queue_display_setting_write(
                         format!("SM62 {} date", if side == 0 { "left" } else { "right" }),
                         240 + side as u16, confirmed_date[side] as u16, date_values[side] as u16,

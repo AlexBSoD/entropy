@@ -1655,9 +1655,9 @@ mod tests {
             });});
             let rects:Vec<_>=output.shapes.iter().filter_map(|s| if let egui::Shape::Rect(r)=&s.shape {Some(r)} else {None}).collect();
             let outer=rects.iter().find(|r| r.stroke.color==egui::Color32::from_gray(75)).unwrap();
-            assert_eq!(outer.fill,if ship {egui::Color32::from_rgb(7,7,5)} else {egui::Color32::from_gray(24)},"ship-only bezel must match atlas background, including idle scene");
+            assert_eq!(outer.fill,if off {egui::Color32::BLACK} else {egui::Color32::from_rgb(7,7,5)},"approved edge fill follows the display background in every mode");
             let seams=rects.iter().filter(|r| r.stroke.color==egui::Color32::from_gray(8)).count();
-            assert_eq!(seams,usize::from(!ship),"ship must not have an inner outline seam; other modes unchanged");
+            assert_eq!(seams,0,"no mode has an inset outline seam");
             if ship {
                 let texture=rects.iter().find(|r|r.brush.is_some()).unwrap();
                 assert_eq!(texture.rect,outer.rect.shrink(7.0),"ship asset rectangle/scale/position must not change");
