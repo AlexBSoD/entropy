@@ -198,14 +198,21 @@ unsafe extern "C" fn IOServiceGetMatchingServices(_: u32, m: CF, i: *mut u32) ->
     if !ok {
         return -1;
     }
-    *i = 100;
-    0
+    // Apple xnu: no matching services => kIOReturnSuccess + null iterator.
+    // Cases 11/12 are genuine enumeration failures, never empty snapshots.
+    let case = OS.with(|s| s.borrow().case);
+    *i = if [10, 11].contains(&case) { 0 } else { 100 };
+    if [11, 12].contains(&case) {
+        -1
+    } else {
+        0
+    }
 }
 #[no_mangle]
 extern "C" fn IOIteratorNext(_: u32) -> u32 {
     OS.with(|s| {
         let mut s = s.borrow_mut();
-        if s.next {
+        if s.next || s.case == 9 {
             0
         } else {
             s.next = true;

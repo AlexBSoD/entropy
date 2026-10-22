@@ -272,8 +272,14 @@ pub(super) fn scan() -> Result<Vec<Device>, String> {
         let mut iterator = 0;
         let matching_ptr = matching.0;
         std::mem::forget(matching); // consumed on success or failure
-        if IOServiceGetMatchingServices(0, matching_ptr, &mut iterator) != 0 || iterator == 0 {
+        if IOServiceGetMatchingServices(0, matching_ptr, &mut iterator) != 0 {
             return Err(error("service enumeration"));
+        }
+        // IOKit returns success with a null iterator when nothing matches
+        // (xnu internal_io_service_get_matching_services / copyExistingServices).
+        // Only a successful empty match proves USB absence; errors stay fail-closed.
+        if iterator == 0 {
+            return Ok(Vec::new());
         }
         let iterator = Object(iterator);
         let mut result = Vec::new();

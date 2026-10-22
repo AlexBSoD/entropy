@@ -284,6 +284,114 @@ mod usb_hotplug_tests {
         }
     }
     #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn macos_unplug_native_producer_inventory_removal_characterization() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        for usb_selected in [false, true] {
+            let (mut app, ctx, _) = fixture();
+            let (tx, scans) = mpsc::channel();
+            app.test_device_scan_requests = Some(tx);
+            let (tx, connects) = mpsc::channel();
+            app.test_connect_requests = Some(tx);
+            app.update_native_background_for_platform(&ctx, 12.0, false, false, "macos");
+            let (usb, done) = scans.try_recv().unwrap();
+            assert!(usb);
+            let native = DeviceManager::test_macos_usb_registry_snapshot(0).unwrap();
+            assert_eq!(native.len(), 1);
+            assert_eq!(
+                native[0].bus_type, "Usb",
+                "actual native producer, not guessed case"
+            );
+            let endpoint = native[0].path.clone();
+            done.send(Ok(native)).unwrap();
+            app.update_native_background_for_platform(&ctx, 12.1, false, false, "macos");
+            assert_eq!(app.device_manager.devices().len(), 2);
+            if usb_selected {
+                app.selected_device = Some(1);
+            }
+            app.update_native_background_for_platform(&ctx, 14.0, false, false, "macos");
+            let (usb, done) = scans.try_recv().unwrap();
+            assert!(usb);
+            // Valid empty IORegistry iterator: real scan/decoder, only OS ABI mocked.
+            let absent = DeviceManager::test_macos_usb_registry_snapshot(9).unwrap();
+            assert!(absent.is_empty());
+            done.send(Ok(absent)).unwrap();
+            app.update_native_background_for_platform(&ctx, 14.1, false, false, "macos");
+            assert!(
+                !app.device_manager
+                    .devices()
+                    .iter()
+                    .any(|d| d.path == endpoint),
+                "successful native USB absence must remove endpoint, selected={usb_selected}"
+            );
+            assert_eq!(app.device_manager.devices().len(), 1);
+            assert_eq!(app.device_manager.devices()[0].bus_type, "Bluetooth");
+            assert!(connects.try_recv().is_err());
+        }
+    }
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn macos_unplug_null_iterator_removes_usb_through_production_tick() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        for usb_selected in [false, true] {
+            let (mut app, ctx, recorder) = fixture();
+            let bt = app.device_manager.devices()[0].clone();
+            app.qmk_hid_hosts.insert(
+                bt.path.clone(),
+                crate::qmk_hid_host::QmkHidHostBridge::test_inert(
+                    bt.clone(),
+                    Default::default(),
+                    None,
+                    crate::qmk_hid_host::HostProtocol::Discover,
+                ),
+            );
+            let (tx, scans) = mpsc::channel();
+            app.test_device_scan_requests = Some(tx);
+            let (tx, connects) = mpsc::channel();
+            app.test_connect_requests = Some(tx);
+            app.update_native_background_for_platform(&ctx, 12.0, false, false, "macos");
+            let (usb, done) = scans.try_recv().unwrap();
+            assert!(usb);
+            let native = DeviceManager::test_macos_usb_registry_snapshot(0).unwrap();
+            let endpoint = native[0].path.clone();
+            done.send(Ok(native)).unwrap();
+            app.update_native_background_for_platform(&ctx, 12.1, false, false, "macos");
+            if usb_selected {
+                app.selected_device = Some(1);
+            }
+            // The caller must preserve inventory on actual enumeration errors.
+            for (case, now) in [(11, 14.0), (12, 16.0), (10, 18.0)] {
+                app.update_native_background_for_platform(&ctx, now, false, false, "macos");
+                let (usb, done) = scans.try_recv().unwrap();
+                assert!(usb);
+                done.send(DeviceManager::test_macos_usb_registry_snapshot(case))
+                    .unwrap();
+                app.update_native_background_for_platform(&ctx, now + 0.1, false, false, "macos");
+                let listed = app
+                    .device_manager
+                    .devices()
+                    .iter()
+                    .any(|d| d.path == endpoint);
+                assert_eq!(listed, case != 10,
+                    "Apple success/null must remove unplugged USB; actual errors must retain it: case={case}, selected={usb_selected}");
+            }
+            assert_eq!(app.device_manager.devices().len(), 1);
+            assert_eq!(app.device_manager.devices()[0].path, bt.path);
+            assert!(app.qmk_hid_hosts.contains_key(&bt.path));
+            if usb_selected {
+                assert!(app.selected_device.is_none());
+                assert!(app.layout.is_none());
+                assert!(app.status_msg.is_empty());
+            } else {
+                assert_eq!(app.selected_device, Some(0));
+                assert!(app.layout.is_some());
+                assert!(app.hid_device.is_some());
+            }
+            assert!(connects.try_recv().is_err());
+            assert!(recorder.requests().is_empty());
+        }
+    }
+    #[test]
     fn macos_usb_hotplug_generic_background_owners_survive_usb_selection_changes() {
         let _storage = crate::app::app_storage::ScopedTempConfig::new();
         for usb_first in [false, true] {
