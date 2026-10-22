@@ -1242,6 +1242,8 @@ impl DeviceApplicationLayouts {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ApplicationLayoutSnapshot {
+    // Semantic routing identity, not the editable name/revision or rendered content.
+    pub(crate) profile_id: Option<String>,
     pub(crate) active: bool,
     pub(crate) revision: u32,
     pub(crate) name: String,
@@ -1276,6 +1278,7 @@ impl ApplicationLayoutSnapshot {
             })
         });
         Self {
+            profile_id: Some(layout.id.clone()),
             active: true,
             revision: layout.revision,
             visuals,
@@ -1304,8 +1307,15 @@ impl ApplicationLayoutSnapshot {
         }
     }
 
+    // Known semantic Default without permission to replay any cached map.
+    // Unlike inactive(), this is a foreground routing result, not revocation.
+    pub(crate) fn firmware_default() -> Self {
+        Self { profile_id: Some(DEFAULT_APPLICATION_LAYOUT_ID.into()), ..Self::inactive() }
+    }
+
     pub(crate) fn inactive() -> Self {
         Self {
+            profile_id: None,
             active: false,
             revision: 0,
             name: String::new(),

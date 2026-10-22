@@ -94,6 +94,7 @@ fn macos_running_under_rosetta() -> bool {
 
 const VIAL_GUI_USB_RETRIES: usize = 20;
 const VIAL_GUI_READ_TIMEOUT_MS: i32 = 500;
+const SM62_DISPLAY_READ_TIMEOUT_MS: i32 = 6_000;
 // Firmware 4.0.6 performs the flash update synchronously before acknowledging
 // SLOT_COMMIT. It remains enumerated, but regularly exceeds the generic USB
 // response window; timing out here incorrectly tears down the whole connection.
@@ -514,8 +515,17 @@ impl SharedHidOutput {
         mode: crate::qmk_hid_host::HostDataMode,
         extended: bool,
     ) -> Self {
+        self.for_host_bridge_with_sm62(mode, extended, false)
+    }
+
+    pub(crate) fn for_host_bridge_with_sm62(
+        &self,
+        mode: crate::qmk_hid_host::HostDataMode,
+        extended: bool,
+        sm62: bool,
+    ) -> Self {
         let mut output = self.clone();
-        output.host_lease = Some(self.host_output.claim(mode, extended));
+        output.host_lease = Some(self.host_output.claim_sm62(mode, extended, sm62));
         output
     }
 
@@ -701,6 +711,25 @@ impl HidDevice {
         match &self.backend {
             HidBackend::Proxy(proxy) => Some(proxy.retirement_handle()),
             _ => None,
+        }
+    }
+
+    pub(crate) fn is_transport_available(&self) -> bool {
+        match &self.backend {
+            HidBackend::Proxy(proxy) => proxy.is_available(),
+            _ => true,
+        }
+    }
+
+    pub(crate) fn with_host_output_paused_for_settings<T>(
+        &self,
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        match &self.backend {
+            HidBackend::Proxy(proxy) => proxy.host_output.with_settings_write_paused(operation),
+            #[cfg(test)]
+            HidBackend::Test { recorder, .. } => recorder.host_output.with_settings_write_paused(operation),
+            _ => operation(),
         }
     }
 
@@ -1140,6 +1169,14 @@ fn usb_read_timeout_ms(transport: HidTransport, data: &[u8]) -> i32 {
         WINDOWS_BLE_READ_TIMEOUT_MS
     } else if data.first() == Some(&0xC9) {
         PICTOGRAM_SLOT_COMMIT_READ_TIMEOUT_MS
+    } else if data.len() >= 4
+        && data[0] == CMD_VIA_VIAL_PREFIX
+        && matches!(data[1], CMD_VIAL_QMK_SETTINGS_SET | CMD_VIAL_QMK_SETTINGS_GET)
+        && (230..=249).contains(&u16::from_le_bytes([data[2], data[3]]))
+    {
+        // The first SM62 player/ship frame may occupy the display task while
+        // the setting ACK is pending; the keyboard can still be on USB.
+        SM62_DISPLAY_READ_TIMEOUT_MS
     } else {
         VIAL_GUI_READ_TIMEOUT_MS
     }
@@ -1843,7 +1880,10 @@ fn response_matches_qmk_settings_get(command: &[u8], resp: &[u8; MSG_LEN]) -> bo
     }
 
     let qsid = u16::from_le_bytes([qsid_bytes[0], qsid_bytes[1]]);
-    if !(200..232).contains(&qsid) {
+    // Only 200..=215 are layer-name strings. SM62 display settings start at
+    // 230 and contain binary values; treating them as UTF-8 drops valid
+    // responses (for example QSID 230 = 1 with echoed 0xE6 in byte 2).
+    if !(200..216).contains(&qsid) {
         return true;
     }
 
@@ -2385,6 +2425,24 @@ mod tests {
     }
 
     #[test]
+    fn sm62_display_settings_get_an_extended_usb_response_window() {
+        for command in [CMD_VIAL_QMK_SETTINGS_SET, CMD_VIAL_QMK_SETTINGS_GET] {
+            for qsid in [230u16, 235, 241] {
+                let [low, high] = qsid.to_le_bytes();
+                assert_eq!(
+                    usb_read_timeout_ms(HidTransport::Usb, &[CMD_VIA_VIAL_PREFIX, command, low, high]),
+                    SM62_DISPLAY_READ_TIMEOUT_MS
+                );
+            }
+        }
+        let [low, high] = 229u16.to_le_bytes();
+        assert_eq!(
+            usb_read_timeout_ms(HidTransport::Usb, &[CMD_VIA_VIAL_PREFIX, CMD_VIAL_QMK_SETTINGS_GET, low, high]),
+            VIAL_GUI_READ_TIMEOUT_MS
+        );
+    }
+
+    #[test]
     fn only_pictogram_slot_commit_gets_the_extended_usb_response_window() {
         assert_eq!(
             usb_read_timeout_ms(HidTransport::Usb, &[0xC9]),
@@ -2571,6 +2629,27 @@ mod tests {
 
         assert!(response_matches_command(&command, &success));
         assert!(response_matches_command(&command, &error));
+    }
+
+    #[test]
+    fn sm62_player_setting_get_accepts_binary_value_and_qsid_echo() {
+        let command = qmk_settings_command(CMD_VIAL_QMK_SETTINGS_GET, 230);
+        let mut response = [0u8; MSG_LEN];
+        response[1] = 1; // Player mode; 0 (Clock) masked the old UTF-8 check.
+        response[2..4].copy_from_slice(&230u16.to_le_bytes());
+
+        assert!(response_matches_command(&command, &response));
+        assert_eq!(
+            hid_protocol::entlayout_section_of_read(&command),
+            Some("QmkSettings")
+        );
+        assert_eq!(
+            hid_protocol::entlayout_section_of_read(&qmk_settings_command(
+                CMD_VIAL_QMK_SETTINGS_GET,
+                215,
+            )),
+            Some("LayerNames")
+        );
     }
 
     #[test]

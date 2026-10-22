@@ -246,6 +246,29 @@ mod tests {
     }
 
     #[test]
+    fn sm62_connect_timeout_remains_visible_after_scan() {
+        let (mut app, ctx, requests) = connection_app();
+        let mut sm62 = connection_device("SM62");
+        sm62.vendor_id = 0xE126;
+        sm62.product_id = 0x00B2;
+        app.device_manager.replace_devices(vec![sm62.clone()]);
+        app.start_connect(0);
+        let (_, tx) = requests.try_recv().unwrap();
+        tx.send(ConnectTaskMessage::Done(Box::new(Err(
+            "Display settings read failed: HID helper timed out or disconnected during command"
+                .to_owned(),
+        ))))
+        .unwrap();
+
+        app.poll_connect(&ctx);
+        assert_eq!(app.selected_device, None);
+        assert!(app.status_msg.starts_with("Connect failed:"));
+        app.apply_device_scan_result(vec![sm62]);
+        assert!(app.status_msg.contains("Display settings read failed"));
+        assert!(requests.try_recv().is_err(), "unexpected automatic reconnect");
+    }
+
+    #[test]
     fn replacement_survives_old_wrapped_cancellation_error() {
         replacement_discards_result(
             Err("Layout read failed: Connect cancelled".to_owned()),
@@ -587,6 +610,7 @@ mod tests {
             started_at: std::time::Instant::now(),
             generation: app.connection_generation,
             timeout_logged: false,
+        usb_only: false,
         };
         scan_tx
             .send(Ok(vec![connection_device("B"), connection_device("A")]))
@@ -619,6 +643,7 @@ mod tests {
             started_at: std::time::Instant::now(),
             generation: app.connection_generation,
             timeout_logged: false,
+        usb_only: false,
         };
         a_tx.send(ConnectTaskMessage::Done(Box::new(Ok(connection_result(
             "Wrong A",
@@ -1451,6 +1476,20 @@ impl EntropyApp {
             Err(e) => {
                 if let Some(reconnect) = reconnect {
                     self.schedule_bluetooth_reconnect_retry(reconnect, &e);
+                    return;
+                }
+
+                if self
+                    .selected_device
+                    .and_then(|index| self.device_manager.devices().get(index))
+                    .is_some_and(Device::is_ergohaven_sm62)
+                {
+                    log::error!("{}", connect_apply_error_log(&e));
+                    // Keep the first SM62 failure on the picker. Even a helper
+                    // timeout can say "timed out or disconnected", so its text
+                    // cannot reliably distinguish a delayed reply from unplug.
+                    self.selected_device = None;
+                    self.clear_connected_keyboard_state(format!("Connect failed: {e}"));
                     return;
                 }
 

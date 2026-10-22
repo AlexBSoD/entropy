@@ -37,8 +37,8 @@ fn vial_lock_control_idle(
     !user_action_busy && (!is_unlocked || !background_layer_active)
 }
 
-fn display_menu_available(known_display_device: bool) -> bool {
-    known_display_device
+fn display_menu_available(known_display_device: bool, firmware_display_settings: bool) -> bool {
+    known_display_device || firmware_display_settings
 }
 
 impl EntropyApp {
@@ -69,7 +69,15 @@ impl EntropyApp {
                 .is_some_and(Self::device_uses_automatic_display_host_data);
             #[cfg(target_arch = "wasm32")]
             let known_display_device = false;
-            let show_display_item = display_menu_available(known_display_device);
+            let show_display_item = display_menu_available(
+                known_display_device,
+                self.display_settings.supported
+                    || self.display_settings.sm62_supported
+                    || self
+                        .supported_qmk_settings
+                        .iter()
+                        .any(|qsid| (230..=239).contains(qsid)),
+            );
             let layer_leds_available_for_menu = self.layer_led_settings.supported;
             let show_encoders_item = self.show_separate_encoder_visibility_settings(layout);
             let show_layout_options_item = !self.user_layout_option_indices(layout).is_empty();
@@ -687,7 +695,8 @@ mod tests {
 
     #[test]
     fn known_display_device_keeps_display_menu_visible_during_capability_reload() {
-        assert!(display_menu_available(true));
-        assert!(!display_menu_available(false));
+        assert!(display_menu_available(true, false));
+        assert!(display_menu_available(false, true));
+        assert!(!display_menu_available(false, false));
     }
 }

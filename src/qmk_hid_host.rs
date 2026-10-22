@@ -6,6 +6,8 @@ use std::sync::{
     Arc, Mutex, OnceLock,
 };
 use std::thread::{self, JoinHandle};
+#[cfg(any(target_os = "windows", test))]
+use std::time::SystemTime;
 use std::time::{Duration, Instant};
 
 const RAW_HID_PACKET_LEN: usize = 32;
@@ -15,18 +17,160 @@ const DATA_LAYOUT: u8 = 0xAC;
 const DATA_MEDIA_ARTIST: u8 = 0xAD;
 const DATA_MEDIA_TITLE: u8 = 0xAE;
 const DATA_DATE: u8 = 0xAF;
+// SM62 firmware: elapsed seconds (LE32), then total seconds (LE32).
+const DATA_SM62_MEDIA_PROGRESS: u8 = 0xB1;
+const SM62_VENDOR_ID: u16 = 0xE126;
+const SM62_PRODUCT_ID: u16 = 0x00B2;
 const DEFAULT_LAYOUT_CODES: [&str; 2] = ["en", "ru"];
 const LAYOUT_RESEND_INTERVAL: Duration = Duration::from_secs(10);
-// One process-wide desktop sampler, not one uninterruptible query thread per
+#[cfg(target_os = "windows")]
+const MEDIA_POLL_INTERVAL: Duration = Duration::from_millis(500);
+#[cfg(not(target_os = "windows"))]
+const MEDIA_POLL_INTERVAL: Duration = Duration::from_secs(1);
+// One process-wide desktop service with bounded independent polling lanes, not one query thread per
 // bridge/reconnect. It never owns HID or a host-output lease. Demand and cached
 // results share one short-held lock; no desktop call executes under that lock.
 static HOST_DATA_SERVICE: OnceLock<HostDataService> = OnceLock::new();
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct MediaInfo {
+    artist: String,
+    title: String,
+    position_seconds: Option<u32>,
+    duration_seconds: Option<u32>,
+}
+
+impl MediaInfo {
+    fn progress_payload(&self) -> [u8; 9] {
+        let duration = self.duration_seconds.unwrap_or(0);
+        let position = self.position_seconds.unwrap_or(0).min(duration);
+        let mut packet = [0; 9];
+        packet[0] = DATA_SM62_MEDIA_PROGRESS;
+        packet[1..5].copy_from_slice(&position.to_le_bytes());
+        packet[5..9].copy_from_slice(&duration.to_le_bytes());
+        packet
+    }
+}
+
+// Some Windows media sessions publish a position only when the user seeks.
+// Keep the displayed clock moving between samples, but re-anchor immediately
+// when the session, track, position or playback state changes.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Default)]
+struct MediaProgressClock {
+    identity: String,
+    raw_position: Option<Duration>,
+    last_updated_ticks: Option<i64>,
+    playing: bool,
+    anchor: Option<Instant>,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl MediaProgressClock {
+    fn update(
+        &mut self,
+        identity: &str,
+        raw_position: Option<Duration>,
+        last_updated_ticks: Option<i64>,
+        sample_age: Option<Duration>,
+        playing: bool,
+        duration: Option<u32>,
+        now: Instant,
+    ) -> Option<u32> {
+        // A newer valid publication can be a seek back to the same raw
+        // position. Missing/stale/regressing timeline identity is not a seek.
+        let fresh_timeline = sample_age.is_some()
+            && last_updated_ticks.is_some_and(|ticks| {
+                ticks > 0 && self.last_updated_ticks.is_none_or(|previous| ticks > previous)
+            });
+        if self.anchor.is_none()
+            || fresh_timeline
+            || self.identity != identity
+            || self.raw_position != raw_position
+            || self.playing != playing
+        {
+            let resumed_without_new_timeline = !self.playing
+                && playing
+                && self.last_updated_ticks == last_updated_ticks
+                && self.identity == identity;
+            self.identity = identity.to_owned();
+            self.raw_position = raw_position;
+            self.last_updated_ticks = last_updated_ticks;
+            self.playing = playing;
+            self.anchor = Some(if playing && !resumed_without_new_timeline {
+                now.checked_sub(sample_age.unwrap_or_default())
+                    .unwrap_or(now)
+            } else {
+                now
+            });
+        }
+        let position = raw_position?;
+        let elapsed = if playing {
+            now.duration_since(self.anchor?)
+        } else {
+            Duration::ZERO
+        };
+        Some(
+            position
+                .saturating_add(elapsed)
+                .as_secs()
+                .min(duration.unwrap_or(u32::MAX) as u64) as u32,
+        )
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_timeline_sample_age(last_updated_ticks: i64, now: SystemTime) -> Option<Duration> {
+    // WinRT DateTime and FILETIME both count 100 ns intervals since 1601-01-01.
+    const UNIX_EPOCH_TICKS: i128 = 116_444_736_000_000_000;
+    const TICKS_PER_SECOND: i128 = 10_000_000;
+    let unix_age = now.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+    let now_ticks = UNIX_EPOCH_TICKS
+        + (unix_age.as_secs() as i128) * TICKS_PER_SECOND
+        + (unix_age.subsec_nanos() as i128) / 100;
+    let age_ticks = now_ticks - last_updated_ticks as i128;
+    // Missing/invalid timestamps must not jump the clock far into a track.
+    if last_updated_ticks <= 0 || !(0..=3_600 * TICKS_PER_SECOND).contains(&age_ticks) {
+        return None;
+    }
+    Some(Duration::from_nanos((age_ticks * 100) as u64))
+}
+
+fn supports_sm62_media_progress(device: &crate::device::Device) -> bool {
+    device.vendor_id == SM62_VENDOR_ID && device.product_id == SM62_PRODUCT_ID
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_timeline_seconds(
+    start_ticks: Option<i64>,
+    end_ticks: Option<i64>,
+    max_seek_ticks: Option<i64>,
+    position_ticks: Option<i64>,
+) -> (Option<u32>, Option<u32>) {
+    const TICKS_PER_SECOND: i64 = 10_000_000;
+    // Some media sessions publish EndTime/Position but not StartTime.
+    let start = start_ticks.unwrap_or(0);
+    let duration = end_ticks
+        .filter(|end| *end > start)
+        .or_else(|| max_seek_ticks.filter(|end| *end > start))
+        .and_then(|end| u32::try_from((end - start) / TICKS_PER_SECOND).ok())
+        .filter(|seconds| *seconds > 0);
+    let position = position_ticks
+        .and_then(|position| {
+            u32::try_from(position.saturating_sub(start).max(0) / TICKS_PER_SECOND).ok()
+        })
+        .map(|position| duration.map_or(position, |duration| position.min(duration)));
+    (position, duration)
+}
 
 pub fn media_snapshot() -> Option<(String, String)> {
     HOST_DATA_SERVICE
         .get()
         .and_then(|service| service.snapshot().media)
-        .filter(|(artist, title)| !artist.is_empty() || !title.is_empty())
+        .and_then(|media| {
+            (!media.artist.is_empty() || !media.title.is_empty())
+                .then_some((media.artist, media.title))
+        })
 }
 
 #[derive(Clone, Default)]
@@ -34,7 +178,7 @@ struct DesktopSnapshot {
     volume: Option<u8>,
     layout: Option<u8>,
     // None means no completed sample, Some(empty) means playback stopped.
-    media: Option<(String, String)>,
+    media: Option<MediaInfo>,
     media_query_ms: u128,
     media_sampled_at: Option<Instant>,
 }
@@ -61,7 +205,7 @@ impl Drop for DesktopOwner {
     fn drop(&mut self) {
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         state.stopped = true;
-        self.shared.wake.notify_one();
+        self.shared.wake.notify_all();
     }
 }
 
@@ -73,7 +217,7 @@ struct HostDataService {
 trait DesktopSource {
     fn volume(&mut self) -> Option<u8>;
     fn layout(&mut self) -> Option<u8>;
-    fn media(&mut self) -> Option<(String, String)>;
+    fn media(&mut self) -> Option<MediaInfo>;
 }
 
 struct NativeDesktopSource {
@@ -105,19 +249,23 @@ impl DesktopSource for NativeDesktopSource {
             .and_then(LayoutTracker::current_layout_index)
     }
 
-    fn media(&mut self) -> Option<(String, String)> {
+    fn media(&mut self) -> Option<MediaInfo> {
         current_media_info()
     }
 }
 
 impl HostDataService {
-    fn start<S: DesktopSource + 'static>(source: impl FnOnce() -> S + Send + 'static) -> Self {
+    fn start<S: DesktopSource + 'static>(source: impl Fn() -> S + Send + Sync + 'static) -> Self {
         let shared = Arc::new(DesktopShared::default());
-        let worker = shared.clone();
-        // Construct platform objects on their owning thread (not all desktop
-        // handles are Send). One sampler lives for the production process;
-        // when idle it waits for subscribers, without any OS polling.
-        thread::spawn(move || run_desktop_service(worker, source()));
+        let source = Arc::new(source);
+        // One process-wide service, three bounded lanes. Construct platform
+        // handles on their owning thread; no OS query or source owns HID.
+        // A slow layout/media API must never freeze fresh volume feedback.
+        for index in 0..3 {
+            let worker = shared.clone();
+            let source = source.clone();
+            thread::spawn(move || run_desktop_service(worker, source(), index));
+        }
         Self {
             owner: Arc::new(DesktopOwner { shared }),
         }
@@ -139,7 +287,7 @@ impl HostDataService {
                 state.demand[index] += 1;
             }
         }
-        self.owner.shared.wake.notify_one();
+        self.owner.shared.wake.notify_all();
         DesktopSubscription {
             service: self.clone(),
             enabled,
@@ -181,41 +329,26 @@ impl Drop for DesktopSubscription {
                 }
             }
         }
-        shared.wake.notify_one();
+        shared.wake.notify_all();
     }
 }
 
-fn run_desktop_service(shared: Arc<DesktopShared>, mut source: impl DesktopSource) {
-    let intervals = [
-        VOLUME_POLL_INTERVAL,
-        Duration::from_millis(100),
-        Duration::from_secs(3),
-    ];
-    let mut last_poll = [Instant::now() - Duration::from_secs(60); 3];
-    let mut last_epoch = [0; 3];
+fn run_desktop_service(shared: Arc<DesktopShared>, mut source: impl DesktopSource, index: usize) {
+    let interval = [VOLUME_POLL_INTERVAL, Duration::from_millis(100), MEDIA_POLL_INTERVAL][index];
+    let mut last_poll = Instant::now() - Duration::from_secs(60);
+    let mut last_epoch = 0;
     loop {
         let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        while !state.stopped && state.demand == [0; 3] {
+        while !state.stopped && state.demand[index] == 0 {
             state = shared.wake.wait(state).unwrap_or_else(|e| e.into_inner());
         }
-        if state.stopped {
-            break;
-        }
+        if state.stopped { return; }
+        let epoch = state.epoch[index];
+        let due = last_epoch != epoch || last_poll.elapsed() >= interval;
         drop(state);
-        for index in 0..3 {
-            let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.stopped {
-                return;
-            }
-            let epoch = state.epoch[index];
-            let due = state.demand[index] > 0
-                && (last_epoch[index] != epoch || last_poll[index].elapsed() >= intervals[index]);
-            drop(state);
-            if !due {
-                continue;
-            }
-            last_epoch[index] = epoch;
-            last_poll[index] = Instant::now();
+        if due {
+            last_epoch = epoch;
+            last_poll = Instant::now();
             let started = Instant::now();
             let mut sample = DesktopSnapshot::default();
             match index {
@@ -228,10 +361,8 @@ fn run_desktop_service(shared: Arc<DesktopShared>, mut source: impl DesktopSourc
                 }
             }
             let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.stopped {
-                return;
-            }
-            // A completed old query may not populate a newly enabled session.
+            if state.stopped { return; }
+            // Old in-flight queries cannot populate a re-enabled session.
             if state.demand[index] > 0 && state.epoch[index] == epoch {
                 match index {
                     0 => state.snapshot.volume = sample.volume,
@@ -245,9 +376,7 @@ fn run_desktop_service(shared: Arc<DesktopShared>, mut source: impl DesktopSourc
             }
         }
         let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.stopped {
-            break;
-        }
+        if state.stopped { return; }
         let _ = shared.wake.wait_timeout(state, Duration::from_millis(20));
     }
 }
@@ -263,8 +392,12 @@ impl<M: FnMut() -> Option<(String, String)>> DesktopSource for TestMediaSource<M
     fn layout(&mut self) -> Option<u8> {
         panic!("media-only fixture must not query real desktop layout")
     }
-    fn media(&mut self) -> Option<(String, String)> {
-        (self.0)()
+    fn media(&mut self) -> Option<MediaInfo> {
+        (self.0)().map(|(artist, title)| MediaInfo {
+            artist,
+            title,
+            ..Default::default()
+        })
     }
 }
 
@@ -698,6 +831,7 @@ struct HostOutputFootprint {
     generation: u64,
     mode: HostDataMode,
     extended: bool,
+    sm62: bool,
 }
 
 #[derive(Clone)]
@@ -707,7 +841,24 @@ pub(crate) struct HostOutputLease {
 }
 
 impl HostOutputOwner {
+    /// Keep unsolicited host-data packets off the selected HID stream while a
+    /// setting SET and its verified GET are in flight. The bridge already
+    /// serializes output through this lock; settings use the proxy directly.
+    pub(crate) fn with_settings_write_paused<T>(&self, operation: impl FnOnce() -> T) -> T {
+        let _output = self.active.lock().unwrap_or_else(|error| error.into_inner());
+        operation()
+    }
+
     pub(crate) fn claim(self: &Arc<Self>, mode: HostDataMode, extended: bool) -> HostOutputLease {
+        self.claim_sm62(mode, extended, false)
+    }
+
+    pub(crate) fn claim_sm62(
+        self: &Arc<Self>,
+        mode: HostDataMode,
+        extended: bool,
+        sm62: bool,
+    ) -> HostOutputLease {
         let generation = self
             .generation
             .fetch_add(1, Ordering::SeqCst)
@@ -718,6 +869,7 @@ impl HostOutputOwner {
                 generation,
                 mode,
                 extended,
+                sm62,
             },
         }
     }
@@ -745,9 +897,10 @@ impl HostOutputLease {
                 let removed = HostDataMode {
                     time: old.mode.time && !self.footprint.mode.time,
                     media: old.mode.media && !self.footprint.mode.media,
+                    layout: old.mode.layout && !self.footprint.mode.layout,
                     ..Default::default()
                 };
-                for clear in shutdown_payloads(removed, old.extended) {
+                for clear in shutdown_payloads_for_device(removed, old.extended, old.sm62) {
                     send(&clear)?;
                 }
             }
@@ -772,14 +925,17 @@ impl HostOutputLease {
         }
         let mut mode = self.footprint.mode;
         let mut extended = self.footprint.extended;
+        let mut sm62 = self.footprint.sm62;
         if let Some(old) = *active {
             mode.time |= old.mode.time;
             mode.media |= old.mode.media;
+            mode.layout |= old.mode.layout;
             extended |= old.extended;
+            sm62 |= old.sm62;
         }
         // A final shutdown is a single ordered batch. A concurrent new claim
         // never blocks the UI and its worker writes only after this batch ends.
-        for clear in shutdown_payloads(mode, extended) {
+        for clear in shutdown_payloads_for_device(mode, extended, sm62) {
             send(&clear)?;
         }
         *active = None;
@@ -818,6 +974,26 @@ impl ApplicationLayoutOwnerState {
         self.verified_key = None;
         self.snapshot_generation = self.generation;
         self.snapshot = crate::application_layouts::ApplicationLayoutSnapshot::inactive();
+    }
+}
+
+mod wake_identity;
+
+// Stateless across workers/reconnects: semantic identity, not a transition counter.
+#[derive(Default)]
+struct ApplicationLayoutTransmission;
+
+impl ApplicationLayoutTransmission {
+    fn packets(&mut self, snapshot: &crate::application_layouts::ApplicationLayoutSnapshot) -> Vec<[u8; 32]> {
+        let mut packets = snapshot.packets();
+        if let Some(id) = &snapshot.profile_id {
+            let commit = packets.last_mut().expect("snapshot has a commit");
+            // Optional v2 extension. v1 consumers ignore it rather than comparing
+            // an identity against their obsolete worker-local epoch namespace.
+            commit[9..11].copy_from_slice(&[0x57, 2]);
+            commit[11..31].copy_from_slice(&wake_identity::digest(id));
+        }
+        packets
     }
 }
 
@@ -941,7 +1117,13 @@ impl QmkHidHostBridge {
             mode,
             shared_output,
             protocol,
-            HostDataService::start(move || TestMediaSource(media_source)),
+            HostDataService::start({
+                let source = Arc::new(Mutex::new(media_source));
+                move || {
+                    let source = source.clone();
+                    TestMediaSource(move || (source.lock().unwrap_or_else(|e| e.into_inner()))())
+                }
+            }),
             open_hid,
         )
     }
@@ -960,7 +1142,11 @@ impl QmkHidHostBridge {
             + 'static,
     ) -> Self {
         let shared_output = shared_output.map(|output| {
-            output.for_host_bridge(mode, matches!(protocol, HostProtocol::Selected(true)))
+            output.for_host_bridge_with_sm62(
+                mode,
+                matches!(protocol, HostProtocol::Selected(true)),
+                supports_sm62_media_progress(&device),
+            )
         });
         let control = Arc::new(BridgeTransportControl::default());
         let worker_control = control.clone();
@@ -1237,8 +1423,11 @@ fn run_bridge(
     let mut last_application_layout = None;
     let mut last_application_layout_resend_generation =
         application_layout_resend_generation.load(Ordering::SeqCst);
+    let mut application_layout_transmission = ApplicationLayoutTransmission::default();
     let mut last_application_layout_send = Instant::now() - Duration::from_secs(60);
     let mut desktop_subscription = None;
+    let mut consecutive_write_failures = 0u8;
+    let mut first_write_failure_at: Option<Instant> = None;
 
     while !stop.load(Ordering::Relaxed) {
         if let Some((hid, selected_extended)) = control.take_selected_handoff() {
@@ -1256,6 +1445,8 @@ fn run_bridge(
                 Ordering::Release,
             );
             device = Some(HostDataHid::Dedicated(hid));
+            first_write_failure_at = None;
+            consecutive_write_failures = 0;
             extended_protocol = mode.time && selected_extended;
             protocol = HostProtocol::Discover;
             last_time = None;
@@ -1302,6 +1493,8 @@ fn run_bridge(
                 })
                 .ok();
             if let Some(dev) = device.as_ref() {
+                first_write_failure_at = None;
+                consecutive_write_failures = 0;
                 if let HostDataHid::Dedicated(hid) = dev {
                     // Also discard any UI grant made while endpoint acquisition
                     // was in flight; it cannot identify this newly opened owner.
@@ -1370,6 +1563,8 @@ fn run_bridge(
         }
 
         let mut write_failed = false;
+        let mut write_attempted = false;
+        let sm62 = target.is_ergohaven_sm62();
 
         if application_layouts_enabled.load(Ordering::Acquire) {
             let resend_generation = application_layout_resend_generation.load(Ordering::SeqCst);
@@ -1384,10 +1579,10 @@ fn run_bridge(
             let snapshot_changed = last_application_layout.as_ref() != Some(&application_layout);
             if snapshot_changed {
                 let mut sent = true;
-                for packet in application_layout.packets() {
+                for packet in application_layout_transmission.packets(&application_layout) {
                     match write_application_layout_payload(&application_layout_snapshot,
-                        &application_layout, generation, &packet, |p| write_payload(dev, p)) {
-                        Ok(true) => {},
+                        &application_layout, generation, &packet, |p| write_payload_with_retry(dev, p, sm62)) {
+                        Ok(true) => { write_attempted = true; },
                         Ok(false) => { sent = false; break; },
                         Err(_) => { sent = false; write_failed = true; break; },
                     }
@@ -1400,8 +1595,8 @@ fn run_bridge(
             } else if last_application_layout_send.elapsed() >= Duration::from_secs(1) {
                 match write_application_layout_payload(&application_layout_snapshot,
                     &application_layout, generation, &application_layout.keepalive_packet(),
-                    |p| write_payload(dev, p)) {
-                    Ok(true) => last_application_layout_send = Instant::now(),
+                    |p| write_payload_with_retry(dev, p, sm62)) {
+                    Ok(true) => { write_attempted = true; last_application_layout_send = Instant::now(); },
                     Ok(false) => continue,
                     Err(_) => write_failed = true,
                 }
@@ -1411,8 +1606,9 @@ fn run_bridge(
         if mode.time && last_time_poll.elapsed() >= Duration::from_secs(1) {
             last_time_poll = Instant::now();
             if extended_protocol {
+                write_attempted = true;
                 let started = Instant::now();
-                let heartbeat = write_payload(dev, &[DATA_HOST_STATUS, 1]);
+                let heartbeat = write_payload_with_retry(dev, &[DATA_HOST_STATUS, 1], sm62);
                 log::debug!(
                     "qmk-hid-host heartbeat: target={:?} online=1 elapsed_ms={} result={heartbeat:?}",
                     target.path,
@@ -1422,14 +1618,15 @@ fn run_bridge(
             }
             let now = current_time_payload();
             if last_time != Some(now) {
+                write_attempted = true;
                 last_time = Some(now);
-                write_failed |= write_payload(dev, &[DATA_TIME, now.0, now.1]).is_err();
+                write_failed |= write_payload_with_retry(dev, &[DATA_TIME, now.0, now.1], sm62).is_err();
                 pause_between_packets();
-                if extended_protocol {
+                if extended_protocol || target.is_ergohaven_sm62() {
                     use chrono::Datelike;
                     let today = chrono::Local::now();
                     let year = today.year() as u16;
-                    write_failed |= write_payload(
+                    write_failed |= write_payload_with_retry(
                         dev,
                         &[
                             DATA_DATE,
@@ -1438,6 +1635,7 @@ fn run_bridge(
                             year as u8,
                             (year >> 8) as u8,
                         ],
+                        sm62,
                     )
                     .is_err();
                     pause_between_packets();
@@ -1457,8 +1655,9 @@ fn run_bridge(
                     break;
                 }
                 if last_volume != Some(volume) {
+                    write_attempted = true;
                     last_volume = Some(volume);
-                    write_failed |= write_payload(dev, &[DATA_VOLUME, volume]).is_err();
+                    write_failed |= write_payload_with_retry(dev, &[DATA_VOLUME, volume], sm62).is_err();
                     pause_between_packets();
                 }
             }
@@ -1471,8 +1670,9 @@ fn run_bridge(
                     break;
                 }
                 if layout_needs_send(last_layout, last_layout_full_send.elapsed(), layout) {
+                    write_attempted = true;
                     last_layout = Some(layout);
-                    let layout_write = write_layout_snapshot(dev, layout, &layout_snapshot);
+                    let layout_write = write_layout_snapshot(dev, layout, &layout_snapshot, sm62);
                     write_failed |= layout_write.is_err();
                     if layout_write.is_ok() {
                         last_layout_full_send = Instant::now();
@@ -1488,7 +1688,9 @@ fn run_bridge(
                 .is_some_and(|at| at > last_media_poll)
         {
             last_media_poll = snapshot.media_sampled_at.unwrap();
-            let (artist, title) = snapshot.media.unwrap_or_default();
+            let media = snapshot.media.unwrap_or_default();
+            let artist = &media.artist;
+            let title = &media.title;
             log::debug!(
                 "qmk-hid-host media query: target={:?} elapsed_ms={}",
                 target.path,
@@ -1498,14 +1700,21 @@ fn run_bridge(
                 break;
             }
             let full_resend = last_media_full_send.elapsed() >= Duration::from_secs(10);
-            if full_resend || artist != last_artist {
+            if full_resend || artist != &last_artist {
+                write_attempted = true;
                 last_artist = artist.clone();
-                write_failed |= write_text_payload(dev, DATA_MEDIA_ARTIST, &artist).is_err();
+                write_failed |= write_text_payload(dev, DATA_MEDIA_ARTIST, artist, sm62).is_err();
                 pause_between_packets();
             }
-            if full_resend || title != last_title {
+            if full_resend || title != &last_title {
+                write_attempted = true;
                 last_title = title.clone();
-                write_failed |= write_text_payload(dev, DATA_MEDIA_TITLE, &title).is_err();
+                write_failed |= write_text_payload(dev, DATA_MEDIA_TITLE, title, sm62).is_err();
+                pause_between_packets();
+            }
+            if supports_sm62_media_progress(&target) {
+                write_attempted = true;
+                write_failed |= write_payload_with_retry(dev, &media.progress_payload(), sm62).is_err();
                 pause_between_packets();
             }
             if full_resend {
@@ -1514,6 +1723,30 @@ fn run_bridge(
         }
 
         if write_failed {
+            consecutive_write_failures = consecutive_write_failures.saturating_add(1);
+            let failure_now = Instant::now();
+            #[cfg(test)]
+            let failure_now = review_regressions::failure_now(failure_now);
+            let failure_started = *first_write_failure_at.get_or_insert(failure_now);
+            if sm62 && failure_now.duration_since(failure_started) < Duration::from_secs(5) {
+                // A display transition can temporarily reject an output report
+                // while the selected USB HID owner is still alive. Keep the
+                // bridge/host status and retry cached data on the next pass.
+                log::warn!(
+                    "SM62 host output temporarily busy; retrying without disconnect target={:?} failure={}",
+                    target.path, consecutive_write_failures
+                );
+                last_time = None;
+                last_volume = None;
+                reset_layout_sync_state(&mut last_layout, &mut last_layout_full_send);
+                last_application_layout = None;
+                last_artist.clear();
+                last_title.clear();
+                last_media_poll = Instant::now() - Duration::from_secs(60);
+                last_media_full_send = Instant::now() - Duration::from_secs(60);
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
             log::warn!(
                 "qmk-hid-host bridge write failed; reconnecting target={:?}",
                 target.path
@@ -1531,6 +1764,10 @@ fn run_bridge(
             last_artist.clear();
             last_title.clear();
             last_media_full_send = Instant::now() - Duration::from_secs(60);
+        } else if write_attempted {
+            consecutive_write_failures = 0;
+            // Idle passes are not evidence of transport recovery.
+            first_write_failure_at = None;
         }
 
         thread::sleep(Duration::from_millis(20));
@@ -1543,7 +1780,12 @@ fn run_bridge(
                     crate::application_layouts::ApplicationLayoutSnapshot::deactivate_packet();
                 let _ = write_payload(device, &packet);
             }
-            send_shutdown_payloads(device, mode, extended_protocol);
+            send_shutdown_payloads(
+                device,
+                mode,
+                extended_protocol,
+                supports_sm62_media_progress(&target),
+            );
         } else if let Some(output) = shared_output.as_ref() {
             // A successor stopped before opening must also finish any retained
             // mode footprint; this uses the existing owner, never a reopened path.
@@ -1573,8 +1815,8 @@ fn layout_snapshot_label(snapshot: &AtomicU8) -> Option<&'static str> {
     }
 }
 
-fn write_layout_snapshot(dev: &HostDataHid, layout: u8, snapshot: &AtomicU8) -> anyhow::Result<()> {
-    let result = write_payload(dev, &[DATA_LAYOUT, layout]);
+fn write_layout_snapshot(dev: &HostDataHid, layout: u8, snapshot: &AtomicU8, sm62: bool) -> anyhow::Result<()> {
+    let result = write_payload_with_retry(dev, &[DATA_LAYOUT, layout], sm62);
     snapshot.store(
         if result.is_ok() { layout } else { u8::MAX },
         Ordering::Relaxed,
@@ -1595,8 +1837,13 @@ fn layout_needs_send(
     last_layout != Some(layout) || elapsed_since_last_send >= LAYOUT_RESEND_INTERVAL
 }
 
-fn send_shutdown_payloads(device: &HostDataHid, mode: HostDataMode, extended_protocol: bool) {
-    let payloads = shutdown_payloads(mode, extended_protocol);
+fn send_shutdown_payloads(
+    device: &HostDataHid,
+    mode: HostDataMode,
+    extended_protocol: bool,
+    sm62: bool,
+) {
+    let payloads = shutdown_payloads_for_device(mode, extended_protocol, sm62);
     if let HostDataHid::Shared(output) = device {
         if let Err(error) = output.write_host_shutdown(&payloads) {
             log::warn!("qmk-hid-host shutdown write failed: {error}");
@@ -1613,7 +1860,18 @@ fn send_shutdown_payloads(device: &HostDataHid, mode: HostDataMode, extended_pro
 }
 
 fn shutdown_payloads(mode: HostDataMode, extended_protocol: bool) -> Vec<Vec<u8>> {
+    shutdown_payloads_for_device(mode, extended_protocol, false)
+}
+
+fn shutdown_payloads_for_device(
+    mode: HostDataMode,
+    extended_protocol: bool,
+    sm62: bool,
+) -> Vec<Vec<u8>> {
     let mut payloads = Vec::new();
+    if sm62 && mode.layout {
+        payloads.push(vec![DATA_LAYOUT, 255]);
+    }
     // Never reopen a device or send BA to firmware that has not advertised it.
     if mode.time && extended_protocol {
         payloads.push(vec![DATA_HOST_STATUS, 0]);
@@ -1621,6 +1879,9 @@ fn shutdown_payloads(mode: HostDataMode, extended_protocol: bool) -> Vec<Vec<u8>
     if mode.media {
         payloads.push(vec![DATA_MEDIA_ARTIST, 0]);
         payloads.push(vec![DATA_MEDIA_TITLE, 0]);
+        if sm62 {
+            payloads.push(MediaInfo::default().progress_payload().to_vec());
+        }
     }
     payloads
 }
@@ -1664,17 +1925,62 @@ fn pause_between_packets() {
 }
 
 fn write_payload(device: &HostDataHid, payload: &[u8]) -> anyhow::Result<()> {
+    #[cfg(test)]
+    if let Some(result) = review_regressions::scripted_write(payload) {
+        result?;
+    }
     device.write_output_report(payload)
 }
 
-fn write_text_payload(device: &HostDataHid, data_type: u8, value: &str) -> anyhow::Result<()> {
+fn write_payload_with_retry(device: &HostDataHid, payload: &[u8], sm62: bool) -> anyhow::Result<()> {
+    match write_payload(device, payload) {
+        Err(error) if sm62 && !crate::hid::is_transport_disconnect_error(&error) => {
+            log::warn!("SM62 host data transient HID write failure; retrying once: {error:#}");
+            thread::sleep(Duration::from_millis(35));
+            write_payload(device, payload)
+        }
+        result => result,
+    }
+}
+
+fn sm62_title_payloads(value: &str) -> Vec<Vec<u8>> {
+    // The display scrolls pixels; the wire budget is independent of its width.
+    // Cap the protocol at 255 bytes without cutting a UTF-8 code point.
+    let mut end = value.len().min(255);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let bytes = &value.as_bytes()[..end];
+    if bytes.len() <= 30 {
+        let mut payload = vec![DATA_MEDIA_TITLE, bytes.len() as u8];
+        payload.extend_from_slice(bytes);
+        return vec![payload];
+    }
+    bytes.chunks(29).enumerate().map(|(index, chunk)| {
+        let mut payload = vec![0xBB, (index * 29) as u8, bytes.len() as u8];
+        payload.extend_from_slice(chunk);
+        payload
+    }).collect()
+}
+
+fn write_text_payload(device: &HostDataHid, data_type: u8, value: &str, sm62: bool) -> anyhow::Result<()> {
+    if sm62 && data_type == DATA_MEDIA_TITLE {
+        let payloads = sm62_title_payloads(value);
+        for (index, payload) in payloads.iter().enumerate() {
+            if index != 0 {
+                pause_between_packets();
+            }
+            write_payload_with_retry(device, payload, sm62)?;
+        }
+        return Ok(());
+    }
     let mut payload = Vec::with_capacity(RAW_HID_PACKET_LEN);
     let mut bytes = value.as_bytes().to_vec();
     bytes.truncate(30);
     payload.push(data_type);
     payload.push(bytes.len() as u8);
     payload.extend(bytes);
-    write_payload(device, &payload)
+    write_payload_with_retry(device, &payload, sm62)
 }
 
 fn current_time_payload() -> (u8, u8) {
@@ -1753,43 +2059,57 @@ fn current_volume_percent() -> Option<u8> {
 }
 
 #[cfg(target_os = "windows")]
-fn current_media_info() -> Option<(String, String)> {
+fn current_media_info() -> Option<MediaInfo> {
     windows_platform::media_info()
 }
 
 #[cfg(target_os = "linux")]
-fn current_media_info() -> Option<(String, String)> {
+fn current_media_info() -> Option<MediaInfo> {
     command_stdout(
         "playerctl",
-        &["metadata", "--format", "{{artist}}\t{{title}}"],
+        &[
+            "-a",
+            "metadata",
+            "--format",
+            "{{playerName}}\t{{status}}\t{{artist}}\t{{title}}\t{{mpris:length}}",
+        ],
     )
-    .and_then(|out| split_media_line(&out))
+    .and_then(|out| split_playerctl_all_metadata(&out))
     .or_else(|| {
         command_stdout(
             "playerctl",
             &[
-                "-a",
                 "metadata",
                 "--format",
-                "{{status}}\t{{artist}}\t{{title}}",
+                "{{artist}}\t{{title}}\t{{mpris:length}}",
             ],
         )
-        .and_then(|out| split_playerctl_all_metadata(&out))
+        .and_then(|out| split_media_line(&out))
+        .map(|mut media| {
+            media.position_seconds = playerctl_position(None);
+            media
+        })
     })
     .or_else(mpris_media_info_via_gdbus)
 }
 
 #[cfg(target_os = "macos")]
-fn current_media_info() -> Option<(String, String)> {
+fn current_media_info() -> Option<MediaInfo> {
     let script = r#"
 set mediaArtist to ""
 set mediaTitle to ""
+set mediaPosition to ""
+set mediaDuration to ""
 tell application "System Events"
     if exists process "Spotify" then
         tell application "Spotify"
             if player state is not stopped then
                 set mediaArtist to artist of current track
                 set mediaTitle to name of current track
+                try
+                    set mediaPosition to player position
+                    set mediaDuration to duration of current track / 1000
+                end try
             end if
         end tell
     else if exists process "Music" then
@@ -1797,11 +2117,15 @@ tell application "System Events"
             if player state is not stopped then
                 set mediaArtist to artist of current track
                 set mediaTitle to name of current track
+                try
+                    set mediaPosition to player position
+                    set mediaDuration to duration of current track
+                end try
             end if
         end tell
     end if
 end tell
-return mediaArtist & tab & mediaTitle
+return mediaArtist & tab & mediaTitle & tab & mediaPosition & tab & mediaDuration
 "#;
     macos_automation_stdout(&["-e", script]).and_then(|out| split_media_line(&out))
 }
@@ -1889,7 +2213,7 @@ fn macos_layout_code_on_main_thread() -> Option<String> {
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-fn current_media_info() -> Option<(String, String)> {
+fn current_media_info() -> Option<MediaInfo> {
     None
 }
 
@@ -1945,18 +2269,130 @@ fn command_stdout_timeout_with_poll(
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-fn split_media_line(line: &str) -> Option<(String, String)> {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn split_media_line(line: &str) -> Option<MediaInfo> {
     let line = line.trim_end_matches(['\r', '\n']);
-    let mut parts = line.splitn(2, '\t');
+    let mut parts = line.splitn(4, '\t');
     let artist = parts.next().unwrap_or_default().trim().to_string();
     let title = parts.next().unwrap_or_default().trim().to_string();
-    (!artist.is_empty() || !title.is_empty()).then_some((artist, title))
+    #[cfg(target_os = "linux")]
+    let (position_seconds, duration_seconds) = (None, parts.next().and_then(parse_microseconds));
+    #[cfg(target_os = "macos")]
+    let (position_seconds, duration_seconds) = (
+        parts.next().and_then(parse_seconds),
+        parts.next().and_then(parse_seconds),
+    );
+    (!artist.is_empty() || !title.is_empty()).then_some(MediaInfo {
+        artist,
+        title,
+        position_seconds,
+        duration_seconds,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn parse_seconds(value: &str) -> Option<u32> {
+    let seconds = value.trim().parse::<f64>().ok()?;
+    (seconds.is_finite() && seconds >= 0.0 && seconds <= u32::MAX as f64)
+        .then_some(seconds.floor() as u32)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_microseconds(value: &str) -> Option<u32> {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()?
+        .checked_div(1_000_000)?
+        .try_into()
+        .ok()
 }
 
 #[cfg(all(test, not(target_os = "windows")))]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires MACROPAD_WAKE_EXE production C/LVGL harness"]
+    fn application_identity_survives_worker_replacement() {
+        use crate::application_layouts::ApplicationLayoutSnapshot;
+        use std::io::Write;
+        for prior in ["", "B"] {
+            for disconnect in ["", "U\n", "X\n", "unknown"] {
+                for next in ["A", "B"] {
+                    let snapshot = |id: &str| {
+                        let mut s = ApplicationLayoutSnapshot::inactive();
+                        s.active = true;
+                        s.name = "worker replacement".into();
+                        s.profile_id = Some(id.into());
+                        s
+                    };
+                    let mut old = ApplicationLayoutTransmission::default();
+                    let mut new = ApplicationLayoutTransmission::default();
+                    let mut trace = String::new();
+                    let mut emit = |packets: Vec<[u8;32]>| {
+                        for packet in packets {
+                            trace.push('P');
+                            for byte in packet {trace.push_str(&format!(" {byte:02x}"));}
+                            trace.push('\n');
+                        }
+                    };
+                    if !prior.is_empty() {emit(old.packets(&snapshot(prior)));}
+                    emit(old.packets(&snapshot("A")));
+                    drop(emit);
+                    trace.push_str("S\n");
+                    if disconnect == "unknown" {
+                        for packet in new.packets(&ApplicationLayoutSnapshot::inactive()) {
+                            trace.push('P');for byte in packet {trace.push_str(&format!(" {byte:02x}"));}trace.push('\n');
+                        }
+                        trace.push_str("N\n");
+                    } else {trace.push_str(disconnect);}
+                    for packet in new.packets(&snapshot(next)) {
+                        trace.push('P');for byte in packet {trace.push_str(&format!(" {byte:02x}"));}trace.push('\n');
+                    }
+                    trace.push_str(if next == "A" {"N\n"} else {"W\n"});
+                    if let Ok(dir) = std::env::var("MACROPAD_WAKE_CASES") {
+                        let path = std::path::Path::new(&dir).join(format!("worker-{}-{}-{next}.trace",if prior.is_empty(){"initial"}else{prior},match disconnect {""=>"reconnect","U\n"=>"deactivate","X\n"=>"expiry",_=>"unknown"}));
+                        std::fs::write(path,&trace).unwrap();
+                    }
+                    let mut child = std::process::Command::new(std::env::var("MACROPAD_WAKE_EXE").unwrap())
+                        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+                    child.stdin.take().unwrap().write_all(trace.as_bytes()).unwrap();
+                    let out = child.wait_with_output().unwrap();
+                    assert!(out.status.success(), "prior={prior:?} disconnect={disconnect:?} next={next}: {}{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn application_profile_wake_epoch_tracks_identity_not_snapshot_content() {
+        use crate::application_layouts::ApplicationLayoutSnapshot;
+        let mut wire = ApplicationLayoutTransmission::default();
+        let mut a = ApplicationLayoutSnapshot::inactive();
+        a.active = true;
+        a.profile_id = Some("profile-a".into());
+        let epoch = |packets: Vec<[u8; 32]>| {
+            let commit = packets.last().unwrap();
+            assert_eq!(&commit[9..11], &[0x57, 2]);
+            <[u8;20]>::try_from(&commit[11..31]).unwrap()
+        };
+        let first = epoch(wire.packets(&a));
+        assert_eq!(epoch(wire.packets(&a)), first, "forced resend");
+        a.revision += 1;
+        a.name = "renamed".into();
+        a.layers[0][0] = 0x0010;
+        a.visuals[0][0] = 1;
+        assert_eq!(epoch(wire.packets(&a)), first, "edits and visuals are not identity");
+        let mut b = a.clone();
+        b.profile_id = Some("profile-b".into());
+        assert_eq!(a.packets(), b.packets(), "identical legacy wire content");
+        let second = epoch(wire.packets(&b));
+        assert_ne!(second, first, "different profiles with identical content");
+        assert_ne!(epoch(wire.packets(&a)), second, "return to earlier profile");
+        let unknown = wire.packets(&ApplicationLayoutSnapshot::inactive());
+        assert!(unknown.last().unwrap()[9..].iter().all(|b|*b==0));
+    }
 
     #[test]
     fn forced_application_layout_resend_advances_transport_generation() {
@@ -2070,7 +2506,7 @@ mod tests {
         let other_device = AtomicU8::new(1);
         assert_eq!(layout_snapshot_label(&snapshot), None);
         for (index, label) in [(0, "EN"), (1, "RU"), (0, "EN")] {
-            write_layout_snapshot(&host_data_hid, index, &snapshot).unwrap();
+            write_layout_snapshot(&host_data_hid, index, &snapshot, false).unwrap();
             assert_eq!(layout_snapshot_label(&snapshot), Some(label));
             assert_eq!(layout_snapshot_label(&other_device), Some("RU"));
         }
@@ -2094,6 +2530,13 @@ mod tests {
         assert_eq!(layout_code_index("ru"), Some(1));
         assert_eq!(layout_code_index("com.apple.keylayout.RussianWin"), Some(1));
         assert_eq!(layout_code_index("de"), None);
+    }
+
+    #[test]
+    fn sm62_shutdown_clears_layout_without_affecting_other_devices() {
+        let mode = HostDataMode { time: false, volume: false, layout: true, media: false };
+        assert_eq!(shutdown_payloads_for_device(mode, false, true), vec![vec![DATA_LAYOUT, 255]]);
+        assert!(shutdown_payloads_for_device(mode, false, false).is_empty());
     }
 
     #[test]
@@ -2628,26 +3071,50 @@ impl LayoutTracker {
 }
 
 #[cfg(target_os = "linux")]
-fn split_playerctl_all_metadata(output: &str) -> Option<(String, String)> {
+fn playerctl_position(player: Option<&str>) -> Option<u32> {
+    let args = match player {
+        Some(name) => vec!["-p", name, "position"],
+        None => vec!["position"],
+    };
+    command_stdout("playerctl", &args)
+        .as_deref()
+        .and_then(parse_seconds)
+}
+
+#[cfg(target_os = "linux")]
+fn split_playerctl_all_metadata(output: &str) -> Option<MediaInfo> {
     let mut fallback = None;
     for line in output.lines() {
-        let mut parts = line.splitn(3, '\t');
+        let mut parts = line.splitn(5, '\t');
+        let player = parts.next().unwrap_or_default().trim();
         let status = parts.next().unwrap_or_default().trim();
         let artist = parts.next().unwrap_or_default().trim().to_string();
         let title = parts.next().unwrap_or_default().trim().to_string();
         if artist.is_empty() && title.is_empty() {
             continue;
         }
+        let media = MediaInfo {
+            artist,
+            title,
+            position_seconds: None,
+            duration_seconds: parts.next().and_then(parse_microseconds),
+        };
         if status.eq_ignore_ascii_case("playing") {
-            return Some((artist, title));
+            return Some(MediaInfo {
+                position_seconds: playerctl_position(Some(player)),
+                ..media
+            });
         }
-        fallback.get_or_insert((artist, title));
+        fallback.get_or_insert((player.to_string(), media));
     }
-    fallback
+    fallback.map(|(player, media)| MediaInfo {
+        position_seconds: playerctl_position(Some(&player)),
+        ..media
+    })
 }
 
 #[cfg(target_os = "linux")]
-fn mpris_media_info_via_gdbus() -> Option<(String, String)> {
+fn mpris_media_info_via_gdbus() -> Option<MediaInfo> {
     let names = command_stdout(
         "gdbus",
         &[
@@ -2670,9 +3137,12 @@ fn mpris_media_info_via_gdbus() -> Option<(String, String)> {
         let Some(metadata) = gdbus_get_mpris_property(&name, "Metadata") else {
             continue;
         };
-        let Some(media) = split_gdbus_mpris_metadata(&metadata) else {
+        let Some(mut media) = split_gdbus_mpris_metadata(&metadata) else {
             continue;
         };
+        media.position_seconds = gdbus_get_mpris_property(&name, "Position")
+            .as_deref()
+            .and_then(gvariant_microseconds);
         let is_playing = gdbus_get_mpris_property(&name, "PlaybackStatus")
             .map(|status| status.contains("'Playing'") || status.contains("\"Playing\""))
             .unwrap_or(false);
@@ -2704,10 +3174,27 @@ fn gdbus_get_mpris_property(name: &str, property: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn split_gdbus_mpris_metadata(metadata: &str) -> Option<(String, String)> {
+fn split_gdbus_mpris_metadata(metadata: &str) -> Option<MediaInfo> {
     let artist = gvariant_metadata_string(metadata, "xesam:artist").unwrap_or_default();
     let title = gvariant_metadata_string(metadata, "xesam:title").unwrap_or_default();
-    (!artist.is_empty() || !title.is_empty()).then_some((artist, title))
+    (!artist.is_empty() || !title.is_empty()).then_some(MediaInfo {
+        artist,
+        title,
+        position_seconds: None,
+        duration_seconds: metadata
+            .find("mpris:length")
+            .and_then(|index| gvariant_microseconds(&metadata[index + "mpris:length".len()..])),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn gvariant_microseconds(value: &str) -> Option<u32> {
+    let after_type = value
+        .split_once("int64 ")
+        .map(|(_, tail)| tail)
+        .or_else(|| value.split_once('<').map(|(_, tail)| tail))?;
+    let number = after_type.split(|c: char| !c.is_ascii_digit()).next()?;
+    parse_microseconds(number)
 }
 
 #[cfg(target_os = "linux")]
@@ -2751,8 +3238,14 @@ fn gvariant_quoted_strings(text: &str) -> Vec<String> {
 
 #[cfg(target_os = "windows")]
 mod windows_platform {
+    use std::cell::RefCell;
+    use std::time::Duration;
     use windows::{
-        Media::Control::GlobalSystemMediaTransportControlsSessionManager,
+        Media::Control::{
+            GlobalSystemMediaTransportControlsSession,
+            GlobalSystemMediaTransportControlsSessionManager,
+            GlobalSystemMediaTransportControlsSessionPlaybackStatus,
+        },
         Win32::{
             Media::Audio::{
                 eMultimedia, eRender, Endpoints::IAudioEndpointVolume, IMMDeviceEnumerator,
@@ -2771,6 +3264,18 @@ mod windows_platform {
             WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId},
         },
     };
+
+    type SessionSample = (
+        super::MediaInfo,
+        bool,
+        String,
+        Option<Duration>,
+        Option<i64>,
+        Option<Duration>,
+    );
+    thread_local! {
+        static MEDIA_CLOCK: RefCell<super::MediaProgressClock> = RefCell::new(Default::default());
+    }
 
     pub fn volume_percent() -> Option<u8> {
         unsafe {
@@ -2794,18 +3299,144 @@ mod windows_platform {
         }
     }
 
-    pub fn media_info() -> Option<(String, String)> {
+    pub fn media_info() -> Option<super::MediaInfo> {
         let manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
             .and_then(|request| request.get())
             .ok()?;
-        let session = manager.GetCurrentSession().ok()?;
+        let current = manager.GetCurrentSession().ok();
+        let current_info = current.as_ref().and_then(read_session);
+        if current_info
+            .as_ref()
+            .is_some_and(|(media, playing, ..)| *playing && media.duration_seconds.is_some())
+        {
+            return current_info.map(finish_sample);
+        }
+        // A metadata-only browser session may remain selected while another
+        // playing session publishes a usable timeline. Never combine metadata
+        // and timeline from different sessions.
+        if let Ok(sessions) = manager.GetSessions() {
+            for session in sessions {
+                if session
+                    .GetPlaybackInfo()
+                    .and_then(|info| info.PlaybackStatus())
+                    .ok()
+                    != Some(GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing)
+                {
+                    continue;
+                }
+                if let Some(media) =
+                    read_session(&session).filter(|(media, ..)| media.duration_seconds.is_some())
+                {
+                    return Some(finish_sample(media));
+                }
+            }
+        }
+        current_info.map(finish_sample)
+    }
+
+    fn finish_sample(
+        (mut media, playing, identity, raw_position, last_updated_ticks, sample_age): SessionSample,
+    ) -> super::MediaInfo {
+        media.position_seconds = MEDIA_CLOCK.with(|clock| {
+            clock.borrow_mut().update(
+                &identity,
+                raw_position,
+                last_updated_ticks,
+                sample_age,
+                playing,
+                media.duration_seconds,
+                std::time::Instant::now(),
+            )
+        });
+        media
+    }
+
+    fn read_session(session: &GlobalSystemMediaTransportControlsSession) -> Option<SessionSample> {
         let props = session
             .TryGetMediaPropertiesAsync()
             .and_then(|request| request.get())
             .ok()?;
         let artist = props.Artist().unwrap_or_default().to_string();
         let title = props.Title().unwrap_or_default().to_string();
-        (!artist.is_empty() || !title.is_empty()).then_some((artist, title))
+        if artist.is_empty() && title.is_empty() {
+            return None;
+        }
+        let timeline_result = session.GetTimelineProperties();
+        if let Err(error) = &timeline_result {
+            log::debug!("Windows media timeline unavailable: {error}");
+        }
+        let timeline = timeline_result.ok();
+        let sampled_at = std::time::SystemTime::now();
+        let last_updated_ticks = timeline
+            .as_ref()
+            .and_then(|t| t.LastUpdatedTime().ok())
+            .map(|t| t.UniversalTime);
+        let sample_age = last_updated_ticks
+            .and_then(|ticks| super::windows_timeline_sample_age(ticks, sampled_at));
+        let raw_position = timeline
+            .as_ref()
+            .and_then(|t| t.Position().ok())
+            .map(|t| t.Duration);
+        let playback = session.GetPlaybackInfo().ok();
+        let playing = playback
+            .as_ref()
+            .and_then(|info| info.PlaybackStatus().ok())
+            == Some(GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing);
+        let (position_seconds, duration_seconds) = super::windows_timeline_seconds(
+            timeline
+                .as_ref()
+                .and_then(|t| t.StartTime().ok())
+                .map(|t| t.Duration),
+            timeline
+                .as_ref()
+                .and_then(|t| t.EndTime().ok())
+                .map(|t| t.Duration),
+            timeline
+                .as_ref()
+                .and_then(|t| t.MaxSeekTime().ok())
+                .map(|t| t.Duration),
+            raw_position,
+        );
+        let start_ticks = timeline
+            .as_ref()
+            .and_then(|t| t.StartTime().ok())
+            .map(|t| t.Duration)
+            .unwrap_or(0);
+        let precise_position = raw_position.map(|position| {
+            Duration::from_nanos(
+                (position.saturating_sub(start_ticks).max(0) as u64).saturating_mul(100),
+            )
+        });
+        let source = session
+            .SourceAppUserModelId()
+            .unwrap_or_default()
+            .to_string();
+        log::debug!(
+            "Windows media session {}: start={:?} end={:?} max_seek={:?} position={:?} updated={:?} age={:?} playing={playing}; parsed={:?}/{:?}",
+            source,
+            timeline.as_ref().and_then(|t| t.StartTime().ok()).map(|t| t.Duration),
+            timeline.as_ref().and_then(|t| t.EndTime().ok()).map(|t| t.Duration),
+            timeline.as_ref().and_then(|t| t.MaxSeekTime().ok()).map(|t| t.Duration),
+            raw_position,
+            last_updated_ticks,
+            sample_age,
+            position_seconds,
+            duration_seconds
+        );
+        let identity = format!("{source}\0{artist}\0{title}\0{duration_seconds:?}");
+        Some((
+            super::MediaInfo {
+                artist,
+                title,
+                position_seconds,
+                duration_seconds,
+            },
+            playing,
+            identity,
+            precise_position,
+            last_updated_ticks,
+            sample_age,
+        ))
     }
 
     pub fn layout_code() -> Option<String> {
@@ -3272,6 +3903,35 @@ mod qa_followup_shared_output {
     }
 
     #[test]
+    fn sm62_setting_write_excludes_shared_host_packets_until_readback() {
+        let owner = Arc::new(HostOutputOwner::default());
+        let lease = owner.claim_sm62(HostDataMode { media: true, ..Default::default() }, false, true);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let settings_owner = owner.clone();
+        let settings = thread::spawn(move || {
+            settings_owner.with_settings_write_paused(|| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let (write_tx, write_rx) = std::sync::mpsc::channel();
+        let host = thread::spawn(move || {
+            lease.write(&[DATA_MEDIA_ARTIST, 0], |_| {
+                write_tx.send(()).unwrap();
+                Ok(())
+            }).unwrap();
+        });
+        assert!(write_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        release_tx.send(()).unwrap();
+        settings.join().unwrap();
+        write_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        host.join().unwrap();
+    }
+
+    #[test]
     fn host_output_generations_are_per_physical_owner() {
         let (a, ar) = crate::hid::HidDevice::test_device();
         let (b, br) = crate::hid::HidDevice::test_device();
@@ -3435,7 +4095,7 @@ pub(crate) fn test_start_profile_handoff_bridge(
     impl DesktopSource for EmptyDesktop {
         fn volume(&mut self) -> Option<u8> { None }
         fn layout(&mut self) -> Option<u8> { None }
-        fn media(&mut self) -> Option<(String, String)> { None }
+        fn media(&mut self) -> Option<MediaInfo> { None }
     }
     QmkHidHostBridge::start_with_desktop_service(
         target,
@@ -3640,7 +4300,11 @@ fn assert_gated_application_output_ui_progress(keepalive: bool) {
     let mut inactive = ApplicationLayoutSnapshot::inactive().packets();
     inactive.push(ApplicationLayoutSnapshot::inactive().keepalive_packet());
     inactive.push(ApplicationLayoutSnapshot::deactivate_packet()); // worker shutdown
-    assert!(requests[admitted + 1..].iter().all(|p| inactive.contains(p)),
+    assert!(requests[admitted + 1..].iter().all(|p| inactive.iter().any(|expected| {
+        // Wake-extension bytes do not change the revocation/active flag, CRC
+        // or revision contract checked by this ownership regression.
+        if p[0] == 0xe3 { p[..9] == expected[..9] } else { p == expected }
+    })),
         "revoked snapshot sent another packet/keepalive after the admitted write");
     assert_eq!(bridge.test_application_layout_snapshot(), ApplicationLayoutSnapshot::inactive());
 }
@@ -3757,4 +4421,114 @@ pub(crate) fn test_open_selected_owner(
     output: &crate::hid::SharedHidOutput,
 ) -> anyhow::Result<()> {
     open_host_data_hid(target, Some(output)).map(|_| ())
+}
+
+#[cfg(test)]
+mod review_regressions;
+
+#[cfg(test)]
+mod sm62_timeline_tests {
+    use super::*;
+
+    #[test]
+    fn progress_packet_uses_elapsed_and_total_seconds() {
+        let info = MediaInfo {
+            position_seconds: Some(75),
+            duration_seconds: Some(230),
+            ..Default::default()
+        };
+        assert_eq!(info.progress_payload(), [0xB1, 75, 0, 0, 0, 230, 0, 0, 0]);
+        assert_eq!(
+            MediaInfo::default().progress_payload(),
+            [0xB1, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        let mode = HostDataMode {
+            media: true,
+            ..Default::default()
+        };
+        assert!(shutdown_payloads_for_device(mode, false, true)
+            .contains(&vec![0xB1, 0, 0, 0, 0, 0, 0, 0, 0]));
+        assert!(!shutdown_payloads_for_device(mode, false, false)
+            .iter()
+            .any(|packet| packet.first() == Some(&0xB1)));
+    }
+
+    #[test]
+    fn playback_advances_between_samples_and_resets_on_seek_or_track_change() {
+        let start = Instant::now();
+        let mut clock = MediaProgressClock::default();
+        assert_eq!(
+            clock.update(
+                "track A",
+                Some(Duration::from_secs(12)),
+                Some(1),
+                None,
+                true,
+                Some(90),
+                start
+            ),
+            Some(12)
+        );
+        assert_eq!(
+            clock.update(
+                "track A",
+                Some(Duration::from_secs(12)),
+                Some(1),
+                None,
+                true,
+                Some(90),
+                start + Duration::from_secs(2)
+            ),
+            Some(14)
+        );
+        assert_eq!(
+            clock.update(
+                "track A",
+                Some(Duration::from_secs(40)),
+                Some(2),
+                None,
+                true,
+                Some(90),
+                start + Duration::from_secs(3)
+            ),
+            Some(40)
+        );
+        assert_eq!(
+            clock.update(
+                "track A",
+                Some(Duration::from_secs(40)),
+                Some(2),
+                None,
+                false,
+                Some(90),
+                start + Duration::from_secs(5)
+            ),
+            Some(40)
+        );
+        assert_eq!(
+            clock.update(
+                "track B",
+                Some(Duration::ZERO),
+                Some(3),
+                None,
+                true,
+                Some(60),
+                start + Duration::from_secs(6)
+            ),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn missing_timeline_start_still_yields_duration_and_position() {
+        let ticks = |seconds: i64| seconds * 10_000_000;
+        assert_eq!(
+            windows_timeline_seconds(None, Some(ticks(230)), None, Some(ticks(75))),
+            (Some(75), Some(230))
+        );
+        assert_eq!(
+            windows_timeline_seconds(None, Some(0), Some(ticks(230)), Some(ticks(75))),
+            (Some(75), Some(230))
+        );
+    }
 }

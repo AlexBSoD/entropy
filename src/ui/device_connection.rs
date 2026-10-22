@@ -287,7 +287,7 @@ impl EntropyApp {
             })
             .collect();
         let has_error = !self.status_msg.trim().is_empty();
-        let status_height = if has_error { 38.0 } else { 0.0 };
+        let status_height = if has_error { 76.0 } else { 0.0 };
         let panel_width = rect.width().min(520.0);
         let adaptive_list_width =
             adaptive_top_dropdown_width(ui, devices.iter().map(|(_, label)| label.as_str()), 220.0);
@@ -324,7 +324,7 @@ impl EntropyApp {
                 if has_error {
                     ui.add_space(8.0);
                     ui.add_sized(
-                        egui::vec2(panel_width.min(460.0), 30.0),
+                        egui::vec2(panel_width.min(460.0), 68.0),
                         egui::Label::new(
                             RichText::new(crate::i18n::tr_text(lang, &self.status_msg))
                                 .size(12.0)

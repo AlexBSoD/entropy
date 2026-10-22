@@ -16,7 +16,7 @@ pub(super) enum QmkSettingWritePolicy {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn qmk_setting_write_policy(qsid: u16) -> QmkSettingWritePolicy {
-    if matches!(qsid, 120..=124 | 142 | 143) {
+    if matches!(qsid, 120..=124 | 142 | 143 | 230..=249) {
         QmkSettingWritePolicy::VerifiedReadback
     } else {
         QmkSettingWritePolicy::SetOnly
@@ -164,6 +164,42 @@ impl SettingsWriteTarget {
                 layer_led_settings.set_value(qsid, readback);
             }
             Self::Display { .. } => {
+                if (246..=247).contains(&qsid) && display_settings.sm62_stars_supported {
+                    let side = (qsid - 246) as usize;
+                    display_settings.sm62_stars_values[side] = readback.min(1) as u8;
+                    display_settings.confirmed_sm62_stars_values[side] = readback.min(1) as u8;
+                    return;
+                }
+                if (248..=249).contains(&qsid) && display_settings.sm62_screens_off_supported {
+                    let side = (qsid - 248) as usize;
+                    display_settings.sm62_screens_off_values[side] = readback.min(1) as u8;
+                    display_settings.confirmed_sm62_screens_off_values[side] = readback.min(1) as u8;
+                    return;
+                }
+                if (244..=245).contains(&qsid) && display_settings.sm62_language_supported {
+                    let side = (qsid - 244) as usize;
+                    display_settings.sm62_language_values[side] = readback.min(1) as u8;
+                    display_settings.confirmed_sm62_language_values[side] = readback.min(1) as u8;
+                    return;
+                }
+                if (242..=243).contains(&qsid) && display_settings.sm62_hold_supported {
+                    let side = (qsid - 242) as usize;
+                    display_settings.sm62_hold_ms[side] = readback.min(10_000);
+                    display_settings.confirmed_sm62_hold_ms[side] = readback.min(10_000);
+                    return;
+                }
+                if (240..=241).contains(&qsid) && display_settings.sm62_date_supported {
+                    let side = (qsid - 240) as usize;
+                    display_settings.sm62_date_values[side] = readback.min(1) as u8;
+                    display_settings.confirmed_sm62_date_values[side] = readback.min(1) as u8;
+                    return;
+                }
+                if (230..=239).contains(&qsid) && display_settings.sm62_supported {
+                    let index = (qsid - 230) as usize;
+                    display_settings.sm62_values[index] = readback.min(255) as u8;
+                    display_settings.confirmed_sm62_values[index] = readback.min(255) as u8;
+                    return;
+                }
                 let value = readback.min(u8::MAX as u16) as u8;
                 if let Some(index) = DATE_QSIDS.iter().position(|q| *q == qsid) {
                     display_settings.date[index] = value;
@@ -282,6 +318,16 @@ pub(super) struct SettingsWriteQueueState {
 
 impl SettingsWriteQueueState {
     fn enqueue(&mut self, mut request: SettingsWriteRequest) -> u64 {
+        // Immediate-mode paint may submit the same optimistic display value
+        // again while the worker owns HID. Keep its identity: superseding it on
+        // every frame prevents readback from ever becoming confirmed.
+        if request.target.is_display() {
+            if let Some(entry) = self.statuses.get(&request.qsid) {
+                if matches!(entry.status, SettingsWriteStatus::Pending) && entry.requested == request.requested {
+                    return entry.request_id;
+                }
+            }
+        }
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
         request.id = self.next_request_id;
         self.statuses.insert(
@@ -385,6 +431,57 @@ fn run_settings_write(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn retry_sm62_setting_io<T>(
+    hid: &crate::hid::HidDevice,
+    qsid: u16,
+    mut operation: impl FnMut() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let attempts = if (230..=249).contains(&qsid) { 3 } else { 1 };
+    for attempt in 0..attempts {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if attempt + 1 < attempts
+                    && hid.is_transport_available()
+                    && !crate::hid::is_transport_disconnect_error(&error) =>
+            {
+                log::warn!(
+                    "SM62 setting qsid {qsid} transient HID failure (attempt {}): {error:#}",
+                    attempt + 1
+                );
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("at least one setting I/O attempt is required")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn setting_error_is_disconnect(qsid: u16, error: &anyhow::Error) -> bool {
+    // An SM62 screen transition can temporarily delay its Vial reply while
+    // LVGL paints the first full frame. A timeout is a failed setting I/O,
+    // not proof that Windows lost the USB device. Only retire the selected
+    // HID session when the transport reports an actual disconnect.
+    if (230..=249).contains(&qsid) {
+        crate::hid::is_transport_disconnect_error(error)
+    } else {
+        crate::hid::is_disconnect_error(error)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn setting_readback_delay(qsid: u16, attempt: usize) -> std::time::Duration {
+    if matches!(qsid, 230 | 235) && attempt == 0 {
+        // Switching to the ship/player view may allocate and flush a full
+        // display frame. Verify after that transition, not in its first 20 ms.
+        std::time::Duration::from_millis(350)
+    } else {
+        SETTINGS_WRITEBACK_DELAYS[attempt.min(SETTINGS_WRITEBACK_DELAYS.len() - 1)]
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub(super) fn write_qmk_setting_value(
     hid: &crate::hid::HidDevice,
     qsid: u16,
@@ -394,13 +491,21 @@ pub(super) fn write_qmk_setting_value(
 ) -> (Result<u16, ModuleSettingWritebackError>, bool) {
     let disconnected = std::cell::Cell::new(false);
     let write = || {
-        let result = if width > 1 {
-            hid.set_qmk_setting_u16(qsid, requested)
-        } else {
-            hid.set_qmk_setting_u8(qsid, requested as u8)
-        };
+        if (230..=249).contains(&qsid) {
+            log::debug!("SM62 setting SET start qsid={qsid} requested={requested}");
+        }
+        let result = retry_sm62_setting_io(hid, qsid, || {
+            if width > 1 {
+                hid.set_qmk_setting_u16(qsid, requested)
+            } else {
+                hid.set_qmk_setting_u8(qsid, requested as u8)
+            }
+        });
+        if (230..=249).contains(&qsid) {
+            log::debug!("SM62 setting SET finished qsid={qsid} ok={}", result.is_ok());
+        }
         result.map_err(|error| {
-            disconnected.set(crate::hid::is_disconnect_error(&error));
+            disconnected.set(!hid.is_transport_available() || setting_error_is_disconnect(qsid, &error));
             error.to_string()
         })
     };
@@ -408,17 +513,24 @@ pub(super) fn write_qmk_setting_value(
         let mut readback_attempt = 0;
         let mut state = ModuleSettingsState::default();
         state.write_verified_value(qsid, requested, write, || {
-            let delay = SETTINGS_WRITEBACK_DELAYS
-                [readback_attempt.min(SETTINGS_WRITEBACK_DELAYS.len() - 1)];
+            let delay = setting_readback_delay(qsid, readback_attempt);
             readback_attempt += 1;
             std::thread::sleep(delay);
-            let result = if width > 1 {
-                hid.get_qmk_setting_u16(qsid)
-            } else {
-                hid.get_qmk_setting_u8(qsid).map(|readback| readback as u16)
-            };
+            if (230..=249).contains(&qsid) {
+                log::debug!("SM62 setting GET start qsid={qsid} attempt={readback_attempt}");
+            }
+            let result = retry_sm62_setting_io(hid, qsid, || {
+                if width > 1 {
+                    hid.get_qmk_setting_u16(qsid)
+                } else {
+                    hid.get_qmk_setting_u8(qsid).map(|readback| readback as u16)
+                }
+            });
+            if (230..=249).contains(&qsid) {
+                log::debug!("SM62 setting GET finished qsid={qsid} ok={}", result.is_ok());
+            }
             result.map_err(|error| {
-                disconnected.set(crate::hid::is_disconnect_error(&error));
+                disconnected.set(!hid.is_transport_available() || setting_error_is_disconnect(qsid, &error));
                 error.to_string()
             })
         })
@@ -464,7 +576,20 @@ impl EntropyApp {
         self.settings_write_queue.pending_value(qsid)
     }
 
-    #[cfg(test)]
+    // Only call for an explicit UI edit. Failed SET/readback leaves device
+    // state uncertain: the last confirmed value is not a safe equality gate.
+    // Keep Pending coalescing, and never turn this into a repaint retry.
+    pub(super) fn explicit_display_setting_needs_write(
+        &self, qsid: u16, confirmed: u16, requested: u16,
+    ) -> bool {
+        if let Some(pending) = self.pending_settings_write_value(qsid) {
+            requested != pending
+        } else {
+            matches!(self.settings_write_status(qsid), Some(SettingsWriteStatus::Failed(_)))
+                || requested != confirmed
+        }
+    }
+
     pub(super) fn settings_write_status(&self, qsid: u16) -> Option<&SettingsWriteStatus> {
         self.settings_write_queue.status(qsid)
     }
@@ -644,7 +769,7 @@ impl EntropyApp {
             id: 0,
             generation: self.settings_write_generation,
             qsid,
-            width: 1,
+            width: if (242..=243).contains(&qsid) { 2 } else { 1 },
             old_value,
             requested,
             target: SettingsWriteTarget::Display { display_label },
@@ -719,7 +844,13 @@ impl EntropyApp {
             #[cfg(target_os = "macos")]
             let _hid_lock = hid_device.macos_hid_operation_lock();
 
-            let (result, disconnected) = run_settings_write(&hid_device, &request);
+            let (result, disconnected) = if (230..=249).contains(&request.qsid) {
+                hid_device.with_host_output_paused_for_settings(|| {
+                    run_settings_write(&hid_device, &request)
+                })
+            } else {
+                run_settings_write(&hid_device, &request)
+            };
             let hid_device = (!disconnected).then_some(hid_device);
             let _ = sender.send(SettingsWriteResult {
                 hid_device,
@@ -804,6 +935,24 @@ impl EntropyApp {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    fn record_superseded_sm62_readback(&mut self, request: &SettingsWriteRequest, readback: u16) {
+        if !request.target.is_display() || !(230..=249).contains(&request.qsid) { return; }
+        // Readback is still confirmed even if superseded by another edit.
+        // Use the one protocol decoder, but retain all newer desired values.
+        let mut observed = self.display_settings.clone();
+        request.target.reconcile_readback(
+            &mut self.module_settings, &mut self.touchpad_settings,
+            &mut self.tap_hold_settings, &mut self.one_shot_settings,
+            &mut self.layer_led_settings, &mut observed, request.qsid, readback);
+        self.display_settings.confirmed_sm62_values = observed.confirmed_sm62_values;
+        self.display_settings.confirmed_sm62_date_values = observed.confirmed_sm62_date_values;
+        self.display_settings.confirmed_sm62_hold_ms = observed.confirmed_sm62_hold_ms;
+        self.display_settings.confirmed_sm62_language_values = observed.confirmed_sm62_language_values;
+        self.display_settings.confirmed_sm62_stars_values = observed.confirmed_sm62_stars_values;
+        self.display_settings.confirmed_sm62_screens_off_values = observed.confirmed_sm62_screens_off_values;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn finish_settings_write(&mut self, result: SettingsWriteResult) {
         let SettingsWriteResult {
             hid_device,
@@ -832,6 +981,9 @@ impl EntropyApp {
                     request.qsid,
                     SettingsWriteStatus::Saved,
                 );
+                if !current {
+                    self.record_superseded_sm62_readback(&request, readback);
+                }
                 if current && newer_debounced_value.is_none() {
                     request.target.reconcile_readback(
                         &mut self.module_settings,
@@ -872,6 +1024,11 @@ impl EntropyApp {
                     request.qsid,
                     SettingsWriteStatus::Failed(error_text.clone()),
                 );
+                if !current {
+                    if let ModuleSettingWritebackError::ReadbackMismatch { actual, .. } = &error {
+                        self.record_superseded_sm62_readback(&request, *actual);
+                    }
+                }
                 if current && newer_debounced_value.is_none() {
                     if let ModuleSettingWritebackError::ReadbackMismatch { actual, .. } = &error {
                         request.target.reconcile_readback(
@@ -911,6 +1068,9 @@ impl EntropyApp {
                 "settings_write.device_disconnected",
             );
             self.settings_write_queue.fail_pending(error);
+            self.shared_hid_output = None;
+            self.retire_selected_qmk_hid_host_bridges();
+            self.start_device_scan();
         }
     }
 
@@ -936,6 +1096,50 @@ impl EntropyApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sm62_timeout_does_not_retire_selected_hid_session() {
+        let timeout = anyhow::anyhow!("device did not respond");
+        assert!(!setting_error_is_disconnect(230, &timeout));
+        assert!(setting_error_is_disconnect(120, &timeout));
+        let disconnect = anyhow::anyhow!("HID device disconnected");
+        assert!(setting_error_is_disconnect(230, &disconnect));
+        assert_eq!(
+            setting_readback_delay(230, 0),
+            std::time::Duration::from_millis(350)
+        );
+        assert_eq!(
+            setting_readback_delay(235, 1),
+            std::time::Duration::from_millis(80)
+        );
+    }
+
+    #[test]
+    fn sm62_setting_io_retries_a_transient_timeout() {
+        let (hid, _) = crate::hid::HidDevice::test_device();
+        let mut attempts = 0;
+        let result = retry_sm62_setting_io(&hid, 230, || {
+            attempts += 1;
+            if attempts == 1 {
+                anyhow::bail!("device did not respond");
+            }
+            Ok(2u8)
+        });
+        assert_eq!(result.unwrap(), 2);
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn sm62_setting_io_does_not_retry_a_physical_disconnect() {
+        let (hid, _) = crate::hid::HidDevice::test_device();
+        let mut attempts = 0;
+        let result = retry_sm62_setting_io(&hid, 235, || -> anyhow::Result<()> {
+            attempts += 1;
+            anyhow::bail!("HID device disconnected");
+        });
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
+    }
 
     fn request(qsid: u16, requested: u16) -> SettingsWriteRequest {
         SettingsWriteRequest {
@@ -972,6 +1176,22 @@ mod tests {
     }
 
     #[test]
+    fn v7_superseded_display_readback_confirms_without_overwriting_pending() {
+        for result in [Ok(0),Err(ModuleSettingWritebackError::ReadbackMismatch {expected:1,actual:0})] {
+        let mut app=test_app(); app.display_settings.sm62_stars_supported=true;
+        app.display_settings.sm62_stars_values=[1,0];
+        app.display_settings.confirmed_sm62_stars_values=[1,0];
+        app.settings_write_queue.enqueue(display_request(246,1,0));
+        let old=app.settings_write_queue.pop_front().unwrap();
+        app.settings_write_queue.enqueue(display_request(246,1,1));
+        app.finish_settings_write(SettingsWriteResult {hid_device:None,request:old,result,disconnected:false});
+        assert_eq!(app.display_settings.sm62_stars_values,[1,0]);
+        assert_eq!(app.display_settings.confirmed_sm62_stars_values,[0,0]);
+        assert_eq!(app.pending_settings_write_value(246),Some(1));
+        }
+    }
+
+    #[test]
     fn settings_write_queue_is_fifo() {
         let mut queue = SettingsWriteQueueState::default();
         let first_id = queue.enqueue(request(1, 10));
@@ -995,6 +1215,26 @@ mod tests {
         assert!(queue.complete(second_id, 122, SettingsWriteStatus::Saved));
         assert_eq!(queue.status(122), Some(&SettingsWriteStatus::Saved));
         assert_eq!(queue.pending_value(122), None);
+    }
+
+    #[test]
+    fn sm62_idle_dropdown_queue_retains_latest_enable_and_independent_timeout() {
+        let mut queue = SettingsWriteQueueState::default();
+        queue.enqueue(display_request(232, 47, 10));
+        let enabling = queue.enqueue(display_request(231, 0, 1));
+        let in_flight_timeout = queue.pop_front().unwrap();
+        assert_eq!((in_flight_timeout.qsid, in_flight_timeout.requested), (232, 10));
+        let disabling = queue.enqueue(display_request(231, 0, 0));
+        queue.enqueue(display_request(237, 83, 120));
+        assert!(!queue.complete(enabling, 231, SettingsWriteStatus::Saved));
+        assert_eq!(queue.pending_value(231), Some(0));
+        let left = queue.pop_front().unwrap();
+        assert_eq!((left.id, left.qsid, left.requested), (disabling, 231, 0));
+        assert!(queue.complete(disabling, 231, SettingsWriteStatus::Saved));
+        assert!(queue.complete(in_flight_timeout.id, 232, SettingsWriteStatus::Saved));
+        let right = queue.pop_front().unwrap();
+        assert_eq!((right.qsid, right.old_value, right.requested), (237, 83, 120));
+        assert!(queue.pop_front().is_none());
     }
 
     #[test]
@@ -1267,6 +1507,93 @@ mod tests {
                 .map(|setting| setting.value),
             Some(128)
         );
+    }
+
+    #[test]
+    fn sm62_display_readback_updates_only_selected_side() {
+        let mut module_settings = ModuleSettingsState::default();
+        let mut touchpad_settings = TouchpadSettingsState::default();
+        let mut tap_hold_settings = TapHoldSettingsState::default();
+        let mut one_shot_settings = OneShotSettingsState::default();
+        let mut layer_led_settings = LayerLedSettingsState::default();
+        let mut display_settings = DisplaySettingsState {
+            sm62_supported: true,
+            // An existing saved preference must survive writes to the other half.
+            sm62_hold_ms: [112, 200],
+            confirmed_sm62_hold_ms: [112, 200],
+            ..DisplaySettingsState::default()
+        };
+        let left_before = display_settings.sm62_values[..5].to_vec();
+        SettingsWriteTarget::Display {
+            display_label: "Right ship timeout".to_owned(),
+        }
+        .reconcile_readback(
+            &mut module_settings,
+            &mut touchpad_settings,
+            &mut tap_hold_settings,
+            &mut one_shot_settings,
+            &mut layer_led_settings,
+            &mut display_settings,
+            237,
+            45,
+        );
+        assert_eq!(display_settings.sm62_values[7], 45);
+        assert_eq!(display_settings.confirmed_sm62_values[7], 45);
+        assert_eq!(display_settings.sm62_values[..5], left_before);
+        display_settings.sm62_date_supported = true;
+        SettingsWriteTarget::Display {
+            display_label: "Right date".to_owned(),
+        }
+        .reconcile_readback(
+            &mut module_settings,
+            &mut touchpad_settings,
+            &mut tap_hold_settings,
+            &mut one_shot_settings,
+            &mut layer_led_settings,
+            &mut display_settings,
+            241,
+            0,
+        );
+        assert_eq!(display_settings.sm62_date_values, [1, 0]);
+        assert_eq!(display_settings.confirmed_sm62_date_values, [1, 0]);
+        assert_eq!(qmk_setting_write_policy(241), QmkSettingWritePolicy::VerifiedReadback);
+        display_settings.sm62_hold_supported = true;
+        SettingsWriteTarget::Display {
+            display_label: "Right layout hold".to_owned(),
+        }
+        .reconcile_readback(
+            &mut module_settings,
+            &mut touchpad_settings,
+            &mut tap_hold_settings,
+            &mut one_shot_settings,
+            &mut layer_led_settings,
+            &mut display_settings,
+            243,
+            2_500,
+        );
+        assert_eq!(display_settings.sm62_hold_ms, [112, 2_500]);
+        assert_eq!(display_settings.confirmed_sm62_hold_ms, [112, 2_500]);
+        assert_eq!(qmk_setting_write_policy(243), QmkSettingWritePolicy::VerifiedReadback);
+        display_settings.sm62_language_supported = true;
+        SettingsWriteTarget::Display { display_label: "Right language".to_owned() }
+            .reconcile_readback(&mut module_settings, &mut touchpad_settings, &mut tap_hold_settings,
+                &mut one_shot_settings, &mut layer_led_settings, &mut display_settings, 245, 0);
+        assert_eq!(display_settings.sm62_language_values, [1, 0]);
+        assert_eq!(display_settings.confirmed_sm62_language_values, [1, 0]);
+        assert_eq!(qmk_setting_write_policy(245), QmkSettingWritePolicy::VerifiedReadback);
+        display_settings.sm62_stars_supported=true;
+        display_settings.sm62_screens_off_supported=true;
+        SettingsWriteTarget::Display {display_label:"Right stars".to_owned()}
+            .reconcile_readback(&mut module_settings,&mut touchpad_settings,&mut tap_hold_settings,
+                &mut one_shot_settings,&mut layer_led_settings,&mut display_settings,247,0);
+        assert_eq!(display_settings.sm62_stars_values,[1,0]);assert_eq!(display_settings.confirmed_sm62_stars_values,[1,0]);
+        SettingsWriteTarget::Display {display_label:"Left screen off".to_owned()}
+            .reconcile_readback(&mut module_settings,&mut touchpad_settings,&mut tap_hold_settings,
+                &mut one_shot_settings,&mut layer_led_settings,&mut display_settings,248,1);
+        assert_eq!(display_settings.sm62_screens_off_values,[1,0]);assert_eq!(display_settings.confirmed_sm62_screens_off_values,[1,0]);
+        assert_eq!(qmk_setting_write_policy(249),QmkSettingWritePolicy::VerifiedReadback);
+
+
     }
 
     #[cfg(not(target_arch = "wasm32"))]

@@ -160,6 +160,7 @@ impl EntropyApp {
             layer_clipboard: None,
             scan_frame: 0,
             last_device_scan_at: 0.0,
+            last_full_device_scan_at: 0.0,
             #[cfg(not(target_arch = "wasm32"))]
             next_battery_refresh_at: None,
             hover_layer: None,
@@ -334,6 +335,8 @@ impl EntropyApp {
             connect_state: ConnectState::Idle,
             #[cfg(not(target_arch = "wasm32"))]
             retiring_connects: Vec::new(),
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            test_device_scan_requests: None,
             #[cfg(all(test, not(target_arch = "wasm32")))]
             test_connect_requests: None,
             #[cfg(all(test, not(target_arch = "wasm32")))]

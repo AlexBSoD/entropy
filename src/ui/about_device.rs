@@ -273,7 +273,11 @@ fn device_about_rows(
             "Product",
             "USB product string",
             "USB product string",
-            text_or_unknown(&info.product),
+            text_or_unknown(crate::device::product_display_name(
+                info.vendor_id,
+                info.product_id,
+                &info.product,
+            )),
         ),
         localized_row(
             lang,
@@ -690,7 +694,10 @@ impl EntropyApp {
             return;
         };
 
-        let title = about_title(lang, &info.product);
+        let title = about_title(
+            lang,
+            crate::device::product_display_name(info.vendor_id, info.product_id, &info.product),
+        );
         let rows = device_about_rows(lang, &info, &self.firmware_update_check);
         let firmware_update_supported = info.firmware_update_target.is_some();
 
@@ -924,6 +931,68 @@ mod tests {
             asset,
             relation: VersionRelation::UpdateAvailable,
         })
+    }
+
+    #[test]
+    fn macropad_v3_uses_short_name_in_about_rows_and_rendered_title() {
+        for product in ["M4CR0Pad v3", "Macropad v3", "Ль"] {
+            let info = DeviceAboutInfo {
+                vendor_id: 0xE126,
+                product_id: 0x0042,
+                product: product.to_owned(),
+                ..Default::default()
+            };
+            for lang in [
+                crate::i18n::Language::English,
+                crate::i18n::Language::Russian,
+            ] {
+                let rows = device_about_rows(lang, &info, &FirmwareUpdateCheckState::Unsupported);
+                assert_eq!(rows[1].value, "Macropad", "reported {product}");
+                let ctx = egui::Context::default();
+                let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+                let mut app = EntropyApp::new(&cc);
+                app.app_settings.language = lang;
+                app.device_about_info = Some(info.clone());
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1200.0, 900.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            app.draw_about_device_page(ui, ui.max_rect());
+                        });
+                    },
+                );
+                let texts = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::epaint::Shape::Text(text) => Some(text.galley.text()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let expected_title = about_title(lang, "Macropad");
+                assert!(texts.contains(&expected_title.as_str()), "{texts:?}");
+                assert!(
+                    !texts
+                        .iter()
+                        .any(|text| text.contains(product) && product != "Macropad"),
+                    "{texts:?}"
+                );
+                // Rendering must not rename storage/identity metadata.
+                assert_eq!(app.device_about_info.as_ref().unwrap().product, product);
+                assert!(app
+                    .device_about_info
+                    .as_ref()
+                    .unwrap()
+                    .firmware_update_target
+                    .is_none());
+            }
+        }
     }
 
     #[test]

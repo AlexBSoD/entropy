@@ -145,7 +145,7 @@ pub(crate) fn entlayout_section_of_read(command: &[u8]) -> Option<&'static str> 
             _ => None,
         },
         [CMD_VIA_VIAL_PREFIX, CMD_VIAL_QMK_SETTINGS_GET, low, high, ..]
-            if (200..232).contains(&u16::from_le_bytes([*low, *high])) =>
+            if (200..216).contains(&u16::from_le_bytes([*low, *high])) =>
         {
             Some("LayerNames")
         }

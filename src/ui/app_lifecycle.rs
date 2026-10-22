@@ -119,6 +119,26 @@ fn connection_replaces_layout_canvas(connect_state: &ConnectState, layout_loaded
 }
 
 impl EntropyApp {
+    /// Shared ownership gate for shortcuts on pages behind app modals.
+    pub(super) fn modal_or_popup_open(&self, ctx: &egui::Context) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        let import_pending = self.import_pending();
+        #[cfg(target_arch = "wasm32")]
+        let import_pending = false;
+        self.application_categories_open
+            || self.application_picker_open
+            || self.text_expander_rule_editor.is_some()
+            || self.keycode_picker.open
+            || self.unlock_open
+            || self.vial_unlock_polling
+            || self.close_to_tray_prompt_open
+            || self.import_report_open
+            || self.typing_trainer_history_open
+            || import_pending
+            || self.top_dropdown_open(ctx)
+            || egui::Popup::is_any_open(ctx)
+    }
+
     fn maybe_open_macro_unlock_preflight(&mut self) {
         if !self.keycode_picker.open || self.keycode_picker.selected_tab != KeycodeTab::Macro {
             self.macro_auto_unlock_cancelled = false;
@@ -163,6 +183,18 @@ impl EntropyApp {
         main_window_hidden_to_tray: bool,
         selected_device_is_bluetooth: bool,
     ) {
+        self.update_native_background_for_platform(ctx, now, main_window_hidden_to_tray,
+            selected_device_is_bluetooth, std::env::consts::OS);
+    }
+
+    // OS policy is explicit so foreign admission can be exercised through the
+    // complete production tick without pretending Linux is a native Mac.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn update_native_background_for_platform(
+        &mut self, ctx: &egui::Context, now: f64,
+        main_window_hidden_to_tray: bool, selected_device_is_bluetooth: bool,
+        discovery_platform: &str,
+    ) {
         self.poll_vial_hid_task(ctx);
         self.poll_sticky_layout_background(ctx);
         self.poll_settings_write(ctx);
@@ -177,22 +209,38 @@ impl EntropyApp {
             self.poll_device_scan(ctx);
             self.maybe_start_bluetooth_reconnect_scan(ctx);
 
-            let hid_session_active = self.hid_device.is_some();
+            // A worker temporarily borrows the handle; it is still the same
+            // active transport and must not authorize full Bluetooth enumeration.
+            let hid_session_active = self.hid_device.is_some()
+                || self.hid_write_task_owner_active()
+                || matches!(self.connect_state, ConnectState::Loading { .. });
+            let bluetooth_busy = (selected_device_is_bluetooth && hid_session_active)
+                || self.bluetooth_discovery_owner_active();
+            // USB-only metadata enumeration is implemented without Bluetooth
+            // device opens on these platforms. Keep the old fail-safe elsewhere.
             let has_discovered_devices = !self.device_manager.devices().is_empty();
-            // Keep the common discovery loop alive even when the selected
-            // keyboard is Bluetooth; otherwise newly attached USB keyboards
-            // never enter the device menu.
-            if (self.last_device_scan_at == 0.0
-                || now - self.last_device_scan_at
-                    >= periodic_device_scan_interval_secs(
-                        hid_session_active,
-                        has_discovered_devices,
-                    ))
-                && periodic_device_scan_allowed(selected_device_is_bluetooth, hid_session_active)
-            {
-                self.scan_frame = self.scan_frame.wrapping_add(1);
-                self.last_device_scan_at = now;
-                self.start_device_scan();
+            let full_interval = periodic_device_scan_interval_secs(hid_session_active, has_discovered_devices);
+            // USB hotplug on every supported OS must not wait for global HID
+            // refresh even with no Bluetooth keyboards. Keep full discovery for
+            // cold startup/new Bluetooth devices, only when every owner allows it.
+            let usb_metadata_supported = matches!(discovery_platform, "linux" | "windows" | "macos");
+            let full_due = self.last_full_device_scan_at == 0.0
+                || now - self.last_full_device_scan_at >= full_interval;
+            let usb_only = usb_metadata_supported && (bluetooth_busy || !full_due);
+            let interval = if usb_only || usb_metadata_supported { 2.0 } else { full_interval };
+            if usb_only || periodic_device_scan_allowed(bluetooth_busy, hid_session_active || bluetooth_busy) {
+                if (self.last_device_scan_at == 0.0 || now - self.last_device_scan_at >= interval)
+                    && (!usb_metadata_supported || matches!(self.device_scan_state, DeviceScanState::Idle)) {
+                    self.scan_frame = self.scan_frame.wrapping_add(1);
+                    self.last_device_scan_at = now;
+                    if !usb_only { self.last_full_device_scan_at = now; }
+                    if usb_only { self.start_usb_device_scan(); }
+                    else { self.start_device_scan(); }
+                }
+                if usb_only || usb_metadata_supported {
+                    ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+                        (interval - (now - self.last_device_scan_at)).clamp(0.025, interval)));
+                }
             }
         }
 
@@ -1420,22 +1468,7 @@ impl eframe::App for EntropyApp {
         self.tour_target_rects.clear();
 
         let keyboard_input_wanted_at_frame_start = ctx.egui_wants_keyboard_input();
-        #[cfg(not(target_arch = "wasm32"))]
-        let import_pending_at_frame_start = self.import_pending();
-        #[cfg(target_arch = "wasm32")]
-        let import_pending_at_frame_start = false;
-        let modal_or_popup_open_at_frame_start = self.application_categories_open
-            || self.application_picker_open
-            || self.text_expander_rule_editor.is_some()
-            || self.keycode_picker.open
-            || self.unlock_open
-            || self.vial_unlock_polling
-            || self.close_to_tray_prompt_open
-            || self.import_report_open
-            || self.typing_trainer_history_open
-            || import_pending_at_frame_start
-            || self.top_dropdown_open(ctx)
-            || egui::Popup::is_any_open(ctx);
+        let modal_or_popup_open_at_frame_start = self.modal_or_popup_open(ctx);
 
         // Auto-scan for device connect/disconnect changes.
         self.secondary_click_handled = false;
@@ -2144,3 +2177,6 @@ impl eframe::App for EntropyApp {
         self.pause_typing_trainer_if_inactive(std::time::Instant::now());
     }
 }
+
+#[cfg(all(test, any(target_os="linux",target_os="windows",target_os="macos")))]
+include!("usb_hotplug_tests.rs");

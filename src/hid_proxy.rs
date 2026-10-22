@@ -18,6 +18,8 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(12);
 // synchronously program flash for up to 2.5 s; queued host-data writes share the
 // same ordered owner and must not retire it while that commit is still active.
 const USB_COMMAND_TIMEOUT: Duration = Duration::from_secs(4);
+// The helper deadline must outlive the 6 s SM62 display-setting read window.
+const SM62_DISPLAY_COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
 const BLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
 const REAPER_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_FRAME: usize = 4_096;
@@ -264,23 +266,32 @@ impl HidProxy {
         self.transport.is_bluetooth()
     }
 
-    fn command_timeout(&self) -> Duration {
+    fn command_timeout(&self, data: &[u8]) -> Duration {
         #[cfg(test)]
         if let Some(timeout) = self.timeout {
             return timeout;
         }
         if self.transport.is_bluetooth() {
             BLE_COMMAND_TIMEOUT
+        } else if data.len() >= 4
+            && data[0] == super::CMD_VIA_VIAL_PREFIX
+            && matches!(
+                data[1],
+                super::CMD_VIAL_QMK_SETTINGS_SET | super::CMD_VIAL_QMK_SETTINGS_GET
+            )
+            && (230..=249).contains(&u16::from_le_bytes([data[2], data[3]]))
+        {
+            SM62_DISPLAY_COMMAND_TIMEOUT
         } else {
             USB_COMMAND_TIMEOUT
         }
     }
 
-    fn request(&self, request: String) -> Result<String> {
+    fn request(&self, request: String, timeout: Duration) -> Result<String> {
         if !self.is_available() {
             bail!("HID helper disconnected (transport retired)");
         }
-        let deadline = Instant::now() + self.command_timeout();
+        let deadline = Instant::now() + timeout;
         let (reply, rx) = mpsc::sync_channel(1);
         // Bounded queue, no waiting for the IPC writer or another caller. Both
         // shared output and queries traverse this SAME owner and response stream.
@@ -307,7 +318,7 @@ impl HidProxy {
 
     pub(super) fn usb_send(&self, data: &[u8]) -> Result<[u8; MSG_LEN]> {
         ensure_output_report_len(data)?;
-        let line = self.request(bytes_to_hex(data))?;
+        let line = self.request(bytes_to_hex(data), self.command_timeout(data))?;
         let response: ProxyResponse = serde_json::from_str(&line)?;
         if !response.ok {
             bail!(response
@@ -323,7 +334,10 @@ impl HidProxy {
 
     pub(super) fn write_output_report(&self, data: &[u8]) -> Result<()> {
         ensure_output_report_len(data)?;
-        let line = self.request(format!("{OUTPUT_PREFIX}{}", bytes_to_hex(data)))?;
+        let line = self.request(
+            format!("{OUTPUT_PREFIX}{}", bytes_to_hex(data)),
+            self.command_timeout(&[]),
+        )?;
         let response: ProxyResponse = serde_json::from_str(&line)?;
         if !response.ok {
             bail!(response
@@ -1014,7 +1028,9 @@ mod tests {
         let start = Instant::now();
         // Larger than any OS anonymous-pipe capacity. The real child deliberately
         // never reads stdin, so the sole owner blocks inside write_all.
-        assert!(proxy.request("x".repeat(8 * 1024 * 1024)).is_err());
+        assert!(proxy
+            .request("x".repeat(8 * 1024 * 1024), proxy.command_timeout(&[]))
+            .is_err());
         assert!(start.elapsed() < Duration::from_secs(2));
         drop(proxy);
         empty_registry();
