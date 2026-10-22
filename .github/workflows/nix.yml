@@ -13,15 +13,41 @@ on:
     branches: [main]
 
 concurrency:
-  group: nix-${{ github.ref }}
+  group: nix-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
+  plan:
+    name: Select Nix coverage
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      run: ${{ steps.policy.outputs.run }}
+      reason: ${{ steps.policy.outputs.reason }}
+      source_run: ${{ steps.policy.outputs.source_run }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Test CI selection and workflow contracts
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
+      - name: Select new validation or verified reuse
+        id: policy
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/ci_policy.py plan --profile nix
+
   flake:
     name: Flake (${{ matrix.system }})
+    needs: plan
+    if: needs.plan.outputs.run == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -63,3 +89,41 @@ jobs:
 
       - name: Flake check
         run: nix flake check --print-build-logs
+
+  complete:
+    name: Nix validation result
+    needs: [plan, flake]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the selected coverage to complete
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          FULL_VALIDATION: ${{ needs.plan.outputs.run }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          needs = json.loads(os.environ['NEEDS_JSON'])
+          if needs['plan']['result'] != 'success':
+              raise SystemExit('Nix coverage selection failed')
+          mode = os.environ['FULL_VALIDATION']
+          if mode not in ('true', 'false'):
+              raise SystemExit('Missing explicit validation decision')
+          expected = 'success' if mode == 'true' else 'skipped'
+          if needs['flake']['result'] != expected:
+              raise SystemExit(f'flake: expected {expected}, got {needs["flake"]["result"]}')
+          PY
+      - uses: actions/checkout@v7
+        if: needs.plan.outputs.run == 'true'
+        with:
+          persist-credentials: false
+      - name: Record actual full Nix validation
+        if: needs.plan.outputs.run == 'true'
+        run: python3 .github/scripts/ci_policy.py record --profile nix --output "$RUNNER_TEMP/ci-proof/nix.json"
+      - name: Publish Nix validation proof
+        if: needs.plan.outputs.run == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-proof-nix-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-proof/nix.json
+          if-no-files-found: error
