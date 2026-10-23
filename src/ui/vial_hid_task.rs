@@ -1,6 +1,127 @@
 use super::*;
 
 #[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+pub(super) struct LayerNameWrite {
+    pub(super) device: crate::device::Device,
+    pub(super) device_key: String,
+    pub(super) layout_id: String,
+    pub(super) generation: u64,
+    pub(super) layer: usize,
+    pub(super) name: String,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn layer_name_write_error(language: crate::i18n::Language, error: &str) -> String {
+    use super::application_layout_runtime::app_layout_text;
+    let reason = match error {
+        "device changed" => app_layout_text(language, "устройство изменилось", "device changed"),
+        "device is busy" => app_layout_text(language, "устройство занято", "device is busy"),
+        "device is disconnected" => app_layout_text(language, "устройство отключено", "device is disconnected"),
+        "layer data is not ready" => app_layout_text(language, "данные слоя не готовы", "layer data is not ready"),
+        "layer name readback mismatch" => app_layout_text(language, "прочитанное имя слоя не совпадает", "layer name readback mismatch"),
+        _ => error,
+    };
+    format!("{}: {reason}", app_layout_text(language, "Имя слоя не сохранено", "Layer name not saved"))
+}
+
+impl EntropyApp {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn selected_layer_names_uncertain(&self) -> bool {
+        let key = self.application_layout_device_key();
+        self.uncertain_layer_names.iter().any(|r| key.as_ref() == Some(&r.device_key)
+            && self.selected_device.and_then(|i| self.device_manager.devices().get(i))
+                .is_some_and(|d| d.path == r.device.path && d.instance_token == r.device.instance_token
+                    && d.permits_hid_target(&r.device)))
+    }
+
+    // Explicit consumers may recover uncertainty with GET only. Repaints never
+    // call this, and the host Default remains the user's draft, not a read cache.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn confirm_uncertain_layer_names(&mut self) -> anyhow::Result<()> {
+        let key = self.application_layout_device_key();
+        let requests: Vec<_> = self.uncertain_layer_names.iter()
+            .filter(|r| key.as_ref() == Some(&r.device_key)
+                && self.selected_device.and_then(|i| self.device_manager.devices().get(i))
+                    .is_some_and(|d| d.path == r.device.path && d.instance_token == r.device.instance_token
+                        && d.permits_hid_target(&r.device))).cloned().collect();
+        if requests.is_empty() { return Ok(()); }
+        anyhow::ensure!(!self.hid_write_task_active(), layer_name_write_error(self.app_settings.language, "device is busy"));
+        for request in requests {
+            anyhow::ensure!(self.selected_device.and_then(|i| self.device_manager.devices().get(i))
+                .is_some_and(|d| d.path == request.device.path
+                    && d.instance_token == request.device.instance_token
+                    && d.permits_hid_target(&request.device)), layer_name_write_error(self.app_settings.language, "device changed"));
+            let hid = self.hid_device.as_ref().ok_or_else(|| anyhow::anyhow!(layer_name_write_error(self.app_settings.language, "device is disconnected")))?;
+            let actual = hid.get_qmk_setting_string(200 + request.layer as u16)
+                .map_err(|error| anyhow::anyhow!(layer_name_write_error(self.app_settings.language, &error.to_string())))?;
+            if let Some(name) = self.layer_names.get_mut(request.layer) { *name = actual.clone(); }
+            if let Some(name) = self.layout.as_mut().and_then(|l| l.layer_names.get_mut(request.layer)) {
+                *name = actual;
+            }
+            self.uncertain_layer_names.retain(|r| r.device_key != request.device_key
+                || r.layer != request.layer || r.generation != request.generation
+                || r.device.path != request.device.path
+                || r.device.instance_token != request.device.instance_token);
+        }
+        self.keycode_picker.layer_names = self.layer_names.clone();
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn maybe_start_layer_name_write(&mut self, ctx: &egui::Context) {
+        while let Some(request) = self.pending_layer_name_writes.front() {
+            let target_matches = request.generation == self.connection_generation
+                && self.application_layout_device_key().as_ref() == Some(&request.device_key)
+                && self.selected_device.and_then(|i| self.device_manager.devices().get(i))
+                    .is_some_and(|device| device.path == request.device.path
+                        && device.instance_token == request.device.instance_token
+                        && device.permits_hid_target(&request.device));
+            if !target_matches {
+                self.status_msg = layer_name_write_error(self.app_settings.language, "device changed");
+                self.pending_layer_name_writes.pop_front();
+                continue;
+            }
+            if self.hid_device.is_none() && !self.hid_write_task_owner_active() {
+                self.status_msg = layer_name_write_error(self.app_settings.language, "device is disconnected");
+                self.pending_layer_name_writes.pop_front();
+                continue;
+            }
+            // Required cold reads belong to this queue, including during exit.
+            // Ordinary background admission may be blocked by the queued write.
+            match self.deferred_device_load.layer_status(request.layer) {
+                DeferredLoadStatus::NotLoaded => {
+                    if let Some(context) = self.deferred_device_load.context.clone() {
+                        let layer = request.layer;
+                        let operation = VialHidOperation::Deferred(
+                            super::device_deferred_load::DeferredLoadRequest::Layer { layer, context });
+                        if self.start_vial_hid_operation(ctx, operation) == VialHidTaskStart::Started {
+                            self.deferred_device_load.set_layer_status(layer, DeferredLoadStatus::Loading);
+                        }
+                        break;
+                    }
+                    self.status_msg = layer_name_write_error(self.app_settings.language, "layer data is not ready");
+                    self.pending_layer_name_writes.pop_front();
+                    continue;
+                }
+                DeferredLoadStatus::Loading => break,
+                DeferredLoadStatus::Failed(_) => {
+                    self.status_msg = layer_name_write_error(self.app_settings.language, "layer data is not ready");
+                    self.pending_layer_name_writes.pop_front();
+                    continue;
+                }
+                _ => {}
+            }
+            let operation = VialHidOperation::LayerNameWrite(request.clone());
+            if self.start_vial_hid_operation(ctx, operation) == VialHidTaskStart::Started {
+                self.pending_layer_name_writes.pop_front();
+            }
+            break;
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 const BATTERY_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 #[cfg(not(target_arch = "wasm32"))]
 const BATTERY_REFRESH_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -21,6 +142,7 @@ fn battery_refresh_delay(battery: Option<crate::hid::BatteryHalves>) -> std::tim
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone)]
 pub(super) enum VialHidOperation {
+    LayerNameWrite(LayerNameWrite),
     UnlockStart,
     UnlockPoll,
     Lock,
@@ -98,6 +220,7 @@ impl VialHidOperation {
 
 #[cfg(not(target_arch = "wasm32"))]
 enum VialHidOutcome {
+    LayerNameWritten(String),
     UnlockStarted {
         unlocked: bool,
         keys: Vec<(u8, u8)>,
@@ -160,6 +283,15 @@ fn run_vial_hid_operation_with_progress(
     cancel: &std::sync::atomic::AtomicBool,
 ) -> anyhow::Result<VialHidOutcome> {
     match operation {
+        VialHidOperation::LayerNameWrite(request) => {
+            let qsid = 200 + request.layer as u16;
+            hid.set_qmk_setting_string(qsid, &request.name)?;
+            let actual = hid.get_qmk_setting_string(qsid)?;
+            let expected = crate::hid::HidDevice::normalized_qmk_setting_string(&request.name);
+            anyhow::ensure!(actual == expected,
+                "layer name readback mismatch");
+            Ok(VialHidOutcome::LayerNameWritten(actual))
+        }
         VialHidOperation::UnlockStart => {
             let (unlocked, in_progress, keys) = hid.get_unlock_status_with_progress()?;
             if !unlocked && !in_progress {
@@ -429,6 +561,14 @@ impl EntropyApp {
             self.display_settings.pictograms.loading = true;
             self.display_settings.pictograms.load_failure = None;
         }
+        // SET can mutate even when its acknowledgement or subsequent GET fails.
+        // Invalidate before handing ownership to the worker, not on completion.
+        if let VialHidOperation::LayerNameWrite(request) = &operation {
+            self.uncertain_layer_names.retain(|old| old.device_key != request.device_key
+                || old.layer != request.layer || old.device.path != request.device.path
+                || old.device.instance_token != request.device.instance_token);
+            self.uncertain_layer_names.push(request.clone());
+        }
         let generation = self.connection_generation;
         let (sender, receiver) = std::sync::mpsc::channel();
         let repaint_ctx = ctx.clone();
@@ -580,6 +720,7 @@ impl EntropyApp {
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn poll_vial_hid_task(&mut self, ctx: &egui::Context) {
         self.poll_vial_hid_task_with_settings_save(ctx, save_app_settings);
+        self.maybe_start_layer_name_write(ctx);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -621,6 +762,41 @@ impl EntropyApp {
 
         self.hid_device = result.hid_device;
         match result.outcome {
+            Ok(VialHidOutcome::LayerNameWritten(actual)) => {
+                if let VialHidOperation::LayerNameWrite(request) = result.operation {
+                    if !self.selected_device.and_then(|i| self.device_manager.devices().get(i))
+                        .is_some_and(|device| device.path == request.device.path
+                            && device.instance_token == request.device.instance_token
+                            && device.permits_hid_target(&request.device)) {
+                        return;
+                    }
+                    // Completion belongs to the captured Default, never the
+                    // profile selected while HID was borrowed by this worker.
+                    if let Some(name) = self.layer_names.get_mut(request.layer) {
+                        *name = actual.clone();
+                    }
+                    if let Some(layout) = self.layout.as_mut() {
+                        if let Some(name) = layout.layer_names.get_mut(request.layer) {
+                            *name = actual.clone();
+                        }
+                    }
+                    self.uncertain_layer_names.retain(|old| old.device_key != request.device_key
+                        || old.layer != request.layer || old.generation != request.generation
+                        || old.device.path != request.device.path
+                        || old.device.instance_token != request.device.instance_token);
+                    if !self.selected_layer_names_uncertain() {
+                        save_layer_names(&self.layer_names, &self.current_device_name);
+                    }
+                    if let Some(profile) = self.app_settings.application_layouts
+                        .get_mut(&request.device_key)
+                        .and_then(|s| s.layouts.get_mut(&request.layout_id)) {
+                        if profile.layer_names.get(request.layer) == Some(&request.name) {
+                            profile.set_layer_name(request.layer, actual);
+                            save_settings(&self.app_settings);
+                        }
+                    }
+                }
+            }
             Ok(VialHidOutcome::UnlockStarted { unlocked, keys }) => {
                 self.finish_vial_unlock_start(unlocked, keys);
             }
@@ -1084,6 +1260,9 @@ impl EntropyApp {
 
         match operation {
             VialHidOperation::UnlockStart => self.fail_vial_unlock_start(error),
+            VialHidOperation::LayerNameWrite(_) => {
+                self.status_msg = layer_name_write_error(self.app_settings.language, &error);
+            }
             VialHidOperation::UnlockPoll => self.fail_vial_unlock_poll(error),
             VialHidOperation::Lock => {
                 self.status_msg = crate::i18n::tr_catalog_format(

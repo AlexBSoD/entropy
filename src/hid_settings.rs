@@ -298,6 +298,13 @@ impl HidDevice {
         decode_qmk_setting_string(&resp, qsid)
     }
 
+    /// Decoded value that fits the same firmware/wire budgets as the setter.
+    pub(crate) fn normalized_qmk_setting_string(value: &str) -> String {
+        String::from_utf8(truncate_qmk_string_payload(value, QMK_STRING_MAX_DECODED_BYTES, 27))
+            .expect("QMK string truncation preserves UTF-8")
+            .replace("%%", "%")
+    }
+
     pub fn set_qmk_setting_string(&self, qsid: u16, value: &str) -> Result<()> {
         let mut cmd = [0u8; 32];
         cmd[0] = CMD_VIA_VIAL_PREFIX;

@@ -37,8 +37,10 @@ fn vial_lock_control_idle(
     !user_action_busy && (!is_unlocked || !background_layer_active)
 }
 
-fn display_menu_available(known_display_device: bool, firmware_display_settings: bool) -> bool {
-    known_display_device || firmware_display_settings
+fn display_menu_available(selected_dedicated_display: bool) -> bool {
+    // Pending reads must not hide known controls; retained flags and overlapping
+    // QSID namespaces must not grant another selected device this page.
+    selected_dedicated_display
 }
 
 impl EntropyApp {
@@ -66,18 +68,10 @@ impl EntropyApp {
             let known_display_device = self
                 .selected_device
                 .and_then(|index| self.device_manager.devices().get(index))
-                .is_some_and(Self::device_uses_automatic_display_host_data);
+                .is_some_and(crate::device::Device::supports_dedicated_display_settings);
             #[cfg(target_arch = "wasm32")]
             let known_display_device = false;
-            let show_display_item = display_menu_available(
-                known_display_device,
-                self.display_settings.supported
-                    || self.display_settings.sm62_supported
-                    || self
-                        .supported_qmk_settings
-                        .iter()
-                        .any(|qsid| (230..=239).contains(qsid)),
-            );
+            let show_display_item = display_menu_available(known_display_device);
             let layer_leds_available_for_menu = self.layer_led_settings.supported;
             let show_encoders_item = self.show_separate_encoder_visibility_settings(layout);
             let show_layout_options_item = !self.user_layout_option_indices(layout).is_empty();
@@ -655,6 +649,10 @@ impl EntropyApp {
     }
 }
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "layout_settings_dropdown_tests.rs"]
+mod production_menu_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -695,8 +693,7 @@ mod tests {
 
     #[test]
     fn known_display_device_keeps_display_menu_visible_during_capability_reload() {
-        assert!(display_menu_available(true, false));
-        assert!(display_menu_available(false, true));
-        assert!(!display_menu_available(false, false));
+        assert!(display_menu_available(true));
+        assert!(!display_menu_available(false));
     }
 }

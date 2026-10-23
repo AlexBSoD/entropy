@@ -311,6 +311,13 @@ impl EntropyApp {
             editing_layer_text: String::new(),
             editing_layer_focus_requested: false,
             editing_layer_layout_id: None,
+            editing_layer_device_key: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            editing_layer_generation: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            pending_layer_name_writes: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            uncertain_layer_names: Vec::new(),
             current_device_name: String::new(),
             current_keyboard_id: None,
             current_encoder_visibility_id: String::new(),

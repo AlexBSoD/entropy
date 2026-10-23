@@ -2,6 +2,30 @@
 //! Each test owns an isolated output root, including settings and auto-backups.
 
 #[test]
+fn uncertain_layer_name_blocks_unchecked_snapshot_and_auto_backup() {
+    let _storage = crate::app::app_storage::ScopedTempConfig::new();
+    let (mut app, recorder, _) = fixture();
+    let ctx = egui::Context::default();
+    app.deferred_device_load = DeferredDeviceLoadState::complete(16);
+    recorder.respond_by(|request| {
+        if request[..2] == [0xfe, 0x0b] { Some(Ok([0; 32])) }
+        else if request[..2] == [0xfe, 0x0a] { Some(Ok([0xff; 32])) }
+        else { None }
+    });
+    app.rename_application_layout_layer(crate::application_layouts::DEFAULT_APPLICATION_LAYOUT_ID, 0, "Draft".into());
+    app.poll_vial_hid_task(&ctx);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while app.hid_write_lifecycle_busy() {
+        app.poll_vial_hid_task(&ctx);
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(app.selected_layer_names_uncertain());
+    assert!(app.entlayout_snapshot().is_none(), "unchecked snapshot treated uncertainty as current");
+    assert!(app.write_entlayout_auto_backup().is_err());
+}
+
+#[test]
 fn macropad_layer_name_get_failure_rolls_back_host_publication() {
     assert_layer_name_failure_rolls_back(false);
 }

@@ -1,5 +1,18 @@
 use super::*;
 
+/// QSID numbers are firmware-local: RMK BT colors overlap Macropad RGB.
+pub(super) fn load_selected_display_settings(
+    device: &crate::device::Device,
+    connection: &crate::hid::HidDevice,
+    supported: &[u16],
+) -> anyhow::Result<DisplaySettingsState> {
+    if device.supports_dedicated_display_settings() {
+        load_display_settings(connection, supported)
+    } else {
+        Ok(DisplaySettingsState::default())
+    }
+}
+
 fn vial_cache_dir() -> Option<std::path::PathBuf> {
     let dir = dirs::config_dir()?.join("entropy").join("vial_cache");
     std::fs::create_dir_all(&dir).ok()?;
@@ -1360,13 +1373,14 @@ impl EntropyApp {
                     load_rgb_settings(&dev_conn, &layout)
                 };
 
-                let display_settings = if (230..=239).all(|qsid| supported_qmk_settings.contains(&qsid))
-                    || DISPLAY_COLOR_QSIDS
-                        .iter()
-                        .all(|qsid| supported_qmk_settings.contains(qsid))
+                let display_settings = if dev.supports_dedicated_display_settings()
+                    && ((230..=239).all(|qsid| supported_qmk_settings.contains(&qsid))
+                        || DISPLAY_COLOR_QSIDS
+                            .iter()
+                            .all(|qsid| supported_qmk_settings.contains(qsid)))
                 {
                     progress("Reading display settings…")?;
-                    load_display_settings(&dev_conn, &supported_qmk_settings)
+                    load_selected_display_settings(&dev, &dev_conn, &supported_qmk_settings)
                         .map_err(|error| format!("Display settings read failed: {error:#}"))?
                 } else {
                     DisplaySettingsState::default()

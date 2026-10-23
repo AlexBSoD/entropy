@@ -866,6 +866,10 @@ impl EntropyApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn write_entlayout_export(&mut self, path: &Path) {
+        if let Err(error) = self.confirm_uncertain_layer_names() {
+            self.status_msg = error.to_string();
+            return;
+        }
         if let Err(error) = self.prepare_entlayout_pictograms() {
             self.status_msg =
                 format!("Layout export failed while reading shared pictograms: {error}");
@@ -1036,6 +1040,9 @@ impl EntropyApp {
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn entlayout_export_json(&mut self) -> Option<Result<String>> {
         self.layout.as_ref()?;
+        if let Err(error) = self.confirm_uncertain_layer_names() {
+            return Some(Err(error));
+        }
         if let Err(error) = self.prepare_entlayout_pictograms() {
             return Some(Err(error));
         }
@@ -1052,6 +1059,12 @@ impl EntropyApp {
     }
 
     fn entlayout_snapshot(&self) -> Option<EntLayoutFile> {
+        // Even callers without a transport (including automatic backups) must
+        // not serialize a last-known cache as confirmed after a failed SET/GET.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.selected_layer_names_uncertain() {
+            return None;
+        }
         let layout = self.layout.as_ref()?;
         // A never-opened application settings page must not downgrade a capable
         // Macropad backup. Default inherits firmware without publishing host data.

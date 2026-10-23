@@ -168,6 +168,9 @@ impl EntropyApp {
         self.editing_layer_text.clear();
         self.editing_layer_focus_requested = false;
         self.editing_layer_layout_id = None;
+        self.editing_layer_device_key = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        { self.editing_layer_generation = None; }
         self.editing_layout_visibility = true;
     }
 

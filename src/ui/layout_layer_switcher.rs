@@ -361,12 +361,20 @@ impl EntropyApp {
                                     );
                                 }
                             } else {
+                                // Recover before applying the explicit edit: GET may replace
+                                // the same layer's cached name with its previous firmware value.
+                                #[cfg(not(target_arch = "wasm32"))]
+                                let confirmation = self.confirm_uncertain_layer_names();
                                 while self.layer_names.len() <= selected {
                                     self.layer_names.push(self.layer_names.len().to_string());
                                 }
                                 self.layer_names[selected] = new_name.clone();
                                 #[cfg(not(target_arch = "wasm32"))]
-                                save_layer_names(&self.layer_names, &self.current_device_name);
+                                if let Err(error) = confirmation {
+                                    self.status_msg = error.to_string();
+                                } else {
+                                    save_layer_names(&self.layer_names, &self.current_device_name);
+                                }
                                 #[cfg(target_arch = "wasm32")]
                                 save_layer_names(&self.layer_names, "default");
                                 // Also write name back to the connected device
@@ -392,6 +400,9 @@ impl EntropyApp {
                     self.editing_layer_text.clear();
                     self.editing_layer_focus_requested = false;
                     self.editing_layer_layout_id = None;
+                    self.editing_layer_device_key = None;
+                    #[cfg(not(target_arch = "wasm32"))]
+                    { self.editing_layer_generation = None; }
                 }
             } else {
                 // Fixed arrow positions based on max 7-char name width so
@@ -489,6 +500,9 @@ impl EntropyApp {
                 if name_r.clicked() && layer_name_edit_available && !self.editing_layout_visibility
                 {
                     self.editing_layer = Some(selected);
+                    self.editing_layer_device_key = self.application_layout_device_key();
+                    #[cfg(not(target_arch = "wasm32"))]
+                    { self.editing_layer_generation = Some(self.connection_generation); }
                     self.editing_layer_text = raw_name.clone();
                     self.editing_layer_layout_id = self
                         .application_layout_editor_active

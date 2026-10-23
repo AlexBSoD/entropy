@@ -1757,6 +1757,49 @@ mod qa_followup_reconnect {
     }
 
     #[test]
+    fn uncertain_layer_name_is_not_reused_by_reconnect_snapshot() {
+        let _storage=crate::app::app_storage::ScopedTempConfig::new();
+        let ctx=egui::Context::default();
+        let (mut app,reconnect)=failed_upload(&ctx);
+        let context=DeferredDeviceLoadContext {
+            json:std::sync::Arc::new(serde_json::json!({})),
+            supported_qmk_settings:std::sync::Arc::new(vec![201]),
+            definition_fingerprint:7,layer_count:2,rows:1,cols:1,encoder_count:0,
+            macro_count:0,macro_memory_bytes:Some(0),tap_dance_count:0,combo_count:0,
+            key_override_count:0,alt_repeat_count:0,modules_supported:false,touchpad_supported:false,
+            bluetooth_supported:false,layer_leds_supported:false,rgb_supported:false,lighting_mode:None,
+            supports_rmk_native_key_actions:false,supports_universal_symbols:false,
+            supports_universal_russian_letters:false,supports_rmk_native_combo_output:false,
+            supports_rmk_native_tap_dance_actions:false,supports_rmk_combo_layers:false,
+        };
+        app.deferred_device_load=DeferredDeviceLoadState::staged(context.clone());
+        app.deferred_device_load.set_layer_status(1,DeferredLoadStatus::Loaded);
+        app.layer_names=vec!["Zero".into(),"Stale".into()];
+        let (hid,packets)=crate::hid::HidDevice::test_device();
+        packets.respond_by(|r| {
+            if r[..2]==[0xfe,0x0b] {Some(Ok([0;32]))}
+            else if r[..2]==[0xfe,0x0a] {Some(Ok([0xff;32]))} else {None}
+        });
+        app.hid_device=Some(hid);
+        let request=super::super::vial_hid_task::LayerNameWrite {
+            device:device("a"),device_key:"reconnect-name".into(),layout_id:"default".into(),
+            generation:app.connection_generation,layer:1,name:"Mutated".into(),
+        };
+        assert_eq!(app.start_vial_hid_operation(&ctx,VialHidOperation::LayerNameWrite(request)),VialHidTaskStart::Started);
+        poll_upload(&mut app,&ctx);
+        let mut fresh=result(&device("a"),7);
+        fresh.layer_count=2;
+        fresh.layout.layers.resize(2,vec![0u16.into()]);
+        fresh.layout.layer_names=vec!["Zero".into(),"Fresh".into()];
+        fresh.deferred_load=DeferredDeviceLoadState::staged(context);
+        app.preserve_deferred_snapshot_on_reconnect(&mut fresh,&reconnect);
+        assert_eq!(fresh.layout.layer_names[1],"Fresh","reconnect reused uncertain name");
+        assert_eq!(fresh.deferred_load.layer_status(1),DeferredLoadStatus::NotLoaded,
+            "reconnect marked uncertainty confirmed without read-only reload");
+        assert_eq!(packets.requests().iter().filter(|r|r[..2]==[0xfe,0x0b]).count(),1);
+    }
+
+    #[test]
     fn failed_upload_draft_survives_successful_same_device_automatic_reconnect_and_reread() {
         let ctx = egui::Context::default();
         let (mut app, reconnect) = failed_upload(&ctx);

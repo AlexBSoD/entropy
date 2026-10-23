@@ -5657,6 +5657,13 @@ pub struct EntropyApp {
     /// Foreground application changes must never redirect the draft to the
     /// newly selected profile.
     pub(crate) editing_layer_layout_id: Option<String>,
+    pub(crate) editing_layer_device_key: Option<String>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) editing_layer_generation: Option<u64>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) pending_layer_name_writes: std::collections::VecDeque<vial_hid_task::LayerNameWrite>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) uncertain_layer_names: Vec<vial_hid_task::LayerNameWrite>,
     /// Current connected device name (for per-device layer names)
     pub(crate) current_device_name: String,
     /// Stable Vial keyboard id for the current firmware definition, when available.

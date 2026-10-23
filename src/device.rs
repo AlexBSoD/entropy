@@ -77,6 +77,14 @@ pub struct Device {
 }
 
 impl Device {
+    /// The dedicated customization page implements only these two protocols.
+    /// Other LCD/OLED devices keep their definition-driven settings routes;
+    /// QSID numbers are firmware-local and cannot identify this protocol.
+    pub(crate) fn supports_dedicated_display_settings(&self) -> bool {
+        self.firmware == FirmwareProtocol::Vial
+            && (self.is_ergohaven_display_macropad() || self.is_ergohaven_sm62())
+    }
+
     /// Repair discovery metadata before it reaches UI and connection identity.
     /// Linux can expose a truncated USB product string and may transiently
     /// report zero VID/PID while the canonical sysfs HID path has both values.
