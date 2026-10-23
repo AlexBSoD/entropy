@@ -303,6 +303,10 @@ impl HidDevice {
         String::from_utf8(truncate_qmk_string_payload(value, QMK_STRING_MAX_DECODED_BYTES, 27))
             .expect("QMK string truncation preserves UTF-8")
             .replace("%%", "%")
+            // GET trims after decoding; truncation can expose whitespace even
+            // when the UI proposal itself had no leading/trailing whitespace.
+            .trim()
+            .to_owned()
     }
 
     pub fn set_qmk_setting_string(&self, qsid: u16, value: &str) -> Result<()> {

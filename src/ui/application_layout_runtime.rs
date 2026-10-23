@@ -2779,6 +2779,51 @@ mod tests {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn ui_name_utf8_whitespace_boundary_confirms_production_worker() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        for (proposal, stored, confirmed) in [
+            ("абвгдеж x", "абвгдеж ", "абвгдеж"),
+            ("Слой%Макро", "Слой%Мак", "Слой%Мак"),
+            ("100%", "100%", "100%"),
+            ("abcdefghijkl", "abcdefghijkl", "abcdefghijkl"),
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = name_review_app();
+            let (hid, packets) = crate::hid::HidDevice::test_device();
+            let store = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            let firmware = store.clone();
+            packets.respond_by(move |r| {
+                if r[..4] == [0xfe, 0x0b, 200, 0] {
+                    let end = r[4..].iter().position(|b| *b == 0).unwrap_or(28);
+                    *firmware.lock().unwrap() = String::from_utf8(r[4..4+end].to_vec()).unwrap().replace("%%", "%");
+                    Some(Ok([0; 32]))
+                } else if r[..4] == [0xfe, 0x0a, 200, 0] {
+                    let name = firmware.lock().unwrap();
+                    let mut response = [0; 32];
+                    response[1..1+name.len()].copy_from_slice(name.as_bytes());
+                    Some(Ok(response))
+                } else { None }
+            });
+            app.hid_device = Some(hid);
+            name_review_rename(&mut app, &ctx, proposal);
+            name_review_drain(&mut app, &ctx);
+            assert_eq!(*store.lock().unwrap(), stored, "setter wire budget changed");
+            assert_eq!(app.layer_names[0], confirmed, "successful UI SET/GET was not confirmed: {}", app.status_msg);
+            assert_eq!(app.layout.as_ref().unwrap().layer_names[0], confirmed);
+            assert!(!app.selected_layer_names_uncertain(), "false uncertainty for {proposal}");
+            assert!(!app.status_msg.contains("Layer name not saved"), "{}", app.status_msg);
+            assert_eq!(crate::app::app_storage::load_layer_names("Macropad")[0], confirmed);
+            let before = packets.requests().len();
+            name_review_frame(&mut app, &ctx, vec![]);
+            app.poll_vial_hid_task(&ctx);
+            assert_eq!(packets.requests().len(), before, "repaint issued a new write");
+            assert_eq!(packets.requests().iter().filter(|r| r[..2] == [0xfe, 0x0b]).count(), 1);
+            assert_eq!(packets.requests().iter().filter(|r| r[..2] == [0xfe, 0x0a]).count(), 1);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn name_review_app() -> EntropyApp {
         let mut app = EntropyApp::new_inert_for_test();
         let mut device = m4cr0pad_v3_device();

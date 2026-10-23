@@ -2,6 +2,149 @@
 //! Each test owns an isolated output root, including settings and auto-backups.
 
 #[test]
+fn gui_export_recovers_uncertain_names_at_ready_entry() {
+    gui_export_uncertain_names("ready", true);
+}
+
+#[test]
+fn gui_export_uncertain_names_read_error_stays_fail_closed() {
+    gui_export_uncertain_names("ready", false);
+}
+
+#[test]
+fn gui_export_uncertain_names_waits_for_borrowed_hid() {
+    gui_export_uncertain_names("borrowed", true);
+}
+
+#[test]
+fn gui_export_uncertain_names_recovers_after_real_full_load() {
+    gui_export_uncertain_names("cold", true);
+}
+
+fn gui_export_uncertain_names(mode: &str, recovered: bool) {
+    let storage = crate::app::app_storage::ScopedTempConfig::new();
+    let (mut app, recorder, _) = fixture();
+    app.current_device_name = "Macropad".into();
+    app.app_settings.language = crate::i18n::Language::English;
+    app.deferred_device_load = DeferredDeviceLoadState::complete(8);
+    for profile in app.application_layout_settings_mut().unwrap().layouts.values_mut() {
+        profile.seed_unset_keycodes([[4; crate::application_layouts::APPLICATION_LAYOUT_CONTROL_COUNT];
+            crate::application_layouts::APPLICATION_LAYOUT_LAYER_COUNT]);
+    }
+    app.app_settings.application_layouts.insert("unrelated-device".into(), DeviceApplicationLayouts::default());
+    let fail_get = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let fail = fail_get.clone();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut gate = Some(release_rx);
+    let mut name = String::new();
+    let held_opcode = if mode == "borrowed" { 0xfe } else { 0x12 };
+    recorder.respond_by(move |r| {
+        if (r[0] == held_opcode && (r[0] != 0xfe || r[1] == 0x08)) && gate.is_some() {
+            entered_tx.send(()).unwrap();
+            gate.take().unwrap().recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+            return Some(Ok([0; 32]));
+        }
+        if r[..4] == [0xfe, 0x0b, 200, 0] {
+            let end = r[4..].iter().position(|b| *b == 0).unwrap_or(28);
+            name = String::from_utf8(r[4..4+end].to_vec()).unwrap();
+            Some(Ok([0; 32]))
+        } else if r[..4] == [0xfe, 0x0a, 200, 0] {
+            if fail.load(std::sync::atomic::Ordering::SeqCst) { return Some(Ok([0xff; 32])); }
+            let mut response = [0; 32];
+            response[1..1+name.len()].copy_from_slice(name.as_bytes());
+            Some(Ok(response))
+        } else if r[0] == 0x12 { Some(Ok([0; 32])) } else { None }
+    });
+    let ctx = egui::Context::default();
+    // Finish ordinary first-frame binding/catalog initialization before taking
+    // preservation snapshots; export is not responsible for those migrations.
+    app.tick_layout_import_lifecycle_for_test(&ctx, 1.0);
+    app.rename_application_layout_layer(DEFAULT_APPLICATION_LAYOUT_ID, 0, "Draft".into());
+    app.poll_vial_hid_task(&ctx);
+    assert!(app.defer_exit_until_hid_write_returns(&ctx));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while app.hid_write_lifecycle_busy() {
+        app.poll_vial_hid_task(&ctx);
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    app.finish_deferred_exit_after_hid_write(&ctx);
+    assert!(!app.exit_after_hid_write, "failed readback blocked exit drain");
+    assert!(app.selected_layer_names_uncertain());
+    assert!(app.entlayout_snapshot().is_none());
+    assert!(app.write_entlayout_auto_backup().is_err());
+    save_app_settings(&app.app_settings);
+    let settings = serde_json::to_value(&app.app_settings).unwrap();
+    let persisted = std::fs::read(app_settings_path()).unwrap();
+    let path = storage.path().join("recovered.entlayout");
+    std::fs::write(&path, b"existing destination").unwrap();
+    let reads = recorder.requests().iter().filter(|r| r[..2] == [0xfe, 0x0a]).count();
+    fail_get.store(!recovered, std::sync::atomic::Ordering::SeqCst);
+    if mode == "cold" {
+        app.deferred_device_load = DeferredDeviceLoadState::staged(DeferredDeviceLoadContext {
+            json: std::sync::Arc::new(serde_json::json!({})),
+            supported_qmk_settings: std::sync::Arc::new(vec![]),
+            definition_fingerprint: 42, layer_count: 8, rows: 5, cols: 3, encoder_count: 1,
+            macro_count: 0, macro_memory_bytes: Some(0), tap_dance_count: 0, combo_count: 0,
+            key_override_count: 0, alt_repeat_count: 0, modules_supported: false, touchpad_supported: false,
+            bluetooth_supported: false, layer_leds_supported: false, rgb_supported: false, lighting_mode: None,
+            supports_rmk_native_key_actions: false, supports_universal_symbols: false,
+            supports_universal_russian_letters: false, supports_rmk_native_combo_output: false,
+            supports_rmk_native_tap_dance_actions: false, supports_rmk_combo_layers: false,
+        });
+    } else if mode == "borrowed" {
+        assert_eq!(app.start_vial_hid_operation(&ctx, crate::app::vial_hid_task::VialHidOperation::Lock),
+            crate::app::vial_hid_task::VialHidTaskStart::Started);
+    }
+    crate::app::file_dialog::set_test_dialog_result(Some(path.clone()));
+    app.request_entlayout_export_after_full_load();
+    if mode != "ready" {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            app.tick_layout_import_lifecycle_for_test(&ctx, 1.0);
+            if entered_rx.try_recv().is_ok() { break; }
+            assert!(std::time::Instant::now() < deadline, "deferred read never started: {}", app.status_msg);
+            std::thread::yield_now();
+        }
+        assert!(app.hid_device.is_none());
+        app.tick_layout_import_lifecycle_for_test(&ctx, 1.0);
+        // Release before assertions so a failing regression cannot strand a worker.
+        release_tx.send(()).unwrap();
+        assert!(app.deferred_full_layout_action_pending(), "export discarded while HID was borrowed: {}", app.status_msg);
+        assert!(app.pending_file_dialog.is_none());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while app.deferred_full_layout_action_pending() || app.vial_hid_task_active() {
+            app.tick_layout_import_lifecycle_for_test(&ctx, 1.0);
+            assert!(std::time::Instant::now() < deadline, "export never finished: {}", app.status_msg);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    assert!(recorder.requests().iter().filter(|r| r[..2] == [0xfe, 0x0a]).count() > reads,
+        "normal export never reached read-only recovery: {}", app.status_msg);
+    if recovered {
+        assert!(app.pending_file_dialog.is_some(), "recovery did not reach picker: {}", app.status_msg);
+        assert!(!app.selected_layer_names_uncertain());
+        assert_eq!(app.layer_names[0], "Draft");
+        app.poll_file_dialog(&ctx);
+        let bundle: EntLayoutFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        app.validate_entlayout_file(&bundle).unwrap();
+        assert_eq!(bundle.data.layer_names[0], "Draft");
+    } else {
+        assert!(app.pending_file_dialog.is_none());
+        assert!(app.status_msg.contains("Layer name not saved"), "{}", app.status_msg);
+        assert!(app.selected_layer_names_uncertain());
+        assert!(app.entlayout_snapshot().is_none());
+        assert!(app.write_entlayout_auto_backup().is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing destination");
+    }
+    assert_eq!(recorder.requests().iter().filter(|r| r[..2] == [0xfe, 0x0b]).count(), 1, "automatic SET retry");
+    assert!(!recorder.requests().iter().any(|r| matches!(r[0], 0x05 | 0x07 | 0x0f)), "export mutated device data");
+    assert_eq!(serde_json::to_value(&app.app_settings).unwrap(), settings);
+    assert_eq!(std::fs::read(app_settings_path()).unwrap(), persisted);
+}
+
+#[test]
 fn uncertain_layer_name_blocks_unchecked_snapshot_and_auto_backup() {
     let _storage = crate::app::app_storage::ScopedTempConfig::new();
     let (mut app, recorder, _) = fixture();

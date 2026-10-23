@@ -843,6 +843,18 @@ struct EntAltRepeatEntry {
 impl EntropyApp {
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn export_entlayout_dialog(&mut self) {
+        // The safe snapshot gate also protects unattended backups. Explicit
+        // export must recover names before that gate, not only after the picker.
+        if self.selected_layer_names_uncertain() && self.hid_write_task_active() {
+            // A worker temporarily owns HID; resume through the existing full-load
+            // queue instead of misreporting a disconnected keyboard or retrying SET.
+            self.deferred_full_layout_action = Some(DeferredFullLayoutAction::ExportEntlayout);
+            return;
+        }
+        if let Err(error) = self.confirm_uncertain_layer_names() {
+            self.status_msg = error.to_string();
+            return;
+        }
         let Some(bundle) = self.entlayout_snapshot() else {
             self.status_msg = crate::i18n::tr_catalog(
                 self.app_settings.language,
