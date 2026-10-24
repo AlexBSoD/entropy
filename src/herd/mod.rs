@@ -7,4 +7,5 @@
 
 pub(crate) mod battery_log;
 pub(crate) mod herdr;
+pub(crate) mod side;
 pub(crate) mod usage;
