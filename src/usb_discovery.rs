@@ -4,34 +4,91 @@ use super::*;
 
 #[cfg(target_os = "linux")]
 pub(super) fn scan() -> Result<Vec<Device>, String> {
-    // Pinned hidapi linux-native-basic-udev enumerates sysfs metadata/report
-    // descriptors only (no hidraw open/ioctl). Do not call scan_devices(): it
-    // additionally enters BlueZ. Return USB endpoints only.
-    let api = hidapi::HidApi::new().map_err(|e| format!("USB metadata scan failed: {e}"))?;
-    validate_linux_snapshot(std::path::Path::new("/sys/class/hidraw"), api
-        .device_list()
-        .filter(|i| {
-            matches!(i.bus_type(), hidapi::BusType::Usb)
-                && i.usage_page() == 0xFF60
-                && i.usage() == 0x61
+    static LAST: std::sync::Mutex<Option<LinuxSnapshot>> = std::sync::Mutex::new(None);
+    let root = std::path::Path::new("/sys/class/hidraw");
+    scan_unless_unchanged(root, &LAST, || {
+        // Pinned hidapi linux-native-basic-udev enumerates sysfs metadata/report
+        // descriptors only (no hidraw open/ioctl). Do not call scan_devices(): it
+        // additionally enters BlueZ. Return USB endpoints only.
+        let api = hidapi::HidApi::new().map_err(|e| format!("USB metadata scan failed: {e}"))?;
+        validate_linux_snapshot(root, api
+            .device_list()
+            .filter(|i| {
+                matches!(i.bus_type(), hidapi::BusType::Usb)
+                    && i.usage_page() == 0xFF60
+                    && i.usage() == 0x61
+            })
+            .map(|i| {
+                let path = i.path().to_string_lossy().to_string();
+                let mut d = Device {
+                    name: i.product_string().unwrap_or("Unknown Keyboard").into(),
+                    vendor_id: i.vendor_id(),
+                    product_id: i.product_id(),
+                    manufacturer: i.manufacturer_string().unwrap_or("").into(),
+                    serial_number: i.serial_number().unwrap_or("").into(),
+                    bus_type: "Usb".into(),
+                    instance_token: device_instance_token(&path),
+                    path,
+                    firmware: FirmwareProtocol::Vial,
+                };
+                d.normalize_discovered_identity();
+                d
+            })
+            .collect())
+    })
+}
+
+/// A complete scan and the hidraw nodes it was taken over.
+#[cfg(target_os = "linux")]
+struct LinuxSnapshot {
+    nodes: Vec<(std::ffi::OsString, std::path::PathBuf)>,
+    devices: Vec<Device>,
+}
+
+// hidapi reads every sysfs attribute of every hidraw node and all its ancestors:
+// about 100 ms of CPU a pass, every 2 s. A node's `device` link names its HID
+// instance, which the kernel numbers anew on every registration, so while the
+// links stay the same the last complete result still holds. Only a complete
+// (validated) result is kept; an incomplete one is retried in full.
+#[cfg(target_os = "linux")]
+fn scan_unless_unchanged(
+    root: &std::path::Path,
+    last: &std::sync::Mutex<Option<LinuxSnapshot>>,
+    scan: impl FnOnce() -> Result<Vec<Device>, String>,
+) -> Result<Vec<Device>, String> {
+    // Read before the scan: a node that changes during it differs next time.
+    let nodes = hidraw_nodes(root);
+    if let (Some(nodes), Some(last)) = (&nodes, &*last.lock().unwrap_or_else(|e| e.into_inner())) {
+        if last.nodes == *nodes {
+            return Ok(last.devices.clone());
+        }
+    }
+    let result = scan();
+    *last.lock().unwrap_or_else(|e| e.into_inner()) = match (nodes, &result) {
+        (Some(nodes), Ok(devices)) => Some(LinuxSnapshot {
+            nodes,
+            devices: devices.clone(),
+        }),
+        _ => None,
+    };
+    result
+}
+
+/// Every hidraw node with its `device` link, sorted; `None` when any is unreadable.
+#[cfg(target_os = "linux")]
+fn hidraw_nodes(root: &std::path::Path) -> Option<Vec<(std::ffi::OsString, std::path::PathBuf)>> {
+    let mut nodes = std::fs::read_dir(root)
+        .ok()?
+        .map(|entry| {
+            let entry = entry.ok()?;
+            Some((
+                entry.file_name(),
+                std::fs::read_link(entry.path().join("device")).ok()?,
+            ))
         })
-        .map(|i| {
-            let path = i.path().to_string_lossy().to_string();
-            let mut d = Device {
-                name: i.product_string().unwrap_or("Unknown Keyboard").into(),
-                vendor_id: i.vendor_id(),
-                product_id: i.product_id(),
-                manufacturer: i.manufacturer_string().unwrap_or("").into(),
-                serial_number: i.serial_number().unwrap_or("").into(),
-                bus_type: "Usb".into(),
-                instance_token: device_instance_token(&path),
-                path,
-                firmware: FirmwareProtocol::Vial,
-            };
-            d.normalize_discovered_identity();
-            d
-        })
-        .collect())
+        .collect::<Option<Vec<_>>>()?;
+    nodes.sort();
+    Some(nodes)
 }
 
 #[cfg(target_os = "linux")]
@@ -398,6 +455,130 @@ mod tests {
         assert_eq!(linux_fixture_snapshot(0).unwrap().len(), 1);
         for case in [12, 13, 14] { assert!(linux_fixture_snapshot(case).unwrap().is_empty()); }
     }
+
+    #[cfg(target_os = "linux")]
+    fn link_node(root: &std::path::Path, name: &str, instance: &str) {
+        let node = root.join(name);
+        let _ = std::fs::remove_dir_all(&node);
+        std::fs::create_dir_all(&node).unwrap();
+        std::os::unix::fs::symlink(format!("../../../{instance}"), node.join("device")).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fixture_device(path: &str) -> Device {
+        Device {
+            name: "Fixture keyboard".into(),
+            manufacturer: "Fixture".into(),
+            serial_number: "".into(),
+            vendor_id: 0xffff,
+            product_id: 0xffff,
+            bus_type: "Usb".into(),
+            path: path.into(),
+            instance_token: format!("sysfs:{path}"),
+            firmware: FirmwareProtocol::Vial,
+        }
+    }
+
+    /// Runs one discovery pass; returns the paths found and whether it scanned.
+    #[cfg(target_os = "linux")]
+    fn pass(
+        root: &std::path::Path,
+        last: &std::sync::Mutex<Option<LinuxSnapshot>>,
+        result: Result<Vec<Device>, String>,
+    ) -> (Result<Vec<String>, String>, bool) {
+        let mut scanned = false;
+        let found = scan_unless_unchanged(root, last, || {
+            scanned = true;
+            result
+        });
+        (
+            found.map(|devices| devices.into_iter().map(|d| d.path).collect()),
+            scanned,
+        )
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_usb_scan_reuses_its_result_while_the_hidraw_nodes_stay_the_same() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let last = std::sync::Mutex::new(None);
+        link_node(root, "hidraw0", "0003:FFFF:FFFF.0001");
+        let found = Ok(vec![fixture_device("/dev/hidraw0")]);
+
+        assert_eq!(
+            pass(root, &last, found.clone()),
+            (Ok(vec!["/dev/hidraw0".into()]), true)
+        );
+        assert_eq!(
+            pass(root, &last, Ok(vec![])),
+            (Ok(vec!["/dev/hidraw0".into()]), false)
+        );
+
+        link_node(root, "hidraw1", "0003:FFFF:FFFF.0002");
+        assert!(
+            pass(root, &last, found.clone()).1,
+            "an added node is scanned"
+        );
+        assert!(!pass(root, &last, Ok(vec![])).1);
+
+        std::fs::remove_dir_all(root.join("hidraw1")).unwrap();
+        assert!(
+            pass(root, &last, found.clone()).1,
+            "a removed node is scanned"
+        );
+
+        // Re-enumerated under the same node name: a new HID instance.
+        link_node(root, "hidraw0", "0003:FFFF:FFFF.0003");
+        assert_eq!(pass(root, &last, Ok(vec![])), (Ok(vec![]), true));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_usb_scan_retries_an_incomplete_snapshot_in_full() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let last = std::sync::Mutex::new(None);
+        link_node(root, "hidraw0", "0003:FFFF:FFFF.0001");
+        let incomplete = Err("USB metadata snapshot incomplete".to_owned());
+
+        assert_eq!(
+            pass(root, &last, incomplete.clone()),
+            (Err("USB metadata snapshot incomplete".into()), true)
+        );
+        assert_eq!(
+            pass(root, &last, incomplete),
+            (Err("USB metadata snapshot incomplete".into()), true)
+        );
+        assert!(pass(root, &last, Ok(vec![fixture_device("/dev/hidraw0")])).1);
+        assert!(!pass(root, &last, Ok(vec![])).1);
+
+        // A failure after a good pass drops the kept result too.
+        link_node(root, "hidraw0", "0003:FFFF:FFFF.0002");
+        assert!(pass(root, &last, Err("gone".into())).1);
+        link_node(root, "hidraw0", "0003:FFFF:FFFF.0001");
+        assert!(
+            pass(root, &last, Ok(vec![])).1,
+            "nothing is kept after a failure"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_usb_scan_runs_every_time_sysfs_cannot_be_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let last = std::sync::Mutex::new(None);
+        let missing = temp.path().join("missing");
+        for _ in 0..2 {
+            assert!(pass(&missing, &last, Ok(vec![])).1);
+        }
+        // A node without its device link proves nothing either.
+        std::fs::create_dir_all(temp.path().join("hidraw0")).unwrap();
+        for _ in 0..2 {
+            assert!(pass(temp.path(), &last, Ok(vec![])).1);
+        }
+    }
+
     #[test]
     fn usb_hotplug_windows_filters_bluetooth_before_any_hid_open() {
         let cases: &[(&[&str], bool)] = &[
