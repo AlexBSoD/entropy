@@ -118,14 +118,17 @@ pub(crate) struct Log {
 
 impl Log {
     /// The logs of the keyboard with this Vial keyboard id, under
-    /// `$XDG_STATE_HOME/entropy/herd/<id>/`.
+    /// `$ENTROPY_HERD_LOG_DIR/<id>/`, by default `$XDG_STATE_HOME/entropy/herd/<id>/`.
     pub(crate) fn for_keyboard(keyboard_uid: [u8; 8]) -> Option<Self> {
         let id: String = keyboard_uid
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        let dir = dirs::state_dir()?.join("entropy").join("herd").join(id);
-        Some(Self::in_dir(&dir))
+        let root = match std::env::var_os("ENTROPY_HERD_LOG_DIR") {
+            Some(dir) => PathBuf::from(dir),
+            None => dirs::state_dir()?.join("entropy").join("herd"),
+        };
+        Some(Self::in_dir(&root.join(id)))
     }
 
     pub(crate) fn in_dir(dir: &Path) -> Self {
