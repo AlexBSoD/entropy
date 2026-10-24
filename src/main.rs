@@ -14,6 +14,8 @@ mod firmware;
 mod firmware_builtin_icons;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod golden_frames;
+#[cfg(target_os = "linux")]
+mod herd;
 #[cfg(not(target_arch = "wasm32"))]
 mod hid;
 mod i18n;
