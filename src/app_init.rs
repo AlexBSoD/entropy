@@ -33,6 +33,8 @@ impl EntropyApp {
         #[cfg(target_os = "linux")]
         crate::smart_input::refresh_installed_ibus_backend();
         crate::smart_input::start();
+        #[cfg(target_os = "linux")]
+        crate::herd::start();
 
         let text_expander_rules_signature =
             text_expander_rules_signature(&app_settings.text_expander_rule_files);

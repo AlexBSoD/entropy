@@ -6,8 +6,6 @@
 //! Environment: `ENTROPY_HERD=0` leaves it off, `HERDR_SOCKET_PATH` and
 //! `CLAUDE_CONFIG_DIR` point at herdr and Claude Code, `ENTROPY_HERD_LOG_DIR`
 //! moves the logs.
-// Wired into the GUI's start-up separately; until then only tests use it.
-#![allow(dead_code)]
 
 pub(crate) mod battery_log;
 pub(crate) mod herdr;
@@ -37,6 +35,10 @@ static RUNNING: Mutex<Option<Running>> = Mutex::new(None);
 /// Starts following herdr, the limits and every Rynk board that serves the
 /// personal commands. Once per process; later calls do nothing.
 pub(crate) fn start() {
+    // The GUI tests build the app too; they must not reach herdr or the boards.
+    if cfg!(test) {
+        return;
+    }
     let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
     if running.is_some() {
         return;

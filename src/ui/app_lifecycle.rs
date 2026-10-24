@@ -1626,6 +1626,8 @@ impl eframe::App for EntropyApp {
         save_app_settings(&self.app_settings);
         #[cfg(target_os = "linux")]
         crate::app_discovery::unload_kwin_foreground_script();
+        #[cfg(target_os = "linux")]
+        crate::herd::stop();
     }
 
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
