@@ -1,9 +1,8 @@
 # Personal Qube wire snapshot — DO NOT edit by hand.
 # File: snapshots/side.snap
 # Payload exemplars and full frames (SEQ 1) of the personal commands. A diff
-# here means their wire changed: bump SIDE_REVISION and regenerate with
-# `--features host,qube_side`:
-#   UPDATE_SNAPSHOTS=1 cargo test -p rmk-types --features host side_wire
+# here means their wire changed: bump SIDE_REVISION and regenerate with:
+#   UPDATE_SNAPSHOTS=1 cargo test -p rmk-types --features host --features qube_side side_wire
 # Format: <label>  <hex bytes>
 
 AgentSummary           02 03 01 04 00

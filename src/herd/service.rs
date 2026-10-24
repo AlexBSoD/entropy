@@ -53,6 +53,10 @@ struct Board {
 }
 
 impl Board {
+    /// One row. The halves report their diagnostics in answer to the refresh
+    /// `GetBatteryHalves` sends, after its reply, so a row carries the previous
+    /// poll's diagnostics (none in the first), as over Vial; the halves'
+    /// uptimes date them.
     fn log_halves(&mut self) -> bool {
         let Some(log) = self.log.as_mut() else {
             return false;
