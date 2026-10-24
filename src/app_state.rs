@@ -5450,6 +5450,11 @@ pub struct EntropyApp {
     /// User action waiting for every staged Bluetooth layer to become complete.
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) deferred_full_layout_action: Option<DeferredFullLayoutAction>,
+    /// Listens for `--export-layout` runs while this instance owns the keyboards.
+    #[cfg(unix)]
+    pub(super) console_export_server: Option<super::headless_export::ExportServer>,
+    #[cfg(unix)]
+    pub(super) pending_console_export: Option<super::headless_export::PendingConsoleExport>,
     pub(super) settings_write_queue: SettingsWriteQueueState,
     pub(super) settings_write_generation: u64,
     pub(super) qmk_settings_write_queue: QmkSettingsWriteQueue,

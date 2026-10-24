@@ -518,6 +518,17 @@ impl EntropyApp {
         }
     }
 
+    /// The full snapshot the loader works toward: a pending menu action, or
+    /// a console export answered by this instance.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wanted_full_layout_action(&self) -> Option<DeferredFullLayoutAction> {
+        #[cfg(unix)]
+        if self.deferred_full_layout_action.is_none() && self.pending_console_export.is_some() {
+            return Some(DeferredFullLayoutAction::ExportEntlayout);
+        }
+        self.deferred_full_layout_action
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     fn deferred_request_for_current_view(
         &self,
@@ -535,12 +546,13 @@ impl EntropyApp {
             });
         }
 
-        if self.deferred_full_layout_action.is_some() {
+        let full_layout_action = self.wanted_full_layout_action();
+        if full_layout_action.is_some() {
             if let Some(layer) = self.deferred_device_load.next_unloaded_layer() {
                 return Some(DeferredLoadRequest::Layer { layer, context });
             }
             if matches!(
-                self.deferred_full_layout_action,
+                full_layout_action,
                 Some(
                     DeferredFullLayoutAction::ImportEntlayout
                         | DeferredFullLayoutAction::ExportEntlayout

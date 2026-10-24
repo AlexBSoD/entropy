@@ -9,6 +9,14 @@ use super::*;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+#[path = "headless_export_ipc.rs"]
+mod running_instance;
+#[cfg(unix)]
+pub(crate) use running_instance::{
+    export_via_running_instance, ExportServer, PendingConsoleExport,
+};
+
 /// Everything went through; the layout is at the requested destination.
 pub(crate) const EXIT_OK: i32 = 0;
 /// The keyboard was found but the export did not complete (connect error,
@@ -16,7 +24,7 @@ pub(crate) const EXIT_OK: i32 = 0;
 pub(crate) const EXIT_FAILED: i32 = 1;
 /// No keyboard matched, or several did and `--device` did not settle it.
 pub(crate) const EXIT_NO_DEVICE: i32 = 2;
-/// Another Entropy instance owns the keyboards; the GUI export still works.
+/// Another Entropy instance owns the keyboards and did not export for us.
 pub(crate) const EXIT_INSTANCE_RUNNING: i32 = 3;
 /// The keyboard loaded, but some of its layers or sections did not; nothing
 /// was written.
@@ -43,8 +51,10 @@ Usage: entropy --export-layout <PATH> [--device <FILTER>] [--timeout <SECONDS>]
                           finished loading by then (default: 60)
 
 Exit status: 0 exported, 1 export failed, 2 no (or ambiguous) keyboard,
-3 another Entropy instance is running, 4 incomplete (the missing sections
-are listed), 64 usage error. A file is replaced only by a complete export.";
+3 another Entropy instance is running and did not answer, 4 incomplete
+(the missing sections are listed), 64 usage error. A file is replaced only
+by a complete export. A running Entropy exports for this command on Linux
+and macOS.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ExportDestination {
@@ -1237,6 +1247,129 @@ mod tests {
         assert_eq!(
             connection.step(&mut app, &ctx),
             Err(ExportError::Incomplete(vec!["TapDance".to_owned()]))
+        );
+    }
+
+    /// A GUI instance connected to the scripted keyboard, its console export
+    /// channel listening at a temporary socket.
+    #[cfg(target_os = "linux")]
+    fn running_instance() -> (
+        EntropyApp,
+        crate::hid::TestHidRecorder,
+        tempfile::TempDir,
+        PathBuf,
+        egui::Context,
+    ) {
+        let (mut app, _, _) = scripted_export_app(|_| None);
+        app.headless = false;
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        scripted_keyboard(&recorder, |_| None);
+        app.test_connect_hid = Some(hid);
+        let ctx = egui::Context::default();
+        app.start_connect(0);
+        let started = Instant::now();
+        while !(matches!(app.connect_state, ConnectState::Idle) && app.layout.is_some()) {
+            assert!(started.elapsed() < Duration::from_secs(20), "connect hung");
+            app.poll_vial_hid_task(&ctx);
+            app.poll_connect(&ctx);
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("entropy").join("export.sock");
+        app.console_export_server = Some(ExportServer::start(&socket, ctx.clone()).unwrap());
+        (app, recorder, dir, socket, ctx)
+    }
+
+    /// One console export against `app`, pumping its frames meanwhile.
+    #[cfg(target_os = "linux")]
+    fn console_export(
+        app: &mut EntropyApp,
+        ctx: &egui::Context,
+        socket: &Path,
+        request: HeadlessExportRequest,
+    ) -> Option<i32> {
+        let socket = socket.to_owned();
+        let client =
+            std::thread::spawn(move || running_instance::export_via_socket(&socket, &request));
+        let started = Instant::now();
+        while !client.is_finished() {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "console export hung"
+            );
+            app.poll_vial_hid_task(ctx);
+            app.poll_console_export(ctx);
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        client.join().unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn running_instance_answers_a_console_export_without_writes() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (mut app, recorder, dir, socket, ctx) = running_instance();
+        let before = recorder.requests().len();
+        let path = dir.path().join("backup.entlayout");
+
+        let code = console_export(
+            &mut app,
+            &ctx,
+            &socket,
+            HeadlessExportRequest {
+                destination: ExportDestination::File(path.clone()),
+                device: Some("m4cr0pad".into()),
+                timeout: Duration::from_secs(20),
+            },
+        );
+
+        assert_eq!(code, Some(EXIT_OK));
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["format"], "entropy.layout");
+        let writes: Vec<_> = recorder.requests()[before..]
+            .iter()
+            .filter(|request| is_write(request))
+            .copied()
+            .collect();
+        assert!(writes.is_empty(), "the console export wrote: {writes:02x?}");
+        assert!(app.pending_console_export.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn console_export_of_another_keyboard_reports_no_device() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (mut app, _, dir, socket, ctx) = running_instance();
+        let path = dir.path().join("backup.entlayout");
+
+        let code = console_export(
+            &mut app,
+            &ctx,
+            &socket,
+            HeadlessExportRequest {
+                destination: ExportDestination::File(path.clone()),
+                device: Some("e126:0071".into()),
+                timeout: Duration::from_secs(20),
+            },
+        );
+
+        assert_eq!(code, Some(EXIT_NO_DEVICE));
+        assert!(!path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn console_export_without_a_listening_instance_keeps_the_old_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let request = HeadlessExportRequest {
+            destination: ExportDestination::Stdout,
+            device: None,
+            timeout: Duration::from_secs(1),
+        };
+        assert_eq!(
+            running_instance::export_via_socket(&dir.path().join("export.sock"), &request),
+            None
         );
     }
 }

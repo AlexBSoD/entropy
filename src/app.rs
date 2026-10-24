@@ -59,6 +59,8 @@ mod entlayout;
 #[cfg(not(target_arch = "wasm32"))]
 #[path = "headless_export.rs"]
 mod headless_export;
+#[cfg(unix)]
+pub(crate) use headless_export::export_via_running_instance;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use headless_export::{
     run_headless_export, HeadlessExportRequest, EXIT_INSTANCE_RUNNING, EXIT_USAGE,
