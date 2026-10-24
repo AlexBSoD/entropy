@@ -85,7 +85,10 @@ fn real_worker_grants_second_transient_incident_its_own_grace() {
                         anyhow::bail!("scripted transient output busy");
                     }
                     if index == 0 {
-                        cache.owner.shared.state.lock().unwrap().snapshot.volume = Some(51);
+                        cache
+                            .owner
+                            .shared
+                            .store_for_test(|snapshot| snapshot.volume = Some(51));
                     } else {
                         script_events.send("second recovered").unwrap();
                     }

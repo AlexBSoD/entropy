@@ -23,6 +23,16 @@ const SM62_VENDOR_ID: u16 = 0xE126;
 const SM62_PRODUCT_ID: u16 = 0x00B2;
 const DEFAULT_LAYOUT_CODES: [&str; 2] = ["en", "ru"];
 const LAYOUT_RESEND_INTERVAL: Duration = Duration::from_secs(10);
+const LAYOUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+// An idle bridge still wakes this often, which bounds how late the Linux
+// device-path check notices an unplugged keyboard. Tests use a long recheck
+// so every path that must reach a bridge early has to prove its own wake.
+#[cfg(not(test))]
+const BRIDGE_IDLE_RECHECK: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const BRIDGE_IDLE_RECHECK: Duration = Duration::from_secs(60);
+// Application-layout snapshots change from the UI without waking the bridge.
+const BRIDGE_APPLICATION_LAYOUT_TICK: Duration = Duration::from_millis(20);
 #[cfg(target_os = "windows")]
 const MEDIA_POLL_INTERVAL: Duration = Duration::from_millis(500);
 #[cfg(not(target_os = "windows"))]
@@ -189,12 +199,61 @@ struct DesktopState {
     epoch: [u64; 3],
     snapshot: DesktopSnapshot,
     stopped: bool,
+    // Bridges to wake when a lane they subscribed to stores news for them.
+    listeners: Vec<([bool; 3], std::sync::Weak<BridgeWake>)>,
 }
 
 #[derive(Default)]
 struct DesktopShared {
     state: Mutex<DesktopState>,
     wake: std::sync::Condvar,
+    #[cfg(test)]
+    lane_passes: [AtomicU64; 3],
+}
+
+#[cfg(test)]
+impl DesktopShared {
+    /// Stores a sample as a lane does, waking the subscribed bridges, for
+    /// tests that drive the snapshot without lane threads.
+    fn store_for_test(&self, update: impl FnOnce(&mut DesktopSnapshot)) {
+        let state = &mut *self.state.lock().unwrap();
+        update(&mut state.snapshot);
+        for (_, bridge) in &state.listeners {
+            if let Some(bridge) = bridge.upgrade() {
+                bridge.wake();
+            }
+        }
+    }
+}
+
+/// Wakes a host bridge before its next deadline: a desktop sample it uses
+/// changed, it was stopped, or it was handed a transport. A wake that lands
+/// while the bridge is busy is kept for its next wait, so none is lost.
+#[derive(Default)]
+struct BridgeWake {
+    pending: Mutex<bool>,
+    signal: std::sync::Condvar,
+    #[cfg(test)]
+    waits: AtomicU64,
+}
+
+impl BridgeWake {
+    fn wake(&self) {
+        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.signal.notify_one();
+    }
+
+    /// Waits up to `timeout`; returns whether a wake ended the wait.
+    fn wait(&self, timeout: Duration) -> bool {
+        #[cfg(test)]
+        self.waits.fetch_add(1, Ordering::Relaxed);
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut pending, _) = self
+            .signal
+            .wait_timeout_while(pending, timeout, |pending| !*pending)
+            .unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *pending)
+    }
 }
 
 struct DesktopOwner {
@@ -261,18 +320,25 @@ impl HostDataService {
         // One process-wide service, three bounded lanes. Construct platform
         // handles on their owning thread; no OS query or source owns HID.
         // A slow layout/media API must never freeze fresh volume feedback.
-        for index in 0..3 {
+        for (index, name) in ["desktop-volume", "desktop-layout", "desktop-media"]
+            .into_iter()
+            .enumerate()
+        {
             let worker = shared.clone();
             let source = source.clone();
-            thread::spawn(move || run_desktop_service(worker, source(), index));
+            thread::Builder::new()
+                .name(name.to_owned())
+                .spawn(move || run_desktop_service(worker, source(), index))
+                .expect("failed to spawn a desktop host-data lane");
         }
         Self {
             owner: Arc::new(DesktopOwner { shared }),
         }
     }
 
-    fn subscribe(&self, mode: HostDataMode) -> DesktopSubscription {
+    fn subscribe(&self, mode: HostDataMode, bridge: &Arc<BridgeWake>) -> DesktopSubscription {
         let enabled = [mode.volume, mode.layout, mode.media];
+        let bridge = Arc::downgrade(bridge);
         let mut state = self
             .owner
             .shared
@@ -287,10 +353,12 @@ impl HostDataService {
                 state.demand[index] += 1;
             }
         }
+        state.listeners.push((enabled, bridge.clone()));
         self.owner.shared.wake.notify_all();
         DesktopSubscription {
             service: self.clone(),
             enabled,
+            bridge,
         }
     }
 
@@ -308,12 +376,20 @@ impl HostDataService {
 struct DesktopSubscription {
     service: HostDataService,
     enabled: [bool; 3],
+    bridge: std::sync::Weak<BridgeWake>,
 }
 
 impl Drop for DesktopSubscription {
     fn drop(&mut self) {
         let shared = &self.service.owner.shared;
         let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(listener) = state
+            .listeners
+            .iter()
+            .position(|(_, bridge)| bridge.ptr_eq(&self.bridge))
+        {
+            state.listeners.swap_remove(listener);
+        }
         for (index, enabled) in self.enabled.iter().enumerate() {
             if *enabled {
                 state.demand[index] -= 1;
@@ -334,7 +410,7 @@ impl Drop for DesktopSubscription {
 }
 
 fn run_desktop_service(shared: Arc<DesktopShared>, mut source: impl DesktopSource, index: usize) {
-    let interval = [VOLUME_POLL_INTERVAL, Duration::from_millis(100), MEDIA_POLL_INTERVAL][index];
+    let interval = [VOLUME_POLL_INTERVAL, LAYOUT_POLL_INTERVAL, MEDIA_POLL_INTERVAL][index];
     let mut last_poll = Instant::now() - Duration::from_secs(60);
     let mut last_epoch = 0;
     loop {
@@ -364,20 +440,46 @@ fn run_desktop_service(shared: Arc<DesktopShared>, mut source: impl DesktopSourc
             if state.stopped { return; }
             // Old in-flight queries cannot populate a re-enabled session.
             if state.demand[index] > 0 && state.epoch[index] == epoch {
-                match index {
-                    0 => state.snapshot.volume = sample.volume,
-                    1 => state.snapshot.layout = sample.layout,
+                // Every media sample is news: bridges resend and pace progress by it.
+                let news = match index {
+                    0 => {
+                        std::mem::replace(&mut state.snapshot.volume, sample.volume)
+                            != sample.volume
+                    }
+                    1 => {
+                        std::mem::replace(&mut state.snapshot.layout, sample.layout)
+                            != sample.layout
+                    }
                     _ => {
                         state.snapshot.media = sample.media;
                         state.snapshot.media_query_ms = sample.media_query_ms;
                         state.snapshot.media_sampled_at = sample.media_sampled_at;
+                        true
+                    }
+                };
+                if news {
+                    for (lanes, bridge) in &state.listeners {
+                        if let Some(bridge) = bridge.upgrade().filter(|_| lanes[index]) {
+                            bridge.wake();
+                        }
                     }
                 }
             }
         }
         let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.stopped { return; }
-        let _ = shared.wake.wait_timeout(state, Duration::from_millis(20));
+        // Sleep until the next sample is due, never closer than the old 20 ms
+        // pass. A re-enable that arrived during the query is due at once;
+        // demand changes and stop notify the condvar and end the wait early.
+        let due_in = if state.epoch[index] != last_epoch {
+            Duration::ZERO
+        } else {
+            interval.saturating_sub(last_poll.elapsed())
+        }
+        .max(Duration::from_millis(20));
+        let _ = shared.wake.wait_timeout(state, due_in);
+        #[cfg(test)]
+        shared.lane_passes[index].fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -422,6 +524,8 @@ const VOLUME_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const VOLUME_POLL_INTERVAL: Duration = Duration::from_millis(40);
 #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 const VOLUME_POLL_INTERVAL: Duration = Duration::from_millis(250);
+#[cfg(test)]
+mod bridge_wake_tests;
 #[cfg(test)]
 mod clock_tests;
 #[cfg(any(target_os = "macos", test))]
@@ -675,6 +779,7 @@ struct BridgeTransportControl {
     stop: AtomicBool,
     retirement: std::sync::Mutex<Option<crate::hid::HidRetirement>>,
     selected_handoff: std::sync::Mutex<Option<(crate::hid::HidDevice, bool)>>,
+    wake: Arc<BridgeWake>,
 }
 
 impl BridgeTransportControl {
@@ -694,6 +799,7 @@ impl BridgeTransportControl {
             return Err(hid);
         }
         *handoff = Some((hid, extended));
+        self.wake.wake();
         Ok(())
     }
 
@@ -738,6 +844,7 @@ impl BridgeTransportControl {
                 token.retire();
             }
         }
+        self.wake.wake();
     }
 }
 
@@ -1164,22 +1271,25 @@ impl QmkHidHostBridge {
         let worker_application_layouts_enabled = application_layouts_enabled.clone();
         let send_shutdown_on_drop = Arc::new(AtomicBool::new(true));
         let worker_shutdown = send_shutdown_on_drop.clone();
-        let thread = thread::spawn(move || {
-            run_bridge(
-                worker_device,
-                mode,
-                worker_output,
-                worker_control,
-                worker_layout,
-                worker_application_layout,
-                worker_application_layout_resend,
-                worker_application_layouts_enabled,
-                protocol,
-                worker_shutdown,
-                desktop,
-                open_hid,
-            )
-        });
+        let thread = thread::Builder::new()
+            .name("host-bridge".to_owned())
+            .spawn(move || {
+                run_bridge(
+                    worker_device,
+                    mode,
+                    worker_output,
+                    worker_control,
+                    worker_layout,
+                    worker_application_layout,
+                    worker_application_layout_resend,
+                    worker_application_layouts_enabled,
+                    protocol,
+                    worker_shutdown,
+                    desktop,
+                    open_hid,
+                )
+            })
+            .expect("failed to spawn a host-data bridge");
         Self {
             device,
             mode,
@@ -1539,7 +1649,10 @@ fn run_bridge(
 
         let Some(dev) = device.as_ref() else {
             desktop_subscription = None;
-            thread::sleep(Duration::from_millis(250));
+            // Until the next open attempt; stop and a handed-over owner wake it.
+            control
+                .wake
+                .wait(Duration::from_secs(2).saturating_sub(last_open_attempt.elapsed()));
             continue;
         };
         if stop.load(Ordering::Relaxed) {
@@ -1558,7 +1671,7 @@ fn run_bridge(
             last_application_layout = None;
             application_layout_snapshot.lock().unwrap_or_else(|e| e.into_inner()).revoke();
             application_layouts_enabled.store(false, Ordering::Release);
-            thread::sleep(Duration::from_millis(250));
+            control.wake.wait(Duration::from_millis(250));
             continue;
         }
 
@@ -1645,7 +1758,7 @@ fn run_bridge(
 
         // HID deadlines consume only cached desktop data. Subscribing cannot
         // run an OS query, and the sampler never receives transport ownership.
-        desktop_subscription.get_or_insert_with(|| desktop.subscribe(mode));
+        desktop_subscription.get_or_insert_with(|| desktop.subscribe(mode, &control.wake));
         let snapshot = desktop.snapshot();
 
         if mode.volume && last_volume_poll.elapsed() >= VOLUME_POLL_INTERVAL {
@@ -1663,7 +1776,7 @@ fn run_bridge(
             }
         }
 
-        if mode.layout && last_layout_poll.elapsed() >= Duration::from_millis(100) {
+        if mode.layout && last_layout_poll.elapsed() >= LAYOUT_POLL_INTERVAL {
             last_layout_poll = Instant::now();
             if let Some(layout) = snapshot.layout {
                 if stop.load(Ordering::Acquire) {
@@ -1770,7 +1883,19 @@ fn run_bridge(
             first_write_failure_at = None;
         }
 
-        thread::sleep(Duration::from_millis(20));
+        control.wake.wait(bridge_idle_wait(
+            Instant::now(),
+            mode,
+            application_layouts_enabled.load(Ordering::Acquire),
+            last_time_poll,
+            (snapshot.volume, last_volume, last_volume_poll),
+            (
+                snapshot.layout,
+                last_layout,
+                last_layout_poll,
+                last_layout_full_send,
+            ),
+        ));
     }
 
     if send_shutdown.load(Ordering::Relaxed) {
@@ -1835,6 +1960,47 @@ fn layout_needs_send(
     layout: u8,
 ) -> bool {
     last_layout != Some(layout) || elapsed_since_last_send >= LAYOUT_RESEND_INTERVAL
+}
+
+/// How long a bridge pass may wait before one of its own deadlines falls due.
+/// New desktop samples, stop and a handed-over owner wake it earlier.
+///
+/// `volume` is the sampled value, the last one sent and the last poll;
+/// `layout` adds the last full send, which paces the periodic resend.
+fn bridge_idle_wait(
+    now: Instant,
+    mode: HostDataMode,
+    application_layouts: bool,
+    last_time_poll: Instant,
+    (volume, last_volume, last_volume_poll): (Option<u8>, Option<u8>, Instant),
+    (layout, last_layout, last_layout_poll, last_layout_full_send): (
+        Option<u8>,
+        Option<u8>,
+        Instant,
+        Instant,
+    ),
+) -> Duration {
+    if application_layouts {
+        return BRIDGE_APPLICATION_LAYOUT_TICK;
+    }
+    let mut due = now + BRIDGE_IDLE_RECHECK;
+    if mode.time {
+        due = due.min(last_time_poll + Duration::from_secs(1));
+    }
+    // A sample that arrived inside its poll interval is still unsent: come
+    // back when the interval opens instead of at the next recheck.
+    if mode.volume && volume.is_some() && volume != last_volume {
+        due = due.min(last_volume_poll + VOLUME_POLL_INTERVAL);
+    }
+    if let Some(layout) = layout.filter(|_| mode.layout) {
+        let since_send = now.saturating_duration_since(last_layout_full_send);
+        due = due.min(if layout_needs_send(last_layout, since_send, layout) {
+            last_layout_poll + LAYOUT_POLL_INTERVAL
+        } else {
+            last_layout_full_send + LAYOUT_RESEND_INTERVAL
+        });
+    }
+    due.saturating_duration_since(now)
 }
 
 fn send_shutdown_payloads(
@@ -3732,12 +3898,9 @@ mod qa_followup_shared_output {
         let (mut old, entered, release, finished) = blocked_media_bridge(output.clone());
         entered.recv_timeout(Duration::from_secs(5)).unwrap();
         let before = recorder.requests().len();
-        let stopped = Instant::now();
-        old.stop();
-        assert!(
-            stopped.elapsed() < Duration::from_secs(1),
-            "shared stop waited for desktop I/O"
-        );
+        // The replacement claims the owner before the old bridge is stopped.
+        // Stop wakes the old bridge at once, so the other order would let its
+        // shutdown run first; the UI suppresses it in that case instead.
         let mut replacement = QmkHidHostBridge::start_with_media_source(
             target(),
             HostDataMode {
@@ -3747,6 +3910,12 @@ mod qa_followup_shared_output {
             Some(output),
             HostProtocol::Selected(true),
             || panic!("time-only bridge must not poll media"),
+        );
+        let stopped = Instant::now();
+        old.stop();
+        assert!(
+            stopped.elapsed() < Duration::from_secs(1),
+            "shared stop waited for desktop I/O"
         );
         let reports = wait_for(&recorder, before, DATA_DATE);
         assert_eq!(
@@ -3779,10 +3948,12 @@ mod qa_followup_shared_output {
         let output = hid.shared_output().unwrap();
         let (mut old, entered, release, finished) = blocked_media_bridge(output.clone());
         entered.recv_timeout(Duration::from_secs(5)).unwrap();
-        old.stop();
-        // No replacement was available to old.stop(). An intermediate claim is
-        // never initialized; the next generation must still clear the old modes.
+        // No replacement bridge was available to old.stop(), only a claim that
+        // lands before it and is never initialized: the next generation must
+        // still clear the old modes. A stopped bridge shuts down at once, so
+        // the claim has to come first rather than race the old shutdown.
         let unused = output.for_host_bridge(HostDataMode::default(), false);
+        old.stop();
         drop(unused);
         let before = recorder.requests().len();
         let mut next = QmkHidHostBridge::start_with_media_source(

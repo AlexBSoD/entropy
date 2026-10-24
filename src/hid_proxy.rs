@@ -1745,7 +1745,8 @@ mod tests {
         );
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let before = output_commands(&slot).len();
-        old.stop();
+        // The successor claims the owner before the old bridge is stopped: a
+        // stopped bridge shuts down at once, not on its next 20 ms pass.
         let mut next = test_start_bridge(
             host_target(),
             clock_mode(),
@@ -1754,6 +1755,7 @@ mod tests {
             HostProtocol::Selected(true),
             || None,
         );
+        old.stop();
         await_condition(|| output_commands(&slot)[before..].contains(&0xAF));
         let reports = output_commands(&slot);
         assert_eq!(&reports[before..], &[0xAD, 0xAE, 0xBA, 0xAA, 0xAF]);
