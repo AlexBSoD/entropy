@@ -4,20 +4,22 @@
 //! Boards are recognized by that interface alone, so no VID or PID list is
 //! kept here. Listing reads what the OS already knows and opens nothing.
 
+use std::collections::HashMap;
 use std::io::{self, Read};
 use std::time::Duration;
 
 use nusb::descriptors::TransferType;
+use nusb::hotplug::HotplugEvent;
 use nusb::io::EndpointRead;
 use nusb::transfer::{Bulk, Direction, In, Out, TransferError};
-use nusb::{DeviceInfo, Endpoint, MaybeFuture};
+use nusb::{DeviceId, DeviceInfo, Endpoint, MaybeFuture};
 use rmk_types_rynk::protocol::rynk::{
     RYNK_USB_INTERFACE_CLASS, RYNK_USB_INTERFACE_PROTOCOL, RYNK_USB_INTERFACE_SUBCLASS,
 };
 
 use super::super::client::RynkTransport;
 use super::super::link::PhysicalId;
-use super::FoundBoard;
+use super::{BusEvent, FoundBoard};
 
 const PREFIX: &str = "usb:";
 /// Covers a whole frame per transfer and is a multiple of both full- and
@@ -26,6 +28,9 @@ const READ_TRANSFER_SIZE: usize = 4096;
 /// How long one frame may take to leave; the board stops taking bytes only
 /// while it is busy, never for longer than a request may take.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(8);
+/// How long a board that just arrived may take to show its interfaces.
+const SETTLE: Duration = Duration::from_secs(2);
+const SETTLE_STEP: Duration = Duration::from_millis(100);
 
 /// One bus device as scanning sees it, apart from nusb's types so that tests
 /// can describe devices.
@@ -141,6 +146,68 @@ pub(crate) fn open(id: &PhysicalId) -> io::Result<UsbTransport> {
         io::ErrorKind::NotFound,
         format!("{} is not on USB", id.0),
     ))
+}
+
+/// The device as it stands once its interfaces show. Linux announces a device
+/// before the kernel has configured it, so a fresh arrival may list none yet.
+fn settled(info: DeviceInfo) -> DeviceInfo {
+    let device = info.id();
+    let mut latest = info;
+    let mut waited = Duration::ZERO;
+    while latest.interfaces().next().is_none() && waited < SETTLE {
+        std::thread::sleep(SETTLE_STEP);
+        waited += SETTLE_STEP;
+        let Ok(mut listed) = devices() else {
+            continue;
+        };
+        match listed.find(|info| info.id() == device) {
+            Some(info) => latest = info,
+            // Gone already; its removal follows.
+            None => break,
+        }
+    }
+    latest
+}
+
+pub(crate) fn watch(mut on_event: impl FnMut(BusEvent) -> bool) -> io::Result<()> {
+    // Watching starts before listing, so a board arriving in between is
+    // reported by one or the other; one reported by both counts once.
+    let events = nusb::watch_devices().map_err(usb_error)?;
+    let mut present = HashMap::<DeviceId, PhysicalId>::new();
+    for info in devices()? {
+        if !arrived(&info, &mut present, &mut on_event) {
+            return Ok(());
+        }
+    }
+    for event in futures_lite::stream::block_on(events) {
+        let more = match event {
+            HotplugEvent::Connected(info) => arrived(&settled(info), &mut present, &mut on_event),
+            HotplugEvent::Disconnected(device) => match present.remove(&device) {
+                Some(id) => on_event(BusEvent::Left(id)),
+                None => true,
+            },
+        };
+        if !more {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Reports `info` if it is a Rynk board not reported yet; false once
+/// `on_event` wants no more.
+fn arrived(
+    info: &DeviceInfo,
+    present: &mut HashMap<DeviceId, PhysicalId>,
+    on_event: &mut impl FnMut(BusEvent) -> bool,
+) -> bool {
+    let Some(board) = Seen::of(info).found() else {
+        return true;
+    };
+    if present.insert(info.id(), board.id.clone()).is_some() {
+        return true;
+    }
+    on_event(BusEvent::Arrived(board.id))
 }
 
 /// A claimed Rynk interface. Dropping it releases the claim.

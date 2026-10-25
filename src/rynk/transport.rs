@@ -1,5 +1,5 @@
-//! How a link reaches its board: finding Rynk boards on their buses and
-//! opening one by its [`PhysicalId`].
+//! How a link reaches its board: finding Rynk boards on their buses, opening
+//! one by its [`PhysicalId`], and following boards as they come and go.
 //!
 //! Finding a board opens nothing. Opening claims the board's interface, which
 //! the OS gives to one handle at a time, so only [`RynkLink`] opens boards.
@@ -47,6 +47,13 @@ impl std::fmt::Display for NotConnected {
 
 #[cfg(target_os = "linux")]
 impl std::error::Error for NotConnected {}
+
+/// A board arriving on or leaving a bus.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BusEvent {
+    Arrived(PhysicalId),
+    Left(PhysicalId),
+}
 
 /// The Rynk boards on every bus Entropy can reach.
 pub(crate) fn scan() -> io::Result<Vec<FoundBoard>> {
@@ -118,4 +125,19 @@ pub(crate) fn open(id: &PhysicalId) -> io::Result<BoxedTransport> {
         io::ErrorKind::NotFound,
         format!("no transport reaches {}", id.0),
     ))
+}
+
+/// Reports the boards present now as arrivals, then every change, until
+/// `on_event` returns false. Blocks the calling thread meanwhile. Only USB
+/// boards come and go here so far.
+pub(crate) fn watch(on_event: impl FnMut(BusEvent) -> bool) -> io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    {
+        usb::watch(on_event)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = on_event;
+        Err(io::ErrorKind::Unsupported.into())
+    }
 }

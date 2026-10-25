@@ -123,6 +123,19 @@ pub(crate) enum RynkClientError {
     },
 }
 
+impl RynkClientError {
+    /// The board does not know the command: a firmware without that table.
+    pub(crate) fn is_unknown_cmd(&self) -> bool {
+        matches!(
+            self,
+            Self::Device {
+                error: RynkError::UnknownCmd,
+                ..
+            }
+        )
+    }
+}
+
 impl fmt::Display for RynkClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1063,13 +1076,8 @@ mod tests {
             vec![reply]
         });
         let mut client = RynkClient::new(board.transport(), quick());
-        assert!(matches!(
-            client.request::<command::GetCurrentLayer>(&()),
-            Err(RynkClientError::Device {
-                error: RynkError::UnknownCmd,
-                ..
-            })
-        ));
+        let unknown = client.request::<command::GetCurrentLayer>(&()).unwrap_err();
+        assert!(unknown.is_unknown_cmd(), "{unknown}");
         assert!(matches!(
             client.request::<command::GetMatrixState>(&()),
             Err(RynkClientError::Device {

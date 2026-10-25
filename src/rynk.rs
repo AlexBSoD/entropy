@@ -12,6 +12,7 @@ pub(crate) mod keycode;
 pub(crate) mod link;
 pub(crate) mod macros;
 pub(crate) mod native_v1;
+pub(crate) mod presence;
 pub(crate) mod read_only;
 pub(crate) mod session;
 pub(crate) mod transport;

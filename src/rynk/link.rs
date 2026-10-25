@@ -1,10 +1,11 @@
 //! One owner per Rynk board.
 //!
 //! The board's interface can be claimed by one handle only, so everything that
-//! talks to a board shares the link of its [`PhysicalId`]: the editor session
-//! and host-data bridges. A thread per link owns the client and runs one
-//! request at a time: the editor first, requests nobody waits on next. The
-//! last [`Arc`] dropped closes the link and releases the claim.
+//! talks to a board shares the link of its [`PhysicalId`]: the editor session,
+//! host-data bridges, background readers. A thread per link owns the client
+//! and runs one request at a time: the editor first, background readers next,
+//! requests nobody waits on last. The last [`Arc`] dropped closes the link and
+//! releases the claim.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -59,7 +60,10 @@ type Client = LinkClient;
 type Job = Box<dyn FnOnce(&mut Client) -> Result<(), RynkClientError> + Send>;
 
 enum Event {
-    Request(Job),
+    Request {
+        job: Job,
+        background: bool,
+    },
     Post {
         key: PostKey,
         queued: Instant,
@@ -207,14 +211,27 @@ impl RynkLink {
         &self.board
     }
 
-    /// A request for the editor: runs before posts.
+    /// A request for the editor: runs before background work and posts.
     pub(crate) fn request<E>(&self, request: E::Request) -> Result<E::Response, RynkClientError>
     where
         E: Endpoint,
         E::Request: Send + 'static,
         E::Response: Send + 'static,
     {
-        self.run(move |client| client.request::<E>(&request))
+        self.submit::<E>(request, false)
+    }
+
+    /// A request nobody in front of the user waits for, such as a periodic read.
+    pub(crate) fn request_background<E>(
+        &self,
+        request: E::Request,
+    ) -> Result<E::Response, RynkClientError>
+    where
+        E: Endpoint,
+        E::Request: Send + 'static,
+        E::Response: Send + 'static,
+    {
+        self.submit::<E>(request, true)
     }
 
     /// Runs `operation` on the client as one editor request, so the requests
@@ -222,6 +239,30 @@ impl RynkLink {
     pub(crate) fn run<R>(
         &self,
         operation: impl FnOnce(&mut LinkClient) -> Result<R, RynkClientError> + Send + 'static,
+    ) -> Result<R, RynkClientError>
+    where
+        R: Send + 'static,
+    {
+        self.schedule(operation, false)
+    }
+
+    fn submit<E>(
+        &self,
+        request: E::Request,
+        background: bool,
+    ) -> Result<E::Response, RynkClientError>
+    where
+        E: Endpoint,
+        E::Request: Send + 'static,
+        E::Response: Send + 'static,
+    {
+        self.schedule(move |client| client.request::<E>(&request), background)
+    }
+
+    fn schedule<R>(
+        &self,
+        operation: impl FnOnce(&mut Client) -> Result<R, RynkClientError> + Send + 'static,
+        background: bool,
     ) -> Result<R, RynkClientError>
     where
         R: Send + 'static,
@@ -236,7 +277,7 @@ impl RynkLink {
             }
             Ok(())
         });
-        self.send(Event::Request(job))?;
+        self.send(Event::Request { job, background })?;
         let result = answer.recv().map_err(|_| closed_error())?;
         // The owner stops on a broken link; its caller hears of it only once
         // the link reads as closed, so the next step already sees it gone.
@@ -305,6 +346,7 @@ fn link_failed(error: &RynkClientError) -> bool {
 struct Owner {
     client: Client,
     editor: VecDeque<Job>,
+    background: VecDeque<Job>,
     /// Posts in the order their slots were first queued.
     posts: VecDeque<(PostKey, Instant)>,
     post_jobs: HashMap<PostKey, Job>,
@@ -315,6 +357,7 @@ impl Owner {
         Self {
             client,
             editor: VecDeque::new(),
+            background: VecDeque::new(),
             posts: VecDeque::new(),
             post_jobs: HashMap::new(),
         }
@@ -323,7 +366,8 @@ impl Owner {
     fn run(mut self, events: &mpsc::Receiver<Event>) {
         loop {
             // Take everything that arrived; sleep only when there is no work.
-            let idle = self.editor.is_empty() && self.posts.is_empty();
+            let idle =
+                self.editor.is_empty() && self.background.is_empty() && self.posts.is_empty();
             let event = if !idle {
                 events
                     .try_recv()
@@ -353,7 +397,13 @@ impl Owner {
 
     fn queue(&mut self, event: Event) {
         match event {
-            Event::Request(job) => self.editor.push_back(job),
+            Event::Request { job, background } => {
+                if background {
+                    self.background.push_back(job)
+                } else {
+                    self.editor.push_back(job)
+                }
+            }
             // A newer value takes the slot but not its place in line: the
             // wait counts from the oldest value not sent yet.
             Event::Post { key, queued, job } => {
@@ -370,7 +420,11 @@ impl Owner {
             .front()
             .is_some_and(|(_, queued)| queued.elapsed() >= POST_MAX_WAIT);
         if !post_overdue {
-            if let Some(job) = self.editor.pop_front() {
+            if let Some(job) = self
+                .editor
+                .pop_front()
+                .or_else(|| self.background.pop_front())
+            {
                 return Some(job);
             }
         }
@@ -568,6 +622,43 @@ mod tests {
             [
                 (Cmd::GetDefaultLayer, 0),
                 (Cmd::GetCurrentLayer, 0),
+                (Cmd::SetDefaultLayer, 7),
+            ]
+        );
+    }
+
+    #[test]
+    fn background_reads_go_after_the_editor_and_before_posts() {
+        let (board, log, release, held) = gated_board();
+        let link = RynkLink::acquire(id("background"), quick(), open(&board)).unwrap();
+        // The first background read holds the owner at the gate.
+        let blocker = {
+            let link = link.clone();
+            std::thread::spawn(move || link.request_background::<command::GetDefaultLayer>(()))
+        };
+        held.recv_timeout(Duration::from_secs(3)).unwrap();
+        link.post::<command::SetDefaultLayer>(0, 7).unwrap();
+        let background = {
+            let link = link.clone();
+            std::thread::spawn(move || link.request_background::<command::GetDefaultLayer>(()))
+        };
+        let editor = {
+            let link = link.clone();
+            std::thread::spawn(move || link.request::<command::GetCurrentLayer>(()))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        release.send(()).unwrap();
+        assert_eq!(editor.join().unwrap().unwrap(), 3);
+        background.join().unwrap().unwrap();
+        blocker.join().unwrap().unwrap();
+        eventually("the post is sent", || commands(&log).len() == 4);
+
+        assert_eq!(
+            commands(&log),
+            [
+                (Cmd::GetDefaultLayer, 0),
+                (Cmd::GetCurrentLayer, 0),
+                (Cmd::GetDefaultLayer, 0),
                 (Cmd::SetDefaultLayer, 7),
             ]
         );
