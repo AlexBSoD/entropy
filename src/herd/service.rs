@@ -24,6 +24,9 @@ use crate::rynk::link::{PhysicalId, RynkLink};
 
 /// The halves resample every 15 s, so logging more often only repeats rows.
 const LOG_EVERY: Duration = Duration::from_secs(300);
+/// How long the halves get to answer the refresh `GetBatteryHalves` asks for,
+/// over a link that may skip connection events, before the diagnostics are read.
+const DIAG_SETTLE: Duration = Duration::from_secs(2);
 const SUMMARY_EVERY: Duration = Duration::from_secs(600);
 /// Unchanged counts go out again this often. herdr reports at least every
 /// [`HEARTBEAT`], so a board hears them about that often, well inside the
@@ -50,24 +53,46 @@ struct Board {
     /// `None` when the board has nothing to log.
     log: Option<Log>,
     next_log: Instant,
+    /// A row with its levels read, and when its diagnostics are due.
+    pending: Option<(Halves, Instant)>,
 }
 
 impl Board {
-    /// One row. The halves report their diagnostics in answer to the refresh
-    /// `GetBatteryHalves` sends, after its reply, so a row carries the previous
-    /// poll's diagnostics (none in the first), as over Vial; the halves'
-    /// uptimes date them.
-    fn log_halves(&mut self) -> bool {
-        let Some(log) = self.log.as_mut() else {
+    /// Starts a row; `true` once one is written. The halves report their
+    /// diagnostics in answer to the refresh `GetBatteryHalves` asks for, after
+    /// its reply, so a board serving both has them read [`DIAG_SETTLE`] later
+    /// and the row carries this poll's; the halves' uptimes date them.
+    fn start_row(&mut self, now: Instant) -> bool {
+        if self.log.is_none() {
             return false;
-        };
+        }
         let mut halves = Halves::default();
         if self.battery {
             match self.link.request_background::<GetBatteryHalves>(()) {
                 Ok(levels) => (halves.left, halves.right) = levels_of(levels),
                 Err(error) => log::warn!("herd battery: {error}"),
             }
+            if self.side.serves(caps::HALVES_DIAG) {
+                self.pending = Some((halves, now + DIAG_SETTLE));
+                return false;
+            }
         }
+        self.write_row(halves)
+    }
+
+    /// Finishes the started row once its diagnostics are due; `true` if it did.
+    fn finish_row(&mut self, now: Instant) -> bool {
+        match self.pending {
+            Some((halves, due)) if now >= due => {
+                self.pending = None;
+                self.write_row(halves)
+            }
+            _ => false,
+        }
+    }
+
+    /// Appends `halves` with the diagnostics the board holds now.
+    fn write_row(&mut self, mut halves: Halves) -> bool {
         if self.side.serves(caps::HALVES_DIAG) {
             match self.link.request_background::<GetHalvesDiag>(()) {
                 Ok(diag) => {
@@ -77,11 +102,24 @@ impl Board {
                 Err(error) => log::warn!("herd diag: {error}"),
             }
         }
-        if let Err(error) = log.append(halves) {
-            log::warn!("herd battery: {error:#}");
-        }
-        true
+        append(&mut self.log, halves)
     }
+
+    fn next_due(&self) -> Instant {
+        self.pending
+            .map_or(self.next_log, |(_, due)| due.min(self.next_log))
+    }
+}
+
+/// `false` when there is no log to append to.
+fn append(log: &mut Option<Log>, halves: Halves) -> bool {
+    let Some(log) = log.as_mut() else {
+        return false;
+    };
+    if let Err(error) = log.append(halves) {
+        log::warn!("herd battery: {error:#}");
+    }
+    true
 }
 
 fn levels_of(levels: BatteryHalves) -> (Option<u8>, Option<u8>) {
@@ -179,7 +217,8 @@ impl Herd {
             side,
             battery,
             log,
-            next_log: now,
+            next_log: now + LOG_EVERY,
+            pending: None,
         };
         let usage = UsageSummary::from((self.read_usage)());
         let stats = &mut self.stats;
@@ -190,9 +229,8 @@ impl Herd {
         if !fed {
             return;
         }
-        if board.log_halves() {
+        if board.start_row(now) {
             self.stats.log_rows += 1;
-            board.next_log = now + LOG_EVERY;
         }
         self.boards.insert(id, board);
     }
@@ -235,8 +273,11 @@ impl Herd {
             self.next_usage = now + HEARTBEAT;
         }
         for board in self.boards.values_mut() {
+            if board.finish_row(now) {
+                self.stats.log_rows += 1;
+            }
             if now >= board.next_log {
-                if board.log_halves() {
+                if board.start_row(now) {
                     self.stats.log_rows += 1;
                 }
                 board.next_log = now + LOG_EVERY;
@@ -251,7 +292,7 @@ impl Herd {
     pub(crate) fn next_due(&self) -> Instant {
         self.boards
             .values()
-            .map(|board| board.next_log)
+            .map(Board::next_due)
             .chain([self.next_usage, self.next_summary])
             .min()
             .unwrap_or(self.next_usage)
@@ -323,7 +364,11 @@ where
     }
 }
 
-fn mark_gap(board: Board) {
+/// Writes a started row with the levels it has, then the gap.
+fn mark_gap(mut board: Board) {
+    if let Some((halves, _)) = board.pending.take() {
+        append(&mut board.log, halves);
+    }
     if let Some(mut log) = board.log {
         if let Err(error) = log.mark_gap() {
             log::warn!("herd battery: {error:#}");
@@ -366,6 +411,7 @@ pub(crate) fn spawn(
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU16, Ordering};
 
     use rmk_types_rynk::protocol::rynk::command::Endpoint as _;
     use rmk_types_rynk::protocol::rynk::ergohaven::ERGOHAVEN_RYNK_REVISION;
@@ -419,9 +465,12 @@ mod tests {
 
     impl Fake {
         /// A board answering `GetSideInfo` with `side` (`None`: `UnknownCmd`)
-        /// and reporting `ergohaven_caps` in its handshake.
+        /// and reporting `ergohaven_caps` in its handshake. Like the firmware,
+        /// it holds the diagnostics the last `GetBatteryHalves` refresh brought:
+        /// their left wake-ups count the refreshes.
         fn new(side: Option<SideInfo>, ergohaven_caps: u32) -> Self {
             let (feed, fed) = mpsc::channel();
+            let refreshes = AtomicU16::new(0);
             let board =
                 FakeBoard::new(move |header: RynkHeader, payload: &[u8]| match header.cmd {
                     Cmd::GetErgohavenInfo => vec![ok(
@@ -443,15 +492,20 @@ mod tests {
                         let _ = feed.send(Fed::Usage(postcard::from_bytes(payload).unwrap()));
                         vec![ok(header, ())]
                     }
-                    cmd if cmd == GetBatteryHalves::CMD => vec![ok(
-                        header,
-                        BatteryHalves {
-                            mask: 1,
-                            left: 80,
-                            right: 0xFF,
-                        },
-                    )],
-                    cmd if cmd == GetHalvesDiag::CMD => vec![ok(header, diag())],
+                    cmd if cmd == GetBatteryHalves::CMD => {
+                        refreshes.fetch_add(1, Ordering::Relaxed);
+                        vec![ok(
+                            header,
+                            BatteryHalves {
+                                mask: 1,
+                                left: 80,
+                                right: 0xFF,
+                            },
+                        )]
+                    }
+                    cmd if cmd == GetHalvesDiag::CMD => {
+                        vec![ok(header, diag(refreshes.load(Ordering::Relaxed)))]
+                    }
                     _ => handshake(header, 512).into_iter().collect(),
                 });
             Self { board, fed }
@@ -483,11 +537,11 @@ mod tests {
         }
     }
 
-    fn diag() -> HalvesDiag {
+    fn diag(wakes: u16) -> HalvesDiag {
         HalvesDiag {
             left: HalfDiag {
                 sleep: Some(SleepStats {
-                    wakes: 7,
+                    wakes,
                     awake_min: 30,
                     uptime_min: 600,
                 }),
@@ -634,22 +688,60 @@ mod tests {
         let now = Instant::now();
         let logs = dir.0.clone();
         let mut herd = Herd::new(usage, move |_| Some(Log::in_dir(&logs)), now);
+        let battery = dir.0.join("battery.csv");
 
         herd.attach(fake.link("log"), now);
-        let battery = dir.0.join("battery.csv");
+        assert_eq!(
+            herd.boards.values().next().unwrap().next_due(),
+            now + DIAG_SETTLE
+        );
+        herd.tick(now + DIAG_SETTLE - Duration::from_millis(1));
+        assert!(rows(&battery).is_empty());
+        herd.tick(now + DIAG_SETTLE);
         let logged = rows(&battery);
         assert_eq!(logged.len(), 2, "{logged:?}");
-        assert!(logged[1].contains(",80,,7,30,600,,,,"), "{}", logged[1]);
+        // The diagnostics of this row's own refresh, the first.
+        assert!(logged[1].contains(",80,,1,30,600,,,,"), "{}", logged[1]);
 
         herd.tick(now + LOG_EVERY / 2);
         assert_eq!(rows(&battery).len(), 2);
         herd.tick(now + LOG_EVERY);
-        assert_eq!(rows(&battery).len(), 3);
+        assert_eq!(rows(&battery).len(), 2);
+        herd.tick(now + LOG_EVERY + DIAG_SETTLE);
+        let logged = rows(&battery);
+        assert_eq!(logged.len(), 3);
+        assert!(logged[2].contains(",80,,2,30,600,,,,"), "{}", logged[2]);
 
         herd.detach(&PhysicalId("herd-log".to_owned()));
         let logged = rows(&battery);
         assert_eq!(logged.len(), 4);
         assert!(logged[3].ends_with(&",".repeat(12)), "{}", logged[3]);
+    }
+
+    #[test]
+    fn a_board_gone_before_its_diagnostics_keeps_the_levels() {
+        let dir = TempDir::new("settle");
+        let fake = Fake::new(
+            Some(side(caps::HALVES_DIAG)),
+            ergohaven::caps::BATTERY_HALVES,
+        );
+        let now = Instant::now();
+        let logs = dir.0.clone();
+        let mut herd = Herd::new(usage, move |_| Some(Log::in_dir(&logs)), now);
+
+        herd.attach(fake.link("settle"), now);
+        herd.detach(&PhysicalId("herd-settle".to_owned()));
+
+        let logged = rows(&dir.0.join("battery.csv"));
+        assert_eq!(logged.len(), 3, "{logged:?}");
+        let cells: Vec<_> = logged[1].split(',').collect();
+        assert_eq!(cells[1..3], ["80", ""]);
+        assert!(
+            cells[3..].iter().all(|cell| cell.is_empty()),
+            "{}",
+            logged[1]
+        );
+        assert!(logged[2].ends_with(&",".repeat(12)), "{}", logged[2]);
     }
 
     #[test]
