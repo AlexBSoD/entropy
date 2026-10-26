@@ -600,6 +600,7 @@ bulk = "command {cmd}: a reply page that cannot be right"
 read_only = "read-only session: command {cmd} was not sent"
 
 [rynk_read]
+title = "Keyboard read report"
 losses = "the editor cannot show all of these entries from the keyboard:"
 combo = "combo {index}: {detail}"
 tap_dance = "Tap Dance {index}: {detail}"

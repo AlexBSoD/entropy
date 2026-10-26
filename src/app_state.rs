@@ -1229,6 +1229,12 @@ pub(crate) struct ConnectResult {
     /// Readiness and immutable metadata for Bluetooth data loaded after the
     /// first usable layer is shown.
     pub(crate) deferred_load: DeferredDeviceLoadState,
+    /// What the editor cannot show of the entries a Rynk board holds.
+    pub(crate) rynk_read_losses: Vec<(
+        crate::rynk::dynamic::DynamicSlot,
+        u8,
+        crate::rynk::dynamic::DynamicLoss,
+    )>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]

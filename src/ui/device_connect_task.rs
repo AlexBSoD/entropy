@@ -765,6 +765,7 @@ impl EntropyApp {
         }
         #[cfg(test)]
         let test_hid = self.test_connect_hid.take();
+        let language = self.app_settings.language;
 
         std::thread::spawn(move || {
             let progress = |message: &str| -> Result<(), String> {
@@ -776,7 +777,7 @@ impl EntropyApp {
             };
             let result = (|| -> Result<ConnectResult, String> {
                 if dev.firmware == FirmwareProtocol::Rynk {
-                    return Self::connect_rynk(&dev, &progress);
+                    return Self::connect_rynk(&dev, language, &progress);
                 }
                 use crate::hid::HidDevice;
 
@@ -1635,6 +1636,7 @@ impl EntropyApp {
                     layer_count,
                     supported_qmk_settings,
                     deferred_load,
+                    rynk_read_losses: Vec::new(),
                 })
             })();
 

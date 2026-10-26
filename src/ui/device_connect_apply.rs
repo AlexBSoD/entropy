@@ -164,6 +164,7 @@ mod tests {
             layer_names_from_firmware: Default::default(),
             supported_qmk_settings: Default::default(),
             deferred_load: Default::default(),
+            rynk_read_losses: Vec::new(),
         }
     }
 
@@ -1460,6 +1461,16 @@ impl EntropyApp {
                 self.hid_device = r.hid_device;
                 self.supported_qmk_settings = r.supported_qmk_settings;
                 self.deferred_device_load = r.deferred_load;
+                if !r.rynk_read_losses.is_empty() {
+                    let language = self.app_settings.language;
+                    self.import_report_title =
+                        crate::i18n::tr_catalog(language, "rynk_read.title").into();
+                    self.import_report_body = crate::rynk::dynamic::describe_dynamic_losses(
+                        language,
+                        &r.rynk_read_losses,
+                    );
+                    self.import_report_open = true;
+                }
 
                 // A headless export only reads: no display preset write-back,
                 // no clock/layout bridges left running on the keyboard.
@@ -1703,6 +1714,7 @@ mod qa_followup_reconnect {
             layer_names_from_firmware: Default::default(),
             supported_qmk_settings: Default::default(),
             deferred_load: Default::default(),
+            rynk_read_losses: Vec::new(),
         }
     }
     fn poll_upload(app: &mut EntropyApp, ctx: &egui::Context) {

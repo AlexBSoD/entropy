@@ -11,6 +11,8 @@ use super::device_connect_task::{
     use_device_name_for_unnamed_layout,
 };
 use super::*;
+use crate::rynk::client::RynkClientError;
+use crate::rynk::dynamic::{DynamicLoss, DynamicSlot};
 use crate::rynk::link::{PhysicalId, RynkLink};
 use crate::rynk::session::RynkSession;
 use crate::rynk::{dynamic, keycode};
@@ -19,8 +21,12 @@ use rmk_types_rynk::protocol::rynk::ergohaven::caps;
 impl EntropyApp {
     pub(super) fn connect_rynk(
         dev: &Device,
+        language: crate::i18n::Language,
         progress: &dyn Fn(&str) -> Result<(), String>,
     ) -> Result<ConnectResult, String> {
+        let rynk_failed = |what: &str, error: RynkClientError| {
+            format!("{what} failed: {}", error.describe(language))
+        };
         progress("Opening Rynk link…")?;
         log::info!("Opening Rynk board {} at {}", dev.name, dev.path);
         let link = RynkLink::open(&PhysicalId(dev.path.clone())).map_err(|error| {
@@ -29,7 +35,7 @@ impl EntropyApp {
                 dev.name,
                 dev.path
             );
-            format!("Open failed: {error}")
+            rynk_failed("Open", error)
         })?;
         let session = RynkSession::new(link);
         let info = session.info().clone();
@@ -40,14 +46,14 @@ impl EntropyApp {
         let definition = session
             .link()
             .run(move |client| client.read_board_definition(hash))
-            .map_err(|error| format!("Definition read failed: {error}"))?;
-        let json =
-            crate::hid::decode_vial_definition(&definition).map_err(failed("Definition decode"))?;
+            .map_err(|error| rynk_failed("Definition read", error))?;
+        let json = crate::hid::decode_vial_definition(&definition)
+            .map_err(failed(language, "Definition decode"))?;
 
         progress("Querying settings…")?;
         let supported_qmk_settings = session
             .setting_keys()
-            .map_err(failed("Setting list read"))?;
+            .map_err(failed(language, "Setting list read"))?;
         let has_qmk_setting = |qsid: u16| supported_qmk_settings.contains(&qsid);
 
         progress("Parsing keyboard layout…")?;
@@ -76,7 +82,7 @@ impl EntropyApp {
         for layer in 0..layer_count {
             let actions = session
                 .keymap_layer(layer as u8)
-                .map_err(failed("Keymap read"))?;
+                .map_err(failed(language, "Keymap read"))?;
             for (index, key) in layout.keys.iter().enumerate() {
                 let at = key.row as usize * layout.cols + key.col as usize;
                 if let Some(&action) = actions.get(at) {
@@ -101,7 +107,7 @@ impl EntropyApp {
             }
             let name = session
                 .get_qmk_setting_string(qsid)
-                .map_err(failed("Layer name read"))?;
+                .map_err(failed(language, "Layer name read"))?;
             *current = Some(name.clone());
             if !name.is_empty() {
                 layout.layer_names[layer] = name;
@@ -132,6 +138,7 @@ impl EntropyApp {
             }
         }
 
+        let mut read_losses = Vec::new();
         if !layout.encoders.is_empty() {
             progress("Reading encoders…")?;
             layout.encoder_layers = vec![vec![0u16; layout.encoders.len()]; layer_count];
@@ -140,9 +147,11 @@ impl EntropyApp {
                 for index in 0..layout.encoder_count() {
                     let action = session
                         .encoder(layer as u8, index as u8)
-                        .map_err(failed("Encoder read"))?;
+                        .map_err(failed(language, "Encoder read"))?;
                     keycodes.push(shown(
-                        &format!("encoder {index} on layer {layer}"),
+                        &mut read_losses,
+                        DynamicSlot::Encoder { layer: layer as u8 },
+                        index as u8,
                         dynamic::encoder_keycodes(action),
                     ));
                 }
@@ -161,7 +170,7 @@ impl EntropyApp {
             Some(
                 session
                     .layout_options()
-                    .map_err(failed("Layout options read"))?,
+                    .map_err(failed(language, "Layout options read"))?,
             )
         };
 
@@ -170,26 +179,35 @@ impl EntropyApp {
         let macro_memory_bytes = capabilities.macro_space_size;
         let macro_buffer = session
             .macro_buffer(macro_memory_bytes, macro_count)
-            .map_err(failed("Macro read"))?;
+            .map_err(failed(language, "Macro read"))?;
         let macro_texts = crate::hid::HidDevice::parse_macros(&macro_buffer, macro_count);
 
         progress("Reading combos…")?;
         let combo_entries: Vec<ComboEntry> = session
             .read_combos()
-            .map_err(failed("Combo read"))?
+            .map_err(failed(language, "Combo read"))?
             .iter()
             .enumerate()
-            .map(|(index, combo)| shown(&format!("combo {index}"), dynamic::combo_entry(combo)))
+            .map(|(index, combo)| {
+                shown(
+                    &mut read_losses,
+                    DynamicSlot::Combo,
+                    index as u8,
+                    dynamic::combo_entry(combo),
+                )
+            })
             .collect();
         progress("Reading tap dance entries…")?;
         let tap_dance_entries: Vec<crate::keycode_picker::TapDanceEntry> = session
             .read_morses()
-            .map_err(failed("Tap dance read"))?
+            .map_err(failed(language, "Tap dance read"))?
             .iter()
             .enumerate()
             .map(|(index, morse)| {
                 shown(
-                    &format!("tap dance {index}"),
+                    &mut read_losses,
+                    DynamicSlot::TapDance,
+                    index as u8,
                     dynamic::tap_dance_entry(morse),
                 )
             })
@@ -197,12 +215,14 @@ impl EntropyApp {
         progress("Reading key overrides…")?;
         let key_override_entries: Vec<KeyOverrideEntry> = session
             .read_forks()
-            .map_err(failed("Key override read"))?
+            .map_err(failed(language, "Key override read"))?
             .iter()
             .enumerate()
             .map(|(index, fork)| {
                 shown(
-                    &format!("key override {index}"),
+                    &mut read_losses,
+                    DynamicSlot::KeyOverride,
+                    index as u8,
                     dynamic::key_override_entry(fork),
                 )
             })
@@ -318,23 +338,31 @@ impl EntropyApp {
             layer_count,
             supported_qmk_settings,
             deferred_load: DeferredDeviceLoadState::complete(layer_count),
+            rynk_read_losses: read_losses,
         })
     }
 }
 
 const QK_REPEAT_KEY: u16 = 0x7C79;
 
-/// What the editor shows of a slot; what it cannot show is logged, since
-/// writing the slot back replaces it.
-fn shown<T>(slot: &str, (entry, losses): (T, Vec<dynamic::DynamicLoss>)) -> T {
-    if !losses.is_empty() {
-        log::warn!("Rynk {slot}: the editor cannot show {losses:?}");
-    }
+/// What the editor shows of an entry. What it cannot show goes to the report
+/// after connect, since editing the entry replaces it.
+fn shown<T>(
+    losses: &mut Vec<(DynamicSlot, u8, DynamicLoss)>,
+    slot: DynamicSlot,
+    index: u8,
+    (entry, lost): (T, Vec<DynamicLoss>),
+) -> T {
+    losses.extend(lost.into_iter().map(|loss| (slot, index, loss)));
     entry
 }
 
-fn failed(what: &'static str) -> impl Fn(anyhow::Error) -> String {
-    move |error| format!("{what} failed: {error:#}")
+/// What failed, and what the board's answer means when it gave one.
+fn failed(language: crate::i18n::Language, what: &'static str) -> impl Fn(anyhow::Error) -> String {
+    move |error| match error.downcast_ref::<RynkClientError>() {
+        Some(rynk) => format!("{what} failed: {}", rynk.describe(language)),
+        None => format!("{what} failed: {error:#}"),
+    }
 }
 
 #[cfg(test)]
@@ -353,6 +381,10 @@ mod tests {
 
     fn key(code: HidKeyCode) -> KeyAction {
         KeyAction::Single(Action::Key(KeyCode::Hid(code)))
+    }
+
+    fn tap_a() -> KeyAction {
+        KeyAction::Tap(Action::Key(KeyCode::Hid(HidKeyCode::A)))
     }
 
     fn compressed(json: serde_json::Value) -> Vec<u8> {
@@ -388,12 +420,16 @@ mod tests {
         stored.settings.insert(200, b"Base\0".to_vec());
         // Named as Entropy names it, so connect has no name to sync.
         stored.settings.insert(201, b"1\0".to_vec());
-        stored.capabilities.max_combos = 1;
-        stored.combos = vec![Combo::new(
-            [key(HidKeyCode::A), key(HidKeyCode::B)],
-            key(HidKeyCode::C),
-            None,
-        )];
+        stored.capabilities.max_combos = 2;
+        stored.combos = vec![
+            Combo::new(
+                [key(HidKeyCode::A), key(HidKeyCode::B)],
+                key(HidKeyCode::C),
+                None,
+            ),
+            // A key the editor has no keycode for.
+            Combo::new([tap_a(), key(HidKeyCode::B)], key(HidKeyCode::C), None),
+        ];
         stored.capabilities.max_morse = 1;
         let mut morse = Morse::default();
         morse
@@ -421,12 +457,18 @@ mod tests {
         }
     }
 
+    fn connect(path: &str) -> Result<ConnectResult, String> {
+        EntropyApp::connect_rynk(&rynk_device(path), crate::i18n::Language::English, &|_| {
+            Ok(())
+        })
+    }
+
     #[test]
     fn a_rynk_board_loads_in_full_without_a_write() {
         let (board, state) = board(stored());
         let _held = link("connect-full", &board);
 
-        let result = EntropyApp::connect_rynk(&rynk_device("connect-full"), &|_| Ok(())).unwrap();
+        let result = connect("connect-full").unwrap();
 
         assert_eq!(result.layout.firmware, FirmwareProtocol::Rynk);
         assert_eq!(result.layer_count, 2);
@@ -437,6 +479,11 @@ mod tests {
         assert_eq!(result.layer_names_from_firmware, [true, true]);
         assert_eq!(result.combo_entries[0].keys, [0x04, 0x05, 0, 0]);
         assert_eq!(result.combo_entries[0].output, KeyBinding::Vial(0x06));
+        assert_eq!(
+            result.rynk_read_losses,
+            [(DynamicSlot::Combo, 1, DynamicLoss::Key(tap_a()))],
+            "what the editor cannot show is reported"
+        );
         assert_eq!(result.tap_dance_entries[0].on_tap, KeyBinding::Vial(0x04));
         assert_eq!(result.key_override_entries.len(), 1);
         assert_eq!(result.macro_texts[0], b"hi");
@@ -468,8 +515,7 @@ mod tests {
         let (board, _) = board(stored);
         let _held = link("connect-matrix", &board);
 
-        let Err(error) = EntropyApp::connect_rynk(&rynk_device("connect-matrix"), &|_| Ok(()))
-        else {
+        let Err(error) = connect("connect-matrix") else {
             panic!("a board whose matrix differs connected");
         };
         assert!(error.contains("differs"), "{error}");
@@ -500,7 +546,8 @@ mod tests {
             .as_ref()
             .is_some_and(crate::device_session::DeviceSession::is_rynk));
         assert_eq!(app.firmware, FirmwareProtocol::Rynk);
-        assert_eq!(app.combo_entries.len(), 1);
+        assert_eq!(app.combo_entries.len(), 2);
         assert_eq!(app.keycode_picker.macro_texts[0], b"hi");
+        assert!(app.import_report_open, "the losses are shown after connect");
     }
 }
