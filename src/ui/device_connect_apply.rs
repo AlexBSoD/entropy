@@ -616,7 +616,12 @@ mod tests {
             .send(Ok(vec![connection_device("B"), connection_device("A")]))
             .unwrap();
         app.poll_device_scan(&ctx);
-        assert_eq!(app.selected_device, Some(0));
+        // The scan lists B first; the list keeps its rows and the selection B.
+        assert_eq!(
+            app.selected_device
+                .map(|index| app.device_manager.devices()[index].stable_identity()),
+            Some(connection_device("B").stable_identity())
+        );
         assert_eq!(app.current_device_name, "Current B");
         assert!(app.hid_device.is_some());
         assert!(requests.try_recv().is_err());
@@ -625,7 +630,11 @@ mod tests {
         app.poll_connect(&ctx);
         let (target, _new_a_tx) = requests.try_recv().unwrap();
         assert_eq!(target.serial_number, "A");
-        assert_eq!(app.selected_device, Some(1));
+        assert_eq!(
+            app.selected_device
+                .map(|index| app.device_manager.devices()[index].stable_identity()),
+            Some(target.stable_identity())
+        );
         assert!(app.hid_device.is_none());
         assert!(app.layout.is_none());
     }
