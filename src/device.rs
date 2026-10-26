@@ -399,6 +399,37 @@ impl Device {
         self.vendor_id == ERGOHAVEN_VENDOR_ID
             && (K04_QUBE_PRODUCT_ID_START..=K04_QUBE_PRODUCT_ID_END).contains(&self.product_id)
     }
+
+    /// A Rynk board as its bus describes it; `path` is the link's id.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn from_rynk_board(board: crate::rynk::transport::FoundBoard) -> Self {
+        Self {
+            name: board
+                .product
+                .unwrap_or_else(|| "Unknown Keyboard".to_owned()),
+            vendor_id: board.vendor_id,
+            product_id: board.product_id,
+            manufacturer: board.manufacturer.unwrap_or_default(),
+            serial_number: board.serial.unwrap_or_default(),
+            bus_type: "Usb".to_owned(),
+            path: board.id.0,
+            instance_token: String::new(),
+            firmware: FirmwareProtocol::Rynk,
+        }
+    }
+}
+
+/// Rynk boards on USB. Finding them opens nothing, so the USB-only scan may
+/// take them too.
+#[cfg(not(target_arch = "wasm32"))]
+fn rynk_usb_devices() -> Vec<Device> {
+    match crate::rynk::transport::scan() {
+        Ok(boards) => boards.into_iter().map(Device::from_rynk_board).collect(),
+        Err(error) => {
+            log::warn!("Rynk USB scan failed: {error}");
+            Vec::new()
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -537,7 +568,11 @@ impl DeviceManager {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn scan_usb_devices() -> Result<Vec<Device>, String> { usb_discovery::scan() }
+    pub fn scan_usb_devices() -> Result<Vec<Device>, String> {
+        let mut devices = usb_discovery::scan()?;
+        devices.extend(rynk_usb_devices());
+        Ok(devices)
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     pub fn scan_devices() -> Result<Vec<Device>, String> {
@@ -599,6 +634,7 @@ impl DeviceManager {
             merge_bluez_vial_devices(&mut devices, bluez_devices);
         }
 
+        devices.extend(rynk_usb_devices());
         Ok(devices)
     }
 

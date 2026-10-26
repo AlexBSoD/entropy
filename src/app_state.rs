@@ -1158,7 +1158,7 @@ pub(crate) struct ConnectResult {
     /// Lock state and physical unlock keys reported by Vial during connect.
     pub(crate) vial_unlock_status: Option<(bool, Vec<(u8, u8)>)>,
     /// Open HID connection used during loading; kept for live writes just like vial-gui.
-    pub(crate) hid_device: Option<crate::hid::HidDevice>,
+    pub(crate) hid_device: Option<crate::device_session::DeviceSession>,
     pub(crate) layout: KeyboardLayout,
     pub(crate) layer_count: usize,
     /// Device/protocol summary shown by the About Device page.

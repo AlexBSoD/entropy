@@ -191,6 +191,7 @@ pub(crate) use hid_settings::{qmk_setting_string_value, BatteryHalves};
 
 #[path = "hid_vial.rs"]
 mod hid_vial;
+pub(crate) use hid_vial::decode_vial_definition;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub struct HidDevice {

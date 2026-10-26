@@ -325,11 +325,11 @@ fn save_cached_qmk_settings(cache_key: &str, context: &QmkSettingsCacheContext, 
     }
 }
 
-fn normalize_reported_layer_count(reported_layer_count: usize) -> usize {
+pub(super) fn normalize_reported_layer_count(reported_layer_count: usize) -> usize {
     reported_layer_count.max(1)
 }
 
-fn use_device_name_for_unnamed_layout(layout: &mut KeyboardLayout, device_name: &str) {
+pub(super) fn use_device_name_for_unnamed_layout(layout: &mut KeyboardLayout, device_name: &str) {
     if layout.name.trim().is_empty() || layout.name.eq_ignore_ascii_case("unknown") {
         let device_name = device_name.trim();
         if !device_name.is_empty() {
@@ -354,7 +354,7 @@ fn is_default_layer_name(index: usize, name: &str) -> bool {
         || trimmed.eq_ignore_ascii_case(&format!("layer {index}"))
 }
 
-fn has_firmware_layer_names(names: &[String]) -> bool {
+pub(super) fn has_firmware_layer_names(names: &[String]) -> bool {
     names
         .iter()
         .enumerate()
@@ -388,7 +388,7 @@ fn firmware_layer_name(
     }
 }
 
-fn layer_name_sync_updates(
+pub(super) fn layer_name_sync_updates(
     names: &[String],
     current_names: &[Option<String>],
     supported_qmk_settings: &[u16],
@@ -775,6 +775,9 @@ impl EntropyApp {
                 Ok(())
             };
             let result = (|| -> Result<ConnectResult, String> {
+                if dev.firmware == FirmwareProtocol::Rynk {
+                    return Self::connect_rynk(&dev, &progress);
+                }
                 use crate::hid::HidDevice;
 
                 progress("Opening HID device…")?;
@@ -1596,7 +1599,7 @@ impl EntropyApp {
                     device_name: dev.name.clone(),
                     keyboard_id,
                     vial_unlock_status,
-                    hid_device: Some(dev_conn),
+                    hid_device: Some(dev_conn.into()),
                     about_info,
                     layer_names_from_firmware,
                     macro_texts,

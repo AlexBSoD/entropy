@@ -1,0 +1,506 @@
+//! Connecting to a Rynk board: the same [`ConnectResult`] the Vial connect
+//! builds, read through the board's link.
+//!
+//! The board hands out the Vial definition, setting ids and values Vial
+//! carries, so the layout and settings load through the Vial path's own code.
+//! Keys, macros and dynamic entries are read as Rynk types and shown the way
+//! the editors hold them. A USB board loads in full here; nothing is deferred.
+
+use super::device_connect_task::{
+    has_firmware_layer_names, layer_name_sync_updates, normalize_reported_layer_count,
+    use_device_name_for_unnamed_layout,
+};
+use super::*;
+use crate::rynk::link::{PhysicalId, RynkLink};
+use crate::rynk::session::RynkSession;
+use crate::rynk::{dynamic, keycode};
+use rmk_types_rynk::protocol::rynk::ergohaven::caps;
+
+impl EntropyApp {
+    pub(super) fn connect_rynk(
+        dev: &Device,
+        progress: &dyn Fn(&str) -> Result<(), String>,
+    ) -> Result<ConnectResult, String> {
+        progress("Opening Rynk link…")?;
+        log::info!("Opening Rynk board {} at {}", dev.name, dev.path);
+        let link = RynkLink::open(&PhysicalId(dev.path.clone())).map_err(|error| {
+            log::warn!(
+                "Rynk board {} at {} did not open: {error}",
+                dev.name,
+                dev.path
+            );
+            format!("Open failed: {error}")
+        })?;
+        let session = RynkSession::new(link);
+        let info = session.info().clone();
+        let capabilities = *session.capabilities();
+
+        progress("Reading keyboard definition…")?;
+        let hash = info.definition_hash;
+        let definition = session
+            .link()
+            .run(move |client| client.read_board_definition(hash))
+            .map_err(|error| format!("Definition read failed: {error}"))?;
+        let json =
+            crate::hid::decode_vial_definition(&definition).map_err(failed("Definition decode"))?;
+
+        progress("Querying settings…")?;
+        let supported_qmk_settings = session
+            .setting_keys()
+            .map_err(failed("Setting list read"))?;
+        let has_qmk_setting = |qsid: u16| supported_qmk_settings.contains(&qsid);
+
+        progress("Parsing keyboard layout…")?;
+        let mut layout = KeyboardLayout::from_vial_json(&json)
+            .map_err(|error| format!("Layout parse failed: {error}"))?;
+        layout.firmware = FirmwareProtocol::Rynk;
+        // The host-data bridges still speak Vial; a Rynk board gets none yet.
+        layout.live_features = Default::default();
+        use_device_name_for_unnamed_layout(&mut layout, &dev.name);
+        if (layout.rows, layout.cols)
+            != (
+                capabilities.num_rows as usize,
+                capabilities.num_cols as usize,
+            )
+        {
+            return Err(format!(
+                "Definition matrix {}x{} differs from the board's {}x{}",
+                layout.rows, layout.cols, capabilities.num_rows, capabilities.num_cols
+            ));
+        }
+        let layer_count = normalize_reported_layer_count(capabilities.num_layers as usize);
+        layout.layers =
+            vec![vec![crate::keyboard::KeyBinding::default(); layout.keys.len()]; layer_count];
+
+        progress("Reading keymap…")?;
+        for layer in 0..layer_count {
+            let actions = session
+                .keymap_layer(layer as u8)
+                .map_err(failed("Keymap read"))?;
+            for (index, key) in layout.keys.iter().enumerate() {
+                let at = key.row as usize * layout.cols + key.col as usize;
+                if let Some(&action) = actions.get(at) {
+                    layout.layers[layer][index] = keycode::key_binding(action);
+                }
+            }
+        }
+
+        if layout.layer_names.len() < layer_count {
+            let start = layout.layer_names.len();
+            layout
+                .layer_names
+                .extend((start..layer_count).map(|layer| layer.to_string()));
+        }
+        layout.layer_names.truncate(layer_count);
+        let mut current_firmware_layer_names = vec![None; layer_count];
+        let mut layer_names_from_firmware = vec![false; layer_count];
+        for (layer, current) in current_firmware_layer_names.iter_mut().enumerate() {
+            let qsid = 200 + layer as u16;
+            if !has_qmk_setting(qsid) {
+                continue;
+            }
+            let name = session
+                .get_qmk_setting_string(qsid)
+                .map_err(failed("Layer name read"))?;
+            *current = Some(name.clone());
+            if !name.is_empty() {
+                layout.layer_names[layer] = name;
+                layer_names_from_firmware[layer] = true;
+            }
+        }
+        if !has_firmware_layer_names(&layout.layer_names) {
+            if let Some(saved) = load_saved_layer_names(&dev.name) {
+                for (layer, name) in saved.into_iter().enumerate().take(layer_count) {
+                    if !layer_names_from_firmware[layer] && !name.trim().is_empty() {
+                        layout.layer_names[layer] = name;
+                    }
+                }
+            }
+        }
+        let layer_name_updates = layer_name_sync_updates(
+            &layout.layer_names,
+            &current_firmware_layer_names,
+            &supported_qmk_settings,
+        );
+        if !layer_name_updates.is_empty() {
+            progress("Syncing layer names…")?;
+            for (qsid, name) in layer_name_updates {
+                let value = crate::hid::qmk_setting_string_value(&name);
+                if let Err(error) = session.set_setting(qsid, value) {
+                    log::warn!("Rynk layer name sync failed for qsid {qsid}: {error:#}");
+                }
+            }
+        }
+
+        if !layout.encoders.is_empty() {
+            progress("Reading encoders…")?;
+            layout.encoder_layers = vec![vec![0u16; layout.encoders.len()]; layer_count];
+            for layer in 0..layer_count {
+                let mut keycodes = Vec::with_capacity(layout.encoder_count());
+                for index in 0..layout.encoder_count() {
+                    let action = session
+                        .encoder(layer as u8, index as u8)
+                        .map_err(failed("Encoder read"))?;
+                    keycodes.push(shown(
+                        &format!("encoder {index} on layer {layer}"),
+                        dynamic::encoder_keycodes(action),
+                    ));
+                }
+                for (visual, encoder) in layout.encoders.iter().enumerate() {
+                    if let Some([ccw, cw]) = keycodes.get(encoder.encoder_idx as usize) {
+                        layout.encoder_layers[layer][visual] =
+                            if encoder.direction == 0 { *ccw } else { *cw };
+                    }
+                }
+            }
+        }
+
+        let layout_options_value = if layout.layout_options.is_empty() {
+            None
+        } else {
+            Some(
+                session
+                    .layout_options()
+                    .map_err(failed("Layout options read"))?,
+            )
+        };
+
+        progress("Reading macros…")?;
+        let macro_count = capabilities.max_macros;
+        let macro_memory_bytes = capabilities.macro_space_size;
+        let macro_buffer = session
+            .macro_buffer(macro_memory_bytes, macro_count)
+            .map_err(failed("Macro read"))?;
+        let macro_texts = crate::hid::HidDevice::parse_macros(&macro_buffer, macro_count);
+
+        progress("Reading combos…")?;
+        let combo_entries: Vec<ComboEntry> = session
+            .read_combos()
+            .map_err(failed("Combo read"))?
+            .iter()
+            .enumerate()
+            .map(|(index, combo)| shown(&format!("combo {index}"), dynamic::combo_entry(combo)))
+            .collect();
+        progress("Reading tap dance entries…")?;
+        let tap_dance_entries: Vec<crate::keycode_picker::TapDanceEntry> = session
+            .read_morses()
+            .map_err(failed("Tap dance read"))?
+            .iter()
+            .enumerate()
+            .map(|(index, morse)| {
+                shown(
+                    &format!("tap dance {index}"),
+                    dynamic::tap_dance_entry(morse),
+                )
+            })
+            .collect();
+        progress("Reading key overrides…")?;
+        let key_override_entries: Vec<KeyOverrideEntry> = session
+            .read_forks()
+            .map_err(failed("Key override read"))?
+            .iter()
+            .enumerate()
+            .map(|(index, fork)| {
+                shown(
+                    &format!("key override {index}"),
+                    dynamic::key_override_entry(fork),
+                )
+            })
+            .collect();
+
+        progress("Reading QMK settings values…")?;
+        let behavior_settings = Self::read_behavior_settings(&supported_qmk_settings, &session);
+        let touchpad_settings =
+            Self::read_touchpad_settings(&json, &supported_qmk_settings, &session);
+        let bluetooth_settings =
+            Self::read_bluetooth_settings(&json, &supported_qmk_settings, &session);
+        progress("Reading module settings…")?;
+        let module_settings = Self::read_module_settings(&json, &supported_qmk_settings, &session);
+        let layer_led_settings =
+            Self::read_layer_led_settings(&json, &supported_qmk_settings, layer_count, &session);
+
+        let supports_battery_halves = info.caps & caps::BATTERY_HALVES != 0;
+        let battery_halves = if supports_battery_halves {
+            match session.battery_halves() {
+                Ok(halves) => Some(halves),
+                Err(error) => {
+                    log::warn!("Rynk battery read failed: {error:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // As RMK's Vial connect reported them: caps word on, no layer lock or
+        // alt repeat; Repeat is there when its keycode maps.
+        let vial_features = VialFeatureSupport {
+            caps_word: true,
+            layer_lock: false,
+            persistent_default_layer: true,
+            repeat_key: keycode::vial_keycode_action(QK_REPEAT_KEY).is_some(),
+            alt_repeat_key: false,
+        };
+        let keyboard_id = u64::from_le_bytes(info.keyboard_uid);
+        let firmware = info.firmware;
+        let about_info = DeviceAboutInfo {
+            manufacturer: dev.manufacturer.clone(),
+            product: dev.name.clone(),
+            vendor_id: dev.vendor_id,
+            product_id: dev.product_id,
+            path: dev.path.clone(),
+            firmware_version: Some(format!(
+                "{}.{}.{}",
+                firmware.major, firmware.minor, firmware.patch
+            )),
+            // Picking the release to update to is left to the Rynk update path.
+            firmware_update_target: None,
+            supports_battery_halves,
+            battery_halves,
+            keyboard_id,
+            macro_entries: macro_texts.len(),
+            macro_memory_bytes: Some(macro_memory_bytes),
+            supports_macro_delays: !macro_texts.is_empty(),
+            tap_dance_entries: tap_dance_entries.len(),
+            combo_entries: combo_entries.len(),
+            key_override_entries: key_override_entries.len(),
+            caps_word: vial_features.caps_word,
+            layer_lock: vial_features.layer_lock,
+            qmk_settings: !supported_qmk_settings.is_empty(),
+            ..Default::default()
+        };
+        let vial_unlock_status = match session.unlock_status() {
+            Ok((unlocked, in_progress, keys)) => Some((unlocked && !in_progress, keys)),
+            Err(error) => {
+                log::warn!("Rynk lock status read failed: {error:#}");
+                None
+            }
+        };
+
+        progress("Applying keyboard layout…")?;
+        Ok(ConnectResult {
+            device_name: dev.name.clone(),
+            keyboard_id,
+            vial_unlock_status,
+            hid_device: Some(session.into()),
+            about_info,
+            layer_names_from_firmware,
+            macro_texts,
+            supports_macro_ext_keycodes: false,
+            supports_rmk_native_key_actions: false,
+            supports_universal_symbols: false,
+            supports_universal_russian_letters: false,
+            supports_rmk_native_combo_output: false,
+            supports_rmk_native_tap_dance_actions: false,
+            supports_rmk_combo_layers: true,
+            macro_ext_keycodes_disabled_reason: None,
+            tap_dance_entries,
+            combo_entries,
+            combo_term: behavior_settings.combo_term,
+            auto_shift_options: behavior_settings.auto_shift_options,
+            auto_shift_timeout: behavior_settings.auto_shift_timeout,
+            mouse_keys_settings: behavior_settings.mouse_keys,
+            touchpad_settings,
+            bluetooth_settings,
+            module_settings,
+            tap_hold_settings: behavior_settings.tap_hold,
+            magic_settings: behavior_settings.magic,
+            one_shot_settings: behavior_settings.one_shot,
+            grave_escape_settings: behavior_settings.grave_escape,
+            layer_led_settings,
+            rgb_settings: RgbSettingsState::default(),
+            display_settings: DisplaySettingsState::default(),
+            layout_options_value,
+            key_override_entries,
+            alt_repeat_entries: Vec::new(),
+            vial_features,
+            layout,
+            layer_count,
+            supported_qmk_settings,
+            deferred_load: DeferredDeviceLoadState::complete(layer_count),
+        })
+    }
+}
+
+const QK_REPEAT_KEY: u16 = 0x7C79;
+
+/// What the editor shows of a slot; what it cannot show is logged, since
+/// writing the slot back replaces it.
+fn shown<T>(slot: &str, (entry, losses): (T, Vec<dynamic::DynamicLoss>)) -> T {
+    if !losses.is_empty() {
+        log::warn!("Rynk {slot}: the editor cannot show {losses:?}");
+    }
+    entry
+}
+
+fn failed(what: &'static str) -> impl Fn(anyhow::Error) -> String {
+    move |error| format!("{what} failed: {error:#}")
+}
+
+#[cfg(test)]
+mod tests {
+    use rmk_types_rynk::action::{Action, KeyAction};
+    use rmk_types_rynk::combo::Combo;
+    use rmk_types_rynk::fork::Fork;
+    use rmk_types_rynk::keyboard_macros::MacroOp;
+    use rmk_types_rynk::keycode::{HidKeyCode, KeyCode};
+    use rmk_types_rynk::morse::{Morse, TAP};
+    use rmk_types_rynk::protocol::rynk::ergohaven::BatteryHalves;
+
+    use super::*;
+    use crate::keyboard::KeyBinding;
+    use crate::rynk::session::testing::{board, link, Stored};
+
+    fn key(code: HidKeyCode) -> KeyAction {
+        KeyAction::Single(Action::Key(KeyCode::Hid(code)))
+    }
+
+    fn compressed(json: serde_json::Value) -> Vec<u8> {
+        let text = json.to_string();
+        let mut out = Vec::new();
+        lzma_rs::xz_compress(&mut text.as_bytes(), &mut out).unwrap();
+        out
+    }
+
+    /// A two-key board with two layers, one of everything, and a battery.
+    fn stored() -> Stored {
+        let mut stored = Stored::new(1, 2, 2);
+        stored.definition = compressed(serde_json::json!({
+            "name": "Rynk fixture",
+            "matrix": {"rows": 1, "cols": 2},
+            "layouts": {"keymap": [["0,0", "0,1"]]}
+        }));
+        stored.keyboard_uid = [1, 2, 3, 4, 5, 6, 7, 8];
+        stored.caps = caps::BATTERY_HALVES;
+        stored.battery = Some(BatteryHalves {
+            mask: 0b01,
+            left: 77,
+            right: 0xFF,
+        });
+        // Layer 1, then layer 2; `Tap` has no keycode of its own.
+        stored.keymap = vec![
+            key(HidKeyCode::A),
+            KeyAction::Tap(Action::Key(KeyCode::Hid(HidKeyCode::A))),
+            key(HidKeyCode::B),
+            KeyAction::No,
+        ];
+        stored.settings.insert(2, vec![200, 0]);
+        stored.settings.insert(200, b"Base\0".to_vec());
+        // Named as Entropy names it, so connect has no name to sync.
+        stored.settings.insert(201, b"1\0".to_vec());
+        stored.capabilities.max_combos = 1;
+        stored.combos = vec![Combo::new(
+            [key(HidKeyCode::A), key(HidKeyCode::B)],
+            key(HidKeyCode::C),
+            None,
+        )];
+        stored.capabilities.max_morse = 1;
+        let mut morse = Morse::default();
+        morse
+            .put(TAP, Action::Key(KeyCode::Hid(HidKeyCode::A)))
+            .unwrap();
+        stored.morses = vec![morse];
+        stored.capabilities.max_forks = 1;
+        stored.forks = vec![Fork::empty()];
+        stored.capabilities.max_macros = 1;
+        stored.macros = vec![vec![MacroOp::Char(b'h'), MacroOp::Char(b'i')]];
+        stored
+    }
+
+    fn rynk_device(path: &str) -> Device {
+        Device {
+            name: "Rynk fixture".into(),
+            vendor_id: 0xE126,
+            product_id: 0x0074,
+            manufacturer: "Ergohaven".into(),
+            serial_number: "rynk:010203".into(),
+            bus_type: "Usb".into(),
+            path: path.into(),
+            instance_token: String::new(),
+            firmware: FirmwareProtocol::Rynk,
+        }
+    }
+
+    #[test]
+    fn a_rynk_board_loads_in_full_without_a_write() {
+        let (board, state) = board(stored());
+        let _held = link("connect-full", &board);
+
+        let result = EntropyApp::connect_rynk(&rynk_device("connect-full"), &|_| Ok(())).unwrap();
+
+        assert_eq!(result.layout.firmware, FirmwareProtocol::Rynk);
+        assert_eq!(result.layer_count, 2);
+        assert_eq!(result.layout.layers[0][0], KeyBinding::Vial(0x04));
+        assert!(matches!(result.layout.layers[0][1], KeyBinding::Rynk(_)));
+        assert_eq!(result.layout.layers[1][0], KeyBinding::Vial(0x05));
+        assert_eq!(result.layout.layer_names[0], "Base");
+        assert_eq!(result.layer_names_from_firmware, [true, true]);
+        assert_eq!(result.combo_entries[0].keys, [0x04, 0x05, 0, 0]);
+        assert_eq!(result.combo_entries[0].output, KeyBinding::Vial(0x06));
+        assert_eq!(result.tap_dance_entries[0].on_tap, KeyBinding::Vial(0x04));
+        assert_eq!(result.key_override_entries.len(), 1);
+        assert_eq!(result.macro_texts[0], b"hi");
+        assert_eq!(result.combo_term, Some(200));
+        assert_eq!(result.supported_qmk_settings, [2, 200, 201]);
+        assert_eq!(
+            result.keyboard_id,
+            u64::from_le_bytes([1, 2, 3, 4, 5, 6, 7, 8])
+        );
+        assert_eq!(result.about_info.keyboard_id, result.keyboard_id);
+        let battery = result.about_info.battery_halves.unwrap();
+        assert_eq!((battery.left, battery.right), (Some(77), None));
+        assert!(result
+            .hid_device
+            .as_ref()
+            .is_some_and(crate::device_session::DeviceSession::is_rynk));
+        assert!(
+            !result.deferred_load.is_staged(),
+            "nothing is left for later"
+        );
+        assert_eq!(state.lock().unwrap().writes(), [], "loading writes nothing");
+    }
+
+    #[test]
+    fn a_definition_of_another_matrix_is_refused() {
+        let mut stored = stored();
+        stored.capabilities.num_cols = 3;
+        stored.keymap.resize(6, KeyAction::No);
+        let (board, _) = board(stored);
+        let _held = link("connect-matrix", &board);
+
+        let Err(error) = EntropyApp::connect_rynk(&rynk_device("connect-matrix"), &|_| Ok(()))
+        else {
+            panic!("a board whose matrix differs connected");
+        };
+        assert!(error.contains("differs"), "{error}");
+    }
+
+    #[test]
+    fn picking_a_rynk_board_connects_it_through_the_connect_worker() {
+        let (board, _) = board(stored());
+        let _held = link("connect-worker", &board);
+        let mut app = EntropyApp::new_inert_for_test();
+        app.device_manager
+            .replace_devices(vec![rynk_device("connect-worker")]);
+
+        app.start_connect(0);
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while matches!(app.connect_state, ConnectState::Loading { .. }) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "connect never finished"
+            );
+            app.poll_connect(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(app
+            .hid_device
+            .as_ref()
+            .is_some_and(crate::device_session::DeviceSession::is_rynk));
+        assert_eq!(app.firmware, FirmwareProtocol::Rynk);
+        assert_eq!(app.combo_entries.len(), 1);
+        assert_eq!(app.keycode_picker.macro_texts[0], b"hi");
+    }
+}

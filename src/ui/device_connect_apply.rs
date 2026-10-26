@@ -124,7 +124,7 @@ mod tests {
             device_name: name.to_owned(),
             keyboard_id: 0xDEAD165,
             vial_unlock_status: Default::default(),
-            hid_device: Some(crate::hid::HidDevice::test_device().0),
+            hid_device: Some(crate::hid::HidDevice::test_device().0.into()),
             layout: KeyboardLayout::from_vial_json(&serde_json::json!({
                 "name": name, "matrix": {"rows": 1, "cols": 1},
                 "layouts": {"keymap": [["0,0"]]}
@@ -1455,8 +1455,9 @@ impl EntropyApp {
                 self.shared_hid_output = r
                     .hid_device
                     .as_ref()
+                    .and_then(crate::device_session::DeviceSession::as_vial)
                     .and_then(crate::hid::HidDevice::shared_output);
-                self.hid_device = r.hid_device.map(Into::into);
+                self.hid_device = r.hid_device;
                 self.supported_qmk_settings = r.supported_qmk_settings;
                 self.deferred_device_load = r.deferred_load;
 
@@ -1540,7 +1541,10 @@ impl EntropyApp {
     /// never a masked transport error.
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn write_layer_names_to_firmware(&self, names: &[String]) -> Vec<usize> {
-        if self.firmware != FirmwareProtocol::Vial {
+        if !matches!(
+            self.firmware,
+            FirmwareProtocol::Vial | FirmwareProtocol::Rynk
+        ) {
             return Vec::new();
         }
         let Some(dev) = &self.hid_device else {
@@ -1659,7 +1663,7 @@ mod qa_followup_reconnect {
             device_name: device.name.clone(),
             keyboard_id: keyboard_id,
             vial_unlock_status: Default::default(),
-            hid_device: Some(hid),
+            hid_device: Some(hid.into()),
             layout: layout(),
             layer_count: 1,
             about_info: DeviceAboutInfo {

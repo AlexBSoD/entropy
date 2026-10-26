@@ -123,6 +123,8 @@ mod grave_escape_settings_ui;
 mod key_assignment;
 #[path = "ui/layer_operations.rs"]
 mod layer_operations;
+#[path = "ui/rynk_connect.rs"]
+mod rynk_connect;
 #[cfg(not(target_arch = "wasm32"))]
 #[path = "standby_background.rs"]
 mod standby_background;
