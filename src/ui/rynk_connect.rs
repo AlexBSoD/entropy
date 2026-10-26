@@ -675,6 +675,32 @@ mod tests {
     }
 
     #[test]
+    fn a_rynk_board_whose_link_broke_is_opened_again_while_plugged_in() {
+        use rmk_types_rynk::protocol::rynk::{command, Cmd};
+
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (board, _) = board(stored());
+        let first = link("link-broke", &board);
+        let mut app = connected("link-broke");
+        board.unplug_on(Cmd::GetCurrentLayer);
+        assert!(first.request::<command::GetCurrentLayer>(()).is_err());
+        assert!(!first.is_open());
+
+        // The port lists the board as before; its next link is the one a
+        // connect finds.
+        let second = link("link-broke", &board);
+        let devices = app.device_manager.devices().to_vec();
+        app.apply_device_scan_result(devices);
+        finish_connect(&mut app);
+        let session = app
+            .hid_device
+            .as_ref()
+            .and_then(crate::device_session::DeviceSession::as_rynk)
+            .expect("the board is connected again");
+        assert!(std::sync::Arc::ptr_eq(session.link(), &second));
+    }
+
+    #[test]
     fn a_locked_rynk_board_locks_its_matrix_but_not_its_edits() {
         let mut stored = stored();
         stored.lock = Some(rmk_types_rynk::protocol::rynk::LockStatus {

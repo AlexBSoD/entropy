@@ -432,12 +432,17 @@ impl EntropyApp {
                     log::info!("USB HID endpoint was re-enumerated; reopening the device");
                     self.start_connect(idx);
                 } else if (self.layout.is_none()
-                    || (self.hid_device.is_none() && !self.hid_write_task_owner_active()))
+                    || (self.hid_device.is_none() && !self.hid_write_task_owner_active())
+                    || self
+                        .hid_device
+                        .as_ref()
+                        .is_some_and(crate::device_session::DeviceSession::link_lost))
                     && !was_loading
                 {
                     // A failed USB settings write can drop the HID owner while
-                    // discovery still reports the same path/instance. Do not
-                    // wait for another OS re-enumeration to reopen it.
+                    // discovery still reports the same path/instance, and a
+                    // Rynk link can break under a board that stays plugged in.
+                    // Do not wait for another OS re-enumeration to reopen it.
                     self.start_connect(idx);
                 } else {
                     self.sync_qmk_hid_host_bridges();

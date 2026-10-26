@@ -228,7 +228,12 @@ impl EntropyApp {
 
             // A worker temporarily borrows the handle; it is still the same
             // active transport and must not authorize full Bluetooth enumeration.
-            let hid_session_active = self.hid_device.is_some()
+            // A Rynk session whose link broke is over: the next full scan,
+            // which reopens its board, is not held back as for a live one.
+            let hid_session_active = self
+                .hid_device
+                .as_ref()
+                .is_some_and(|session| !session.link_lost())
                 || self.hid_write_task_owner_active()
                 || matches!(self.connect_state, ConnectState::Loading { .. });
             let bluetooth_busy = (selected_device_is_bluetooth && hid_session_active)
