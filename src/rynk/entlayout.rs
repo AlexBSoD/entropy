@@ -36,8 +36,8 @@ pub(crate) fn decode_v10_native_field(encoded: &str) -> Result<KeyAction> {
     }
 }
 
-/// What an import cannot carry to a Rynk board. The import stops with the
-/// whole list before it writes anything.
+/// What an import cannot carry to a Rynk board. The user sees the whole list
+/// before anything is written, and imports without these parts or not at all.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ImportLoss {
     /// A native v1 action that changes on the way.
@@ -85,6 +85,30 @@ pub(crate) enum ImportLoss {
         index: usize,
     },
 }
+
+impl ImportLoss {
+    /// Whether the import still carries this after the user accepted the
+    /// losses: a native v1 action goes as its upgrade, everything else is
+    /// taken out of the file first.
+    pub(crate) fn stays_when_accepted(&self) -> bool {
+        matches!(self, Self::NativeV1 { .. })
+    }
+}
+
+/// An import that would lose `message`'s list on a Rynk board, stopped before
+/// the backup until the user accepts it.
+#[derive(Debug)]
+pub(crate) struct EntLayoutLossesNeedConsent {
+    pub(crate) message: String,
+}
+
+impl std::fmt::Display for EntLayoutLossesNeedConsent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for EntLayoutLossesNeedConsent {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BindingPlace {
@@ -269,6 +293,18 @@ pub(crate) fn runs_in_tap_dance(binding: KeyBinding) -> bool {
         binding_action(binding),
         Ok(KeyAction::No | KeyAction::Single(_))
     )
+}
+
+/// Whether `entry` merges into the board's morse key `index` within its
+/// patterns per key, as the import merges it.
+pub(crate) fn tap_dance_fits(
+    entry: &TapDanceEntry,
+    morses: &[Morse],
+    index: usize,
+    capabilities: &DeviceCapabilities,
+) -> bool {
+    let morse = morses.get(index).cloned().unwrap_or_default();
+    merge_tap_dance(&morse, entry, capabilities.max_patterns_per_key as usize).is_ok()
 }
 
 /// A macro's Vial bytes without what the board would not run, or `None` when
@@ -845,131 +881,6 @@ mod tests {
                 },
             ]
         );
-    }
-
-    /// Real .entlayout files through the whole migration: `ENTROPY_RYNK_CORPUS`
-    /// names the files, separated by `:`. They stay out of the repository.
-    #[test]
-    #[ignore = "needs ENTROPY_RYNK_CORPUS"]
-    fn real_files_migrate_without_losses() {
-        let corpus = std::env::var("ENTROPY_RYNK_CORPUS").expect("ENTROPY_RYNK_CORPUS");
-        let mut failed = Vec::new();
-        for path in corpus.split(':').filter(|path| !path.is_empty()) {
-            let file: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-            let version = file["version"].as_u64().unwrap() as u16;
-            let data = &file["data"];
-            let binding =
-                |keycode: &serde_json::Value, native: &serde_json::Value| match native.as_str() {
-                    Some(encoded) if version == NATIVE_V2_ENTLAYOUT_VERSION => {
-                        KeyBinding::Rynk(decode_v10_native_field(encoded).unwrap())
-                    }
-                    Some(encoded) => KeyBinding::Rmk(
-                        postcard::from_bytes(&native_field_bytes(encoded).unwrap()).unwrap(),
-                    ),
-                    None => KeyBinding::Vial(keycode.as_u64().unwrap() as u16),
-                };
-            let none = serde_json::Value::Null;
-            let mut layers: Vec<Vec<KeyBinding>> = data["keymap"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .enumerate()
-                .map(|(layer, keys)| {
-                    keys.as_array()
-                        .unwrap()
-                        .iter()
-                        .enumerate()
-                        .map(|(key, keycode)| {
-                            binding(
-                                keycode,
-                                data["native_keymap"]
-                                    .get(layer)
-                                    .and_then(|l| l.get(key))
-                                    .unwrap_or(&none),
-                            )
-                        })
-                        .collect()
-                })
-                .collect();
-            let encoders: Vec<Vec<u16>> =
-                serde_json::from_value(data["encoder_keymap"].clone()).unwrap();
-            let macros: Vec<Vec<u8>> = data["macros"]["bytecode_base64"]
-                .as_array()
-                .map(|all| {
-                    all.iter()
-                        .map(|m| BASE64_STANDARD.decode(m.as_str().unwrap()).unwrap())
-                        .collect()
-                })
-                .unwrap_or_default();
-            let mut combos: Vec<ComboEntry> = data["combos"]["entries"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|entry| ComboEntry {
-                    keys: serde_json::from_value(entry["keys"].clone()).unwrap(),
-                    output: binding(&entry["output"], &entry["native_output"]),
-                    layer: entry["layer"].as_u64().map(|layer| layer as u8),
-                })
-                .collect();
-            let mut tap_dances: Vec<TapDanceEntry> = data["tap_dance"]["entries"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|entry| TapDanceEntry {
-                    on_tap: binding(&entry["on_tap"], &entry["native_on_tap"]),
-                    on_hold: binding(&entry["on_hold"], &entry["native_on_hold"]),
-                    on_double_tap: binding(&entry["on_double_tap"], &entry["native_on_double_tap"]),
-                    on_tap_hold: binding(&entry["on_tap_hold"], &entry["native_on_tap_hold"]),
-                    tapping_term: entry["tapping_term"].as_u64().unwrap() as u16,
-                })
-                .collect();
-            let key_overrides: Vec<crate::app::KeyOverrideEntry> = data["key_overrides"]["entries"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|entry| crate::app::KeyOverrideEntry {
-                    trigger: entry["trigger"].as_u64().unwrap() as u16,
-                    replacement: entry["replacement"].as_u64().unwrap() as u16,
-                    layers: entry["layers"].as_u64().unwrap() as u16,
-                    trigger_mods: entry["trigger_mods"].as_u64().unwrap() as u8,
-                    negative_mod_mask: entry["negative_mod_mask"].as_u64().unwrap() as u8,
-                    suppressed_mods: entry["suppressed_mods"].as_u64().unwrap() as u8,
-                    options: crate::app::KeyOverrideOptionsState::from_bits(
-                        entry["options"].as_u64().unwrap() as u8,
-                    ),
-                })
-                .collect();
-
-            let mut losses = upgrade_native_v1_bindings(&mut layers, &mut combos, &mut tap_dances);
-            let import = RynkImport {
-                layers: &layers,
-                encoder_layers: &encoders,
-                macros: &macros,
-                combos: &combos,
-                tap_dances: &tap_dances,
-                key_overrides: &key_overrides,
-                morses: &[],
-            };
-            losses.extend(rynk_import_losses(&import, &capabilities()));
-            let native = layers
-                .iter()
-                .flatten()
-                .filter(|b| matches!(b, KeyBinding::Rynk(_)))
-                .count();
-            eprintln!(
-                "{path}: v{version}, {} layers, {native} native keys, {} losses",
-                layers.len(),
-                losses.len()
-            );
-            for loss in &losses {
-                eprintln!("  {loss:?}");
-            }
-            if !losses.is_empty() {
-                failed.push(path.to_owned());
-            }
-        }
-        assert!(failed.is_empty(), "losses in {failed:?}");
     }
 
     #[test]

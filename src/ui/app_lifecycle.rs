@@ -122,7 +122,7 @@ impl EntropyApp {
     /// Shared ownership gate for shortcuts on pages behind app modals.
     pub(super) fn modal_or_popup_open(&self, ctx: &egui::Context) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
-        let import_pending = self.import_pending();
+        let import_pending = self.import_pending() || self.entlayout_losses_prompt.is_some();
         #[cfg(target_arch = "wasm32")]
         let import_pending = false;
         self.application_categories_open
@@ -352,14 +352,23 @@ impl EntropyApp {
                     self.import_report_body = report;
                     self.import_report_open = true;
                 }
-                Err(e) => self.report_import_failure(
-                    "status_messages.layout_import_failed_title",
-                    crate::i18n::tr_catalog_format(
-                        self.app_settings.language,
-                        "status_messages.import_failed",
-                        &[("error", &format!("{e:#}"))],
-                    ),
-                ),
+                Err(e) => {
+                    match e.downcast::<crate::rynk::entlayout::EntLayoutLossesNeedConsent>() {
+                        // Nothing is written yet: the user decides on the list.
+                        Ok(losses) => {
+                            self.entlayout_losses_prompt =
+                                Some((path, opened_generation, losses.message));
+                        }
+                        Err(e) => self.report_import_failure(
+                            "status_messages.layout_import_failed_title",
+                            crate::i18n::tr_catalog_format(
+                                self.app_settings.language,
+                                "status_messages.import_failed",
+                                &[("error", &format!("{e:#}"))],
+                            ),
+                        ),
+                    }
+                }
             }
         }
         if let Some(path) = self.pending_entsettings_import_path.take() {
@@ -563,6 +572,117 @@ impl EntropyApp {
             );
         });
     }
+
+    /// What a Rynk board would not take from an `.entlayout`, and the choice
+    /// to import without it or to leave the board as it is.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn draw_entlayout_losses_prompt(&mut self, ctx: &egui::Context) {
+        let Some((_, _, message)) = &self.entlayout_losses_prompt else {
+            return;
+        };
+        let lang = self.app_settings.language;
+        let body = format!(
+            "{}\n{message}",
+            crate::i18n::tr_catalog(lang, "entlayout.rynk_losses_hint")
+        );
+        let screen_rect = ctx.content_rect();
+        egui::Area::new("entlayout_losses_backdrop".into())
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen_rect.min)
+            .show(ctx, |ui| {
+                let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, screen_rect.size());
+                ui.interact(
+                    rect,
+                    egui::Id::new("entlayout_losses_backdrop_blocker"),
+                    egui::Sense::click_and_drag(),
+                );
+                ui.painter().rect_filled(
+                    rect,
+                    0.0,
+                    Color32::from_black_alpha(crate::ui_style::modal_backdrop_alpha(
+                        ctx.global_style().visuals.dark_mode,
+                    )),
+                );
+            });
+
+        let mut open = true;
+        let mut import_clicked = false;
+        let mut cancel_clicked = false;
+        crate::ui_style::centered_modal_window(
+            ctx,
+            crate::i18n::tr_catalog(lang, "entlayout.rynk_losses_title"),
+            egui::Id::new("entlayout_losses_window"),
+            &mut open,
+            Vec2::new(680.0, 620.0),
+        )
+        .show(ctx, |ui| {
+            ui.set_min_size(Vec2::new(660.0, 560.0));
+            let rect = ui.max_rect();
+            let content_rect = egui::Rect::from_min_max(
+                egui::pos2(rect.left() + 34.0, rect.top() + 18.0),
+                egui::pos2(rect.right() - 34.0, rect.bottom() - 74.0),
+            );
+            let button_size = crate::ui_style::modal_action_button_size();
+            let button_gap = 10.0;
+            let button_rect = egui::Rect::from_center_size(
+                egui::pos2(rect.center().x, rect.bottom() - 34.0),
+                egui::vec2(button_size.x * 2.0 + button_gap, button_size.y),
+            );
+
+            crate::ui_style::allocate_ui_at_rect(ui, content_rect, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(content_rect.height())
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(content_rect.width() - 18.0);
+                        Self::draw_import_report_text(ui, &body);
+                    });
+            });
+
+            crate::ui_style::allocate_ui_at_rect(ui, button_rect, |ui| {
+                ui.allocate_ui_with_layout(
+                    button_rect.size(),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        if crate::ui_style::modern_button(
+                            ui,
+                            crate::i18n::tr_catalog(lang, "common.cancel"),
+                            button_size,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            cancel_clicked = true;
+                        }
+                        ui.add_space(button_gap);
+                        if crate::ui_style::modern_button(
+                            ui,
+                            crate::i18n::tr_catalog(lang, "entlayout.rynk_losses_import"),
+                            button_size,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            import_clicked = true;
+                        }
+                    },
+                );
+            });
+        });
+
+        if import_clicked {
+            if let Some((path, generation, _)) = self.entlayout_losses_prompt.take() {
+                self.begin_entlayout_import(path.clone());
+                // The retry belongs to the connection the file was chosen for.
+                self.pending_entlayout_import_path = Some((path.clone(), generation));
+                self.entlayout_losses_accepted = Some(path);
+            }
+        } else if cancel_clicked || !open {
+            self.entlayout_losses_prompt = None;
+            self.status_msg =
+                crate::i18n::tr_catalog(lang, "status_messages.import_cancelled").into();
+        }
+    }
 }
 
 fn should_write_dynamic_entries(
@@ -685,6 +805,55 @@ mod tests {
             crate::i18n::tr_catalog(
                 app.app_settings.language,
                 "status_messages.file_dialog_device_changed"
+            )
+        );
+    }
+
+    #[test]
+    fn a_rynk_import_asks_about_its_losses_and_other_failures_say_why() {
+        let storage = crate::app::app_storage::ScopedTempConfig::new();
+        let mut app = EntropyApp::new_inert_for_test();
+        let ctx = egui::Context::default();
+        // A key a Rynk board cannot hold.
+        let mut layout = KeyboardLayout::from_vial_json(&serde_json::json!({
+            "matrix": { "rows": 1, "cols": 1 },
+            "layouts": { "keymap": [["0,0"]] }
+        }))
+        .unwrap();
+        layout.layers = vec![vec![crate::keyboard::KeyBinding::Vial(0x7000)]];
+        app.layout = Some(layout);
+        let file = storage.path().join("lossy.entlayout");
+        std::fs::write(&file, app.entlayout_export_json().unwrap().unwrap()).unwrap();
+        let stored = crate::rynk::session::testing::Stored::new(1, 1, 1);
+        let (board, state) = crate::rynk::session::testing::board(stored);
+        let link = crate::rynk::session::testing::link("import-consent", &board);
+        app.hid_device = Some(crate::device_session::DeviceSession::Rynk(
+            crate::rynk::session::RynkSession::new(link),
+        ));
+
+        // What the board would lose waits for the user, before any write.
+        app.begin_entlayout_import(file.clone());
+        app.handle_pending_imports(&ctx, 1.0);
+        app.handle_pending_imports(&ctx, 1.1);
+        assert!(app
+            .entlayout_losses_prompt
+            .as_ref()
+            .is_some_and(|(path, _, _)| *path == file));
+        assert!(!app.import_report_open);
+        assert_eq!(state.lock().unwrap().writes(), []);
+
+        // Any other failure says why in the report window.
+        app.entlayout_losses_prompt = None;
+        app.begin_entlayout_import(storage.path().join("missing.entlayout"));
+        app.handle_pending_imports(&ctx, 2.0);
+        app.handle_pending_imports(&ctx, 2.1);
+        assert!(app.entlayout_losses_prompt.is_none());
+        assert!(app.import_report_open);
+        assert_eq!(
+            app.import_report_title,
+            crate::i18n::tr_catalog(
+                app.app_settings.language,
+                "status_messages.layout_import_failed_title",
             )
         );
     }
@@ -1985,6 +2154,8 @@ impl eframe::App for EntropyApp {
             });
             self.import_report_open = open && !close_clicked;
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.draw_entlayout_losses_prompt(ctx);
 
         self.draw_close_to_tray_prompt(ctx);
 

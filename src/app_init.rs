@@ -186,6 +186,8 @@ impl EntropyApp {
             import_report_title: String::new(),
             import_report_body: String::new(),
             pending_entlayout_import_path: None,
+            entlayout_losses_prompt: None,
+            entlayout_losses_accepted: None,
             pending_file_dialog: None,
             connection_generation: 0,
             parent_window_handle: None,

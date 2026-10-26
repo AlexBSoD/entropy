@@ -1060,6 +1060,11 @@ impl EntropyApp {
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn import_entlayout_from_path(&mut self, path: &Path) -> Result<String> {
         let lang = self.app_settings.language;
+        // Consent covers one try of the file it was given for.
+        let losses_accepted = self
+            .entlayout_losses_accepted
+            .take()
+            .is_some_and(|accepted| accepted == path);
         let data = std::fs::read_to_string(path).with_context(|| {
             crate::i18n::tr_catalog_format(
                 lang,
@@ -1067,7 +1072,7 @@ impl EntropyApp {
                 &[("path", &path.display().to_string())],
             )
         })?;
-        let bundle = match read_entlayout_document(&data).context(
+        let mut bundle = match read_entlayout_document(&data).context(
             crate::i18n::tr_catalog(lang, "entlayout.invalid_entlayout_json"),
         )? {
             EntLayoutDocument::Device(bundle) => bundle,
@@ -1083,6 +1088,7 @@ impl EntropyApp {
             self.prepare_entlayout_pictograms()?;
         }
         self.validate_entlayout_file(&bundle)?;
+        self.consent_to_rynk_losses(&mut bundle, losses_accepted)?;
         let backup_path = self.write_entlayout_auto_backup()?;
         let (firmware_failures, mapping, portable_settings) = self.apply_entlayout(&bundle)?;
         Ok(self.entlayout_import_report(
@@ -2166,22 +2172,6 @@ impl EntropyApp {
                 staged_pictograms = Some(confirmed);
             }
         }
-        if let Some((capabilities, morses)) = self
-            .hid_device
-            .as_ref()
-            .and_then(crate::device_session::DeviceSession::rynk_import_context)
-        {
-            let losses = self.entlayout_rynk_losses(bundle, &mapping, &capabilities, &morses)?;
-            if !losses.is_empty() {
-                bail!(
-                    "{}",
-                    crate::rynk::entlayout::describe_import_losses(
-                        self.app_settings.language,
-                        &losses
-                    )
-                );
-            }
-        }
         let (mut firmware_failures, portable_settings) =
             self.apply_entlayout_firmware_state(bundle, &mapping)?;
         // Complete backups must finish every supported HID operation before host
@@ -2461,6 +2451,174 @@ impl EntropyApp {
             capabilities,
         ));
         Ok(losses)
+    }
+
+    /// On a Rynk board, what `bundle` cannot carry stops the import before the
+    /// backup until the user accepts the list. Accepted, the file loses those
+    /// parts the way the firmware dropped them over Vial.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn consent_to_rynk_losses(&self, bundle: &mut EntLayoutFile, accepted: bool) -> Result<()> {
+        let Some((capabilities, morses)) = self
+            .hid_device
+            .as_ref()
+            .and_then(crate::device_session::DeviceSession::rynk_import_context)
+        else {
+            return Ok(());
+        };
+        self.settle_rynk_losses(bundle, &capabilities, &morses, accepted)
+    }
+
+    fn settle_rynk_losses(
+        &self,
+        bundle: &mut EntLayoutFile,
+        capabilities: &rmk_types_rynk::protocol::rynk::DeviceCapabilities,
+        morses: &[rmk_types_rynk::morse::Morse],
+        accepted: bool,
+    ) -> Result<()> {
+        use crate::rynk::entlayout::{describe_import_losses, EntLayoutLossesNeedConsent};
+        let language = self.app_settings.language;
+        let mapping = self.entlayout_import_mapping(bundle)?;
+        let losses = self.entlayout_rynk_losses(bundle, &mapping, capabilities, morses)?;
+        if losses.is_empty() {
+            return Ok(());
+        }
+        if !accepted {
+            let message = describe_import_losses(language, &losses);
+            return Err(EntLayoutLossesNeedConsent { message }.into());
+        }
+        self.lenient_rynk_entlayout(bundle, capabilities, morses)?;
+        // Anything left here is a gap in the leniency, not the user's choice.
+        let left: Vec<_> = self
+            .entlayout_rynk_losses(bundle, &mapping, capabilities, morses)?
+            .into_iter()
+            .filter(|loss| !loss.stays_when_accepted())
+            .collect();
+        if !left.is_empty() {
+            bail!("{}", describe_import_losses(language, &left));
+        }
+        Ok(())
+    }
+
+    /// `bundle` as a Rynk board stores it after the user accepted the losses,
+    /// as the firmware stored it over Vial: keycodes without an action become
+    /// `KC_NO`, tap dance fields that are not one action are emptied, macros
+    /// drop what the board would not run and then the ones past its buffer,
+    /// and combos, tap dances and key overrides that still do not fit are
+    /// emptied. Keycodes are judged as the import maps them and stay unmapped;
+    /// entries the import skips stay as they are.
+    fn lenient_rynk_entlayout(
+        &self,
+        bundle: &mut EntLayoutFile,
+        capabilities: &rmk_types_rynk::protocol::rynk::DeviceCapabilities,
+        morses: &[rmk_types_rynk::morse::Morse],
+    ) -> Result<()> {
+        use crate::rynk::entlayout::{
+            fit_macros, lenient_keycode, lenient_macro, runs_in_tap_dance, tap_dance_fits,
+        };
+        let layout = self.layout.as_ref().context("Missing target layout")?;
+        let limits = self.entlayout_keycode_import_limits();
+        let source = bundle.clone();
+        let version = source.version;
+        let lenient = |keycode| match try_map_entlayout_keycode(keycode, &source, layout, limits) {
+            Some(mapped) if lenient_keycode(mapped) == 0 => 0,
+            _ => keycode,
+        };
+        let data = &mut bundle.data;
+
+        for keycode in data
+            .keymap
+            .iter_mut()
+            .chain(data.encoder_keymap.iter_mut())
+            .flatten()
+        {
+            *keycode = lenient(*keycode);
+        }
+
+        for (index, entry) in data.combos.entries.iter_mut().enumerate() {
+            if index < capabilities.max_combos as usize {
+                if remap_entcombo_entry(entry, &source, layout, limits).is_none() {
+                    continue;
+                }
+                for key in &mut entry.keys {
+                    *key = lenient(*key);
+                }
+                entry.output = lenient(entry.output);
+                let keys = entry.keys.iter().filter(|&&key| key != 0).count();
+                if keys <= capabilities.max_combo_keys as usize {
+                    continue;
+                }
+            }
+            entry.keys = [0; 4];
+            entry.output = 0;
+            entry.native_output = None;
+            entry.rynk_output = None;
+            entry.layer = None;
+        }
+
+        for (index, entry) in data.tap_dance.entries.iter_mut().enumerate() {
+            if index >= capabilities.max_morse as usize {
+                for (keycode, native, rynk) in enttap_dance_fields(entry) {
+                    (*keycode, *native, *rynk) = (0, None, None);
+                }
+                entry.tapping_term = 0;
+                continue;
+            }
+            let Some(remapped) = remap_enttap_dance_entry(entry, &source, layout, limits) else {
+                continue;
+            };
+            let bindings = rynk_tap_dance(version, &remapped)?;
+            for ((keycode, native, rynk), binding) in
+                enttap_dance_fields(entry).into_iter().zip(bindings)
+            {
+                if !runs_in_tap_dance(binding) {
+                    (*keycode, *native, *rynk) = (0, None, None);
+                }
+            }
+            let remapped = remap_enttap_dance_entry(entry, &source, layout, limits)
+                .context("Tap Dance mapping changed")?;
+            let [on_tap, on_hold, on_double_tap, on_tap_hold] = rynk_tap_dance(version, &remapped)?;
+            let tap_dance = crate::keycode_picker::TapDanceEntry {
+                on_tap,
+                on_hold,
+                on_double_tap,
+                on_tap_hold,
+                tapping_term: entry.tapping_term,
+            };
+            if !tap_dance_fits(&tap_dance, morses, index, capabilities) {
+                for (keycode, native, rynk) in enttap_dance_fields(entry) {
+                    (*keycode, *native, *rynk) = (0, None, None);
+                }
+            }
+        }
+
+        for (index, entry) in data.key_overrides.entries.iter_mut().enumerate() {
+            if index >= capabilities.max_forks as usize {
+                (entry.trigger, entry.replacement) = (0, 0);
+            } else if remap_entkey_override_entry(entry, &source, layout, limits).is_some() {
+                entry.trigger = lenient(entry.trigger);
+                entry.replacement = lenient(entry.replacement);
+            }
+        }
+
+        if entmacro_count(&data.macros) > 0 {
+            let mut macros = entmacro_bytecode(&data.macros)?;
+            let mut changed = false;
+            for bytes in &mut macros {
+                if let Some(kept) = lenient_macro(bytes) {
+                    *bytes = kept;
+                    changed = true;
+                }
+            }
+            changed |= !fit_macros(&mut macros, capabilities).is_empty();
+            if changed {
+                data.macros.bytecode_base64 = macros
+                    .iter()
+                    .map(|bytes| BASE64_STANDARD.encode(bytes))
+                    .collect();
+                data.macros.texts.clear();
+            }
+        }
+        Ok(())
     }
 
     fn entlayout_keycode_import_limits(&self) -> EntLayoutKeycodeImportLimits {
@@ -4091,6 +4249,62 @@ fn remap_enttap_dance_entry(
         rynk_on_tap_hold: entry.rynk_on_tap_hold,
         tapping_term: entry.tapping_term,
     })
+}
+
+/// A tap dance entry's four fields, each as its keycode, native and Rynk part.
+fn enttap_dance_fields(
+    entry: &mut EntTapDanceEntry,
+) -> [(
+    &mut u16,
+    &mut Option<String>,
+    &mut Option<rmk_types_rynk::action::KeyAction>,
+); 4] {
+    [
+        (
+            &mut entry.on_tap,
+            &mut entry.native_on_tap,
+            &mut entry.rynk_on_tap,
+        ),
+        (
+            &mut entry.on_hold,
+            &mut entry.native_on_hold,
+            &mut entry.rynk_on_hold,
+        ),
+        (
+            &mut entry.on_double_tap,
+            &mut entry.native_on_double_tap,
+            &mut entry.rynk_on_double_tap,
+        ),
+        (
+            &mut entry.on_tap_hold,
+            &mut entry.native_on_tap_hold,
+            &mut entry.rynk_on_tap_hold,
+        ),
+    ]
+}
+
+/// What a mapped tap dance entry's fields become on a Rynk board.
+fn rynk_tap_dance(
+    version: u16,
+    entry: &EntTapDanceEntry,
+) -> Result<[crate::keyboard::KeyBinding; 4]> {
+    let binding = |keycode, native: &Option<String>, rynk| {
+        entlayout_dynamic_binding(version, keycode, native.as_deref(), rynk, true)
+    };
+    Ok([
+        binding(entry.on_tap, &entry.native_on_tap, entry.rynk_on_tap)?,
+        binding(entry.on_hold, &entry.native_on_hold, entry.rynk_on_hold)?,
+        binding(
+            entry.on_double_tap,
+            &entry.native_on_double_tap,
+            entry.rynk_on_double_tap,
+        )?,
+        binding(
+            entry.on_tap_hold,
+            &entry.native_on_tap_hold,
+            entry.rynk_on_tap_hold,
+        )?,
+    ])
 }
 
 fn remap_entkey_override_entry(

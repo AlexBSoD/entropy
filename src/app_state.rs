@@ -5406,6 +5406,14 @@ pub struct EntropyApp {
     /// device B that connected in the meantime.
     pub(crate) pending_entlayout_import_path: Option<(std::path::PathBuf, u64)>,
     #[cfg(not(target_arch = "wasm32"))]
+    /// An `.entlayout` import a Rynk board would lose part of, waiting for the
+    /// user: the path and connection generation as pending, and what goes.
+    pub(crate) entlayout_losses_prompt: Option<(std::path::PathBuf, u64, String)>,
+    #[cfg(not(target_arch = "wasm32"))]
+    /// The file whose losses the user accepted: its next import goes on
+    /// without them.
+    pub(crate) entlayout_losses_accepted: Option<std::path::PathBuf>,
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) pending_entsettings_import_path: Option<std::path::PathBuf>,
     /// Cached result of scanning the IBus component directories, which the Text
     /// Expander setup page would otherwise redo on every frame. Refreshes on

@@ -103,6 +103,8 @@ impl EntropyApp {
         self.retire_selected_qmk_hid_host_bridges();
         self.pending_device_connect = None;
         self.pending_entlayout_import_path = None;
+        self.entlayout_losses_prompt = None;
+        self.entlayout_losses_accepted = None;
         self.pending_entsettings_import_path = None;
         self.import_progress_started_at = None;
         self.reset_settings_write_context();
