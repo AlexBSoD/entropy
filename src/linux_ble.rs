@@ -17,11 +17,11 @@ use zbus::blocking::{Connection, Proxy};
 use zbus::fdo::ManagedObjects;
 use zbus::zvariant::{ObjectPath, OwnedValue, Value};
 
-const BLUEZ_DESTINATION: &str = "org.bluez";
+pub(crate) const BLUEZ_DESTINATION: &str = "org.bluez";
 const BLUEZ_GATT_PREFIX: &str = "bluez-gatt:";
-const DEVICE_INTERFACE: &str = "org.bluez.Device1";
-const SERVICE_INTERFACE: &str = "org.bluez.GattService1";
-const CHARACTERISTIC_INTERFACE: &str = "org.bluez.GattCharacteristic1";
+pub(crate) const DEVICE_INTERFACE: &str = "org.bluez.Device1";
+pub(crate) const SERVICE_INTERFACE: &str = "org.bluez.GattService1";
+pub(crate) const CHARACTERISTIC_INTERFACE: &str = "org.bluez.GattCharacteristic1";
 const DESCRIPTOR_INTERFACE: &str = "org.bluez.GattDescriptor1";
 const HID_SERVICE_UUID: &str = "1812";
 const REPORT_MAP_CHARACTERISTIC_UUID: &str = "2a4b";
@@ -119,7 +119,7 @@ fn bluez_service_path(path: &str) -> Option<&str> {
         .filter(|path| path.starts_with('/'))
 }
 
-fn bluez_connection() -> Result<Connection> {
+pub(crate) fn bluez_connection() -> Result<Connection> {
     ConnectionBuilder::system()
         .context("Failed to create BlueZ D-Bus connection builder")?
         .method_timeout(BLUEZ_METHOD_TIMEOUT)
@@ -127,7 +127,7 @@ fn bluez_connection() -> Result<Connection> {
         .context("Failed to connect to the BlueZ system bus")
 }
 
-fn managed_objects(connection: &Connection) -> Result<ManagedObjects> {
+pub(crate) fn managed_objects(connection: &Connection) -> Result<ManagedObjects> {
     let proxy = ObjectManagerProxy::builder(connection)
         .destination(BLUEZ_DESTINATION)
         .context("Invalid BlueZ D-Bus destination")?
@@ -140,27 +140,36 @@ fn managed_objects(connection: &Connection) -> Result<ManagedObjects> {
         .context("Failed to enumerate BlueZ GATT objects")
 }
 
-fn property_string(properties: &HashMap<String, OwnedValue>, name: &str) -> Option<String> {
+pub(crate) fn property_string(
+    properties: &HashMap<String, OwnedValue>,
+    name: &str,
+) -> Option<String> {
     properties
         .get(name)
         .and_then(|value| <&str>::try_from(value).ok())
         .map(str::to_owned)
 }
 
-fn property_bool(properties: &HashMap<String, OwnedValue>, name: &str) -> Option<bool> {
+pub(crate) fn property_bool(properties: &HashMap<String, OwnedValue>, name: &str) -> Option<bool> {
     properties
         .get(name)
         .and_then(|value| bool::try_from(value).ok())
 }
 
-fn property_path(properties: &HashMap<String, OwnedValue>, name: &str) -> Option<String> {
+pub(crate) fn property_path(
+    properties: &HashMap<String, OwnedValue>,
+    name: &str,
+) -> Option<String> {
     properties
         .get(name)
         .and_then(|value| <&ObjectPath<'_>>::try_from(value).ok())
         .map(ToString::to_string)
 }
 
-fn property_strings(properties: &HashMap<String, OwnedValue>, name: &str) -> Vec<String> {
+pub(crate) fn property_strings(
+    properties: &HashMap<String, OwnedValue>,
+    name: &str,
+) -> Vec<String> {
     properties
         .get(name)
         .and_then(|value| value.try_clone().ok())
@@ -176,7 +185,7 @@ fn property_bytes(properties: &HashMap<String, OwnedValue>, name: &str) -> Vec<u
         .unwrap_or_default()
 }
 
-fn interface_properties<'a>(
+pub(crate) fn interface_properties<'a>(
     interfaces: &'a HashMap<zbus::names::OwnedInterfaceName, HashMap<String, OwnedValue>>,
     interface: &str,
 ) -> Option<&'a HashMap<String, OwnedValue>> {
@@ -531,7 +540,7 @@ fn select_vial_endpoints(
     endpoints
 }
 
-fn parse_bluez_modalias(modalias: &str) -> (u16, u16) {
+pub(crate) fn parse_bluez_modalias(modalias: &str) -> (u16, u16) {
     let lower = modalias.to_ascii_lowercase();
     let Some(vendor_start) = lower.find(":v").map(|index| index + 2) else {
         return (0, 0);
@@ -701,7 +710,7 @@ fn validate_service_identity(
     Ok(())
 }
 
-fn ensure_device_connected(connection: &Connection, device_path: &str) -> Result<()> {
+pub(crate) fn ensure_device_connected(connection: &Connection, device_path: &str) -> Result<()> {
     let proxy = Proxy::new(connection, BLUEZ_DESTINATION, device_path, DEVICE_INTERFACE)
         .context("Failed to create the BlueZ device proxy")?;
     let connected = proxy.get_property::<bool>("Connected").unwrap_or(false);
@@ -744,7 +753,10 @@ fn endpoints_for_service(
         .find(|endpoints| endpoints.service == service)
 }
 
-fn characteristic_proxy<'a>(connection: &'a Connection, path: &'a str) -> Result<Proxy<'a>> {
+pub(crate) fn characteristic_proxy<'a>(
+    connection: &'a Connection,
+    path: &'a str,
+) -> Result<Proxy<'a>> {
     Proxy::new(
         connection,
         BLUEZ_DESTINATION,
@@ -759,7 +771,7 @@ fn descriptor_proxy<'a>(connection: &'a Connection, path: &'a str) -> Result<Pro
         .context("Failed to create a BlueZ GATT descriptor proxy")
 }
 
-fn value_bytes(value: &Value<'_>) -> Option<Vec<u8>> {
+pub(crate) fn value_bytes(value: &Value<'_>) -> Option<Vec<u8>> {
     let array: &zbus::zvariant::Array<'_> = value.downcast_ref().ok()?;
     array.iter().map(|item| u8::try_from(item).ok()).collect()
 }

@@ -97,8 +97,7 @@ impl DeviceSession {
     pub(crate) fn is_bluetooth_transport(&self) -> bool {
         match self {
             Self::Vial(hid) => hid.is_bluetooth_transport(),
-            // Rynk boards are reached over USB only so far.
-            Self::Rynk(_) => false,
+            Self::Rynk(session) => crate::rynk::transport::is_bluetooth(session.link().id()),
         }
     }
 

@@ -99,6 +99,7 @@ impl Seen {
             manufacturer: self.manufacturer.clone(),
             product: self.product.clone(),
             serial: self.serial.clone(),
+            bluetooth: false,
         })
     }
 }

@@ -18,8 +18,8 @@ use rmk_types_rynk::protocol::rynk::Cmd;
 use super::client::{RynkBoard, RynkClient, RynkClientError, RynkTimeouts, RynkTransport};
 use super::transport;
 
-/// How long a post may wait behind other requests before it goes first. Kept
-/// well under the firmware's host-data TTL.
+/// How long a post may wait behind other requests before it goes first, so
+/// host data (time, media, layout) never shows far behind on the board.
 #[cfg(not(test))]
 const POST_MAX_WAIT: Duration = Duration::from_secs(1);
 #[cfg(test)]

@@ -411,7 +411,7 @@ impl Device {
             product_id: board.product_id,
             manufacturer: board.manufacturer.unwrap_or_default(),
             serial_number: board.serial.unwrap_or_default(),
-            bus_type: "Usb".to_owned(),
+            bus_type: if board.bluetooth { "Bluetooth" } else { "Usb" }.to_owned(),
             path: board.id.0,
             instance_token: String::new(),
             firmware: FirmwareProtocol::Rynk,
@@ -419,14 +419,14 @@ impl Device {
     }
 }
 
-/// Rynk boards on USB. Finding them opens nothing, so the USB-only scan may
-/// take them too.
+/// Rynk boards a scan found. Finding them opens nothing, so the USB-only scan
+/// may take the USB ones too.
 #[cfg(not(target_arch = "wasm32"))]
-fn rynk_usb_devices() -> Vec<Device> {
-    match crate::rynk::transport::scan() {
+fn rynk_devices(found: std::io::Result<Vec<crate::rynk::transport::FoundBoard>>) -> Vec<Device> {
+    match found {
         Ok(boards) => boards.into_iter().map(Device::from_rynk_board).collect(),
         Err(error) => {
-            log::warn!("Rynk USB scan failed: {error}");
+            log::warn!("Rynk scan failed: {error}");
             Vec::new()
         }
     }
@@ -570,7 +570,7 @@ impl DeviceManager {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn scan_usb_devices() -> Result<Vec<Device>, String> {
         let mut devices = usb_discovery::scan()?;
-        devices.extend(rynk_usb_devices());
+        devices.extend(rynk_devices(crate::rynk::transport::scan_usb()));
         Ok(devices)
     }
 
@@ -634,7 +634,7 @@ impl DeviceManager {
             merge_bluez_vial_devices(&mut devices, bluez_devices);
         }
 
-        devices.extend(rynk_usb_devices());
+        devices.extend(rynk_devices(crate::rynk::transport::scan()));
         Ok(devices)
     }
 
