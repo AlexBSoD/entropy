@@ -104,6 +104,8 @@
             # Unit tests are pure (i18n catalogs, layout parsing, bundled script
             # contents) — no keyboard, X server or network needed.
             doCheck = true;
+            # Runs the KWin script in tests.
+            nativeCheckInputs = [ pkgs.nodejs ];
             # Sandboxed builders have a non-writable HOME. Keep all test outputs
             # local to this check, without disabling persistence tests.
             preCheck = ''
@@ -258,6 +260,8 @@
               pkg-config
               # scripts/check_i18n.py
               python3
+              # Runs the KWin script in tests.
+              nodejs
             ];
 
             buildInputs = commonNativeDeps pkgs;
