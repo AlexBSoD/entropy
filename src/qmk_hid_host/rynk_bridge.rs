@@ -490,6 +490,36 @@ mod tests {
         assert_eq!(bridge.layout_label(), Some("RU"));
     }
 
+    /// K:04 Mini over Bluetooth and Phenom over USB at once: every layout
+    /// change reaches both.
+    #[test]
+    fn two_boards_get_every_layout_change() {
+        let desktop = Desktop::new();
+        desktop.show(Some(0), None);
+        let layout_only = HostDataMode {
+            time: false,
+            volume: false,
+            layout: true,
+            media: false,
+        };
+        let (bluetooth, bluetooth_received) = board(ALL_HOST_DATA);
+        let (usb, usb_received) = board(ALL_HOST_DATA);
+        let usb = usb.usb();
+        let _bridges = [
+            desktop.bridge(link("rynk-bridge-two-bt", &bluetooth), layout_only),
+            desktop.bridge(link("rynk-bridge-two-usb", &usb), layout_only),
+        ];
+
+        let expected = [0, 1, 0, 1].map(HostDataUpdate::KeyboardLayout);
+        for (count, layout) in [(2, 1), (3, 0), (4, 1)] {
+            await_updates(&bluetooth_received, count - 1);
+            await_updates(&usb_received, count - 1);
+            desktop.show(Some(layout), None);
+        }
+        assert_eq!(await_updates(&bluetooth_received, 4), expected);
+        assert_eq!(await_updates(&usb_received, 4), expected);
+    }
+
     #[test]
     fn the_board_gets_everything_at_start_then_only_what_changes() {
         let desktop = Desktop::new();

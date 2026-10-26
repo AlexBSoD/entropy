@@ -756,6 +756,7 @@ pub(crate) mod testing {
         handler: Handler,
         pending: VecDeque<u8>,
         chunk: usize,
+        usb: bool,
         sent: Vec<RynkHeader>,
         dropped: usize,
     }
@@ -775,6 +776,7 @@ pub(crate) mod testing {
                     handler: Box::new(handler),
                     pending: VecDeque::new(),
                     chunk: usize::MAX,
+                    usb: false,
                     sent: Vec::new(),
                     dropped: 0,
                 }),
@@ -785,6 +787,13 @@ pub(crate) mod testing {
         /// Replies in 32-byte HID reports, zero-padded like `RynkHidService`.
         pub(crate) fn hid_reports(self) -> Self {
             self.state().chunk = 32;
+            self
+        }
+
+        /// Takes no frame while a reply waits to be read, as over USB: the
+        /// firmware's session blocks on the reply until the host polls for it.
+        pub(crate) fn usb(self) -> Self {
+            self.state().usb = true;
             self
         }
 
@@ -825,6 +834,12 @@ pub(crate) mod testing {
             let len = deframer.next(&mut buf).expect("one whole frame");
             let header = RynkHeader::parse(buf.first_chunk().unwrap());
             let mut state = self.0.state();
+            if state.usb && !state.pending.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the board took no frame",
+                ));
+            }
             state.sent.push(header);
             for mut reply in (state.handler)(header, &buf[RYNK_HEADER_SIZE..len]) {
                 if state.chunk != usize::MAX {

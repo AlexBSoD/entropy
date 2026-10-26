@@ -240,14 +240,20 @@ impl RynkLink {
         answer.recv().map_err(|_| closed_error())?
     }
 
-    /// Sends `request` without waiting for its reply. A newer post with the
-    /// same `slot` replaces one not sent yet.
+    /// Sends `request` without the caller waiting for its reply. A newer post
+    /// with the same `slot` replaces one not sent yet.
     pub(crate) fn post<E>(&self, slot: u16, request: E::Request) -> Result<(), RynkClientError>
     where
         E: Endpoint,
         E::Request: Send + 'static,
     {
-        let job: Job = Box::new(move |client| client.send::<E>(&request).map(|_| ()));
+        // The owner still reads the reply: over USB the board takes no frame
+        // while its last reply waits for the host. What it answers matters to
+        // no one; only a link that broke ends the owner.
+        let job: Job = Box::new(move |client| match client.request::<E>(&request) {
+            Err(error) if link_failed(&error) => Err(error),
+            _ => Ok(()),
+        });
         self.send(Event::Post {
             key: PostKey { cmd: E::CMD, slot },
             queued: Instant::now(),
@@ -687,6 +693,31 @@ mod tests {
             commands(&log)[1..],
             [(Cmd::SetDefaultLayer, 5), (Cmd::GetCurrentLayer, 0)]
         );
+    }
+
+    /// Phenom over USB kept the first layout it was sent: nothing read the
+    /// post's reply, so the board took no further frame and the link broke.
+    #[test]
+    fn posts_after_posts_reach_a_board_over_usb() {
+        let (board, log) = layer_board();
+        let board = board.usb();
+        let link = RynkLink::acquire(id("usb-posts"), quick(), open(&board)).unwrap();
+        for value in 1..=3u8 {
+            link.post::<command::SetDefaultLayer>(0, value).unwrap();
+            eventually("the post is sent", || {
+                commands(&log).len() == value as usize
+            });
+        }
+        assert!(link.is_open());
+        assert_eq!(
+            commands(&log),
+            [
+                (Cmd::SetDefaultLayer, 1),
+                (Cmd::SetDefaultLayer, 2),
+                (Cmd::SetDefaultLayer, 3),
+            ]
+        );
+        assert_eq!(link.request::<command::GetCurrentLayer>(()).unwrap(), 3);
     }
 
     /// A transport that can be unplugged.
