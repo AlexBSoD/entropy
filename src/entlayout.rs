@@ -2234,6 +2234,21 @@ impl EntropyApp {
         }
         let (mut firmware_failures, portable_settings) =
             self.apply_entlayout_firmware_state(bundle, &mapping)?;
+        // A board that dropped out took nothing after the write that broke, so
+        // the editor and the saved names must not take the file either.
+        if self
+            .hid_device
+            .as_ref()
+            .is_some_and(crate::device_session::DeviceSession::link_lost)
+        {
+            let lang = self.app_settings.language;
+            bail!(
+                "{}\n\n{}: {}",
+                crate::i18n::tr_catalog(lang, "entlayout.connection_lost"),
+                crate::i18n::tr_catalog(lang, "entlayout.firmware_issues"),
+                firmware_failures.lines.join(", ")
+            );
+        }
         // Complete backups must finish every supported HID operation before host
         // settings publication or sidecar commit. Firmware itself is not atomic.
         #[cfg(not(target_arch = "wasm32"))]

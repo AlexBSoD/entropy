@@ -778,6 +778,9 @@ pub(crate) mod testing {
         usb: bool,
         sent: Vec<RynkHeader>,
         dropped: usize,
+        unplug_on: Option<Cmd>,
+        /// Bumped by an unplug: transports opened before it are dead.
+        plugged: u32,
     }
 
     /// A board in a box: decodes each frame a transport sends and queues the
@@ -798,6 +801,8 @@ pub(crate) mod testing {
                     usb: false,
                     sent: Vec::new(),
                     dropped: 0,
+                    unplug_on: None,
+                    plugged: 0,
                 }),
                 Condvar::new(),
             )))
@@ -818,7 +823,7 @@ pub(crate) mod testing {
 
         /// A transport to the board; dropping it is letting the board go.
         pub(crate) fn transport(&self) -> FakeTransport {
-            FakeTransport(self.clone())
+            FakeTransport(self.clone(), self.state().plugged)
         }
 
         /// Bytes the board sends unasked: topics, or what a session left behind.
@@ -832,6 +837,12 @@ pub(crate) mod testing {
             self.state().sent.clone()
         }
 
+        /// Pulls the board out as a frame of `cmd` is sent: the transport that
+        /// sends it breaks, and a transport opened afterwards finds the board.
+        pub(crate) fn unplug_on(&self, cmd: Cmd) {
+            self.state().unplug_on = Some(cmd);
+        }
+
         /// Transports dropped so far.
         pub(crate) fn dropped(&self) -> usize {
             self.state().dropped
@@ -842,7 +853,7 @@ pub(crate) mod testing {
         }
     }
 
-    pub(crate) struct FakeTransport(FakeBoard);
+    pub(crate) struct FakeTransport(FakeBoard, u32);
 
     impl RynkTransport for FakeTransport {
         fn send(&mut self, frame: &[u8]) -> io::Result<()> {
@@ -853,6 +864,14 @@ pub(crate) mod testing {
             let len = deframer.next(&mut buf).expect("one whole frame");
             let header = RynkHeader::parse(buf.first_chunk().unwrap());
             let mut state = self.0.state();
+            if state.plugged != self.1 {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            if state.unplug_on == Some(header.cmd) {
+                state.unplug_on = None;
+                state.plugged += 1;
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
             if state.usb && !state.pending.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -877,6 +896,9 @@ pub(crate) mod testing {
             let (mut state, _) = ready
                 .wait_timeout_while(state, timeout, |state| state.pending.is_empty())
                 .unwrap_or_else(|error| error.into_inner());
+            if state.plugged != self.1 {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
             let n = buf.len().min(state.chunk).min(state.pending.len());
             for (slot, byte) in buf.iter_mut().zip(state.pending.drain(..n)) {
                 *slot = byte;

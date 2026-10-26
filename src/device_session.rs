@@ -116,6 +116,13 @@ impl DeviceSession {
         }
     }
 
+    /// A Rynk board whose link broke: nothing reaches the board through this
+    /// session any more, even while the board stays plugged in.
+    pub(crate) fn link_lost(&self) -> bool {
+        self.as_rynk()
+            .is_some_and(|session| !session.is_transport_available())
+    }
+
     /// Rynk host data waits its turn between requests, so only Vial pauses it.
     pub(crate) fn with_host_output_paused_for_settings<T>(
         &self,

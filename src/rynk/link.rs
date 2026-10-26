@@ -237,7 +237,13 @@ impl RynkLink {
             Ok(())
         });
         self.send(Event::Request(job))?;
-        answer.recv().map_err(|_| closed_error())?
+        let result = answer.recv().map_err(|_| closed_error())?;
+        // The owner stops on a broken link; its caller hears of it only once
+        // the link reads as closed, so the next step already sees it gone.
+        if result.as_ref().err().is_some_and(link_failed) {
+            self.closed.wait(BUSY_RETRY);
+        }
+        result
     }
 
     /// Sends `request` without the caller waiting for its reply. A newer post
@@ -754,6 +760,7 @@ mod tests {
         let broken = RynkLink::acquire(id("broken"), quick(), &mut open).unwrap();
         unplugged.store(true, Ordering::SeqCst);
         assert!(broken.request::<command::GetCurrentLayer>(()).is_err());
+        assert!(!broken.is_open(), "the request that broke it saw it closed");
         let stopped = broken
             .request::<command::GetCurrentLayer>(())
             .expect_err("the stopped owner answers nothing more");

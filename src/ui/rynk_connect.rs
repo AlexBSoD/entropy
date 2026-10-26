@@ -621,6 +621,59 @@ mod tests {
         assert!(app.import_report_open, "the losses are shown after connect");
     }
 
+    /// An app the fixture board under `path` is connected to.
+    fn connected(path: &str) -> EntropyApp {
+        let mut app = EntropyApp::new_inert_for_test();
+        app.device_manager.replace_devices(vec![rynk_device(path)]);
+        app.start_connect(0);
+        finish_connect(&mut app);
+        app
+    }
+
+    fn finish_connect(app: &mut EntropyApp) {
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while matches!(app.connect_state, ConnectState::Loading { .. }) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "connect never finished"
+            );
+            app.poll_connect(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn an_import_the_board_drops_out_of_leaves_the_editor_as_it_was() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (board, state) = board(stored());
+        let _held = link("import-dropped", &board);
+        let mut app = connected("import-dropped");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("changed.entlayout");
+        app.write_entlayout_export(&path);
+        let mut file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        // "bye", under a name of its own.
+        file["data"]["macros"]["bytecode_base64"] = serde_json::json!(["Ynll"]);
+        file["data"]["macros"]["names"] = serde_json::json!(["Farewell"]);
+        std::fs::write(&path, file.to_string()).unwrap();
+
+        board.unplug_on(rmk_types_rynk::protocol::rynk::Cmd::SetMacro);
+        let error = app.import_entlayout_from_path(&path).unwrap_err();
+        let lost = crate::i18n::tr_catalog(app.app_settings.language, "entlayout.connection_lost");
+        assert!(error.to_string().contains(lost), "{error:#}");
+        assert_eq!(app.keycode_picker.macro_texts[0], b"hi");
+        assert_ne!(
+            app.keycode_picker.macro_names.first().map(String::as_str),
+            Some("Farewell")
+        );
+        assert_eq!(
+            state.lock().unwrap().macros[0],
+            [MacroOp::Char(b'h'), MacroOp::Char(b'i')]
+        );
+    }
+
     #[test]
     fn a_locked_rynk_board_locks_its_matrix_but_not_its_edits() {
         let mut stored = stored();
