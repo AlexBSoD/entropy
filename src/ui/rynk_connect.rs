@@ -164,15 +164,17 @@ impl EntropyApp {
             }
         }
 
-        let layout_options_value = if layout.layout_options.is_empty() {
-            None
-        } else {
-            Some(
-                session
-                    .layout_options()
-                    .map_err(failed(language, "Layout options read"))?,
-            )
-        };
+        // A board without the option serves no value for it.
+        let layout_options_value =
+            if layout.layout_options.is_empty() || info.caps & caps::LAYOUT_OPTIONS == 0 {
+                None
+            } else {
+                Some(
+                    session
+                        .layout_options()
+                        .map_err(failed(language, "Layout options read"))?,
+                )
+            };
 
         progress("Reading macros…")?;
         let macro_count = capabilities.max_macros;
@@ -263,24 +265,33 @@ impl EntropyApp {
         };
         let keyboard_id = u64::from_le_bytes(info.keyboard_uid);
         let firmware = info.firmware;
+        let firmware_version = format!("{}.{}.{}", firmware.major, firmware.minor, firmware.patch);
+        // The same release as over Vial: the definition names its asset, and a
+        // dongle shows host time and media.
+        let host_screen = caps::HOST_TIME | caps::HOST_MEDIA;
+        let firmware_update_target = crate::app::rmk_firmware_release_target(
+            dev.vendor_id,
+            dev.product_id,
+            Some(&firmware_version),
+            &json,
+            info.caps & host_screen == host_screen,
+            true,
+        );
         let about_info = DeviceAboutInfo {
             manufacturer: dev.manufacturer.clone(),
             product: dev.name.clone(),
             vendor_id: dev.vendor_id,
             product_id: dev.product_id,
             path: dev.path.clone(),
-            firmware_version: Some(format!(
-                "{}.{}.{}",
-                firmware.major, firmware.minor, firmware.patch
-            )),
-            // Picking the release to update to is left to the Rynk update path.
-            firmware_update_target: None,
+            firmware_version: Some(firmware_version),
+            firmware_update_target,
             supports_battery_halves,
             battery_halves,
             keyboard_id,
             macro_entries: macro_texts.len(),
             macro_memory_bytes: Some(macro_memory_bytes),
             supports_macro_delays: !macro_texts.is_empty(),
+            supports_macro_ext_keycodes: true,
             tap_dance_entries: tap_dance_entries.len(),
             combo_entries: combo_entries.len(),
             key_override_entries: key_override_entries.len(),
@@ -306,12 +317,14 @@ impl EntropyApp {
             about_info,
             layer_names_from_firmware,
             macro_texts,
-            supports_macro_ext_keycodes: false,
-            supports_rmk_native_key_actions: false,
-            supports_universal_symbols: false,
-            supports_universal_russian_letters: false,
-            supports_rmk_native_combo_output: false,
-            supports_rmk_native_tap_dance_actions: false,
+            // Rynk carries every key action, combo output, morse action and
+            // 16-bit macro keycode; symbols and Russian letters are per board.
+            supports_macro_ext_keycodes: true,
+            supports_rmk_native_key_actions: true,
+            supports_universal_symbols: info.caps & caps::UNIVERSAL_SYMBOLS != 0,
+            supports_universal_russian_letters: info.caps & caps::RUSSIAN_LETTERS != 0,
+            supports_rmk_native_combo_output: true,
+            supports_rmk_native_tap_dance_actions: true,
             supports_rmk_combo_layers: true,
             macro_ext_keycodes_disabled_reason: None,
             tap_dance_entries,
@@ -403,7 +416,7 @@ mod tests {
             "layouts": {"keymap": [["0,0", "0,1"]]}
         }));
         stored.keyboard_uid = [1, 2, 3, 4, 5, 6, 7, 8];
-        stored.caps = caps::BATTERY_HALVES;
+        stored.caps = caps::BATTERY_HALVES | caps::UNIVERSAL_SYMBOLS;
         stored.battery = Some(BatteryHalves {
             mask: 0b01,
             left: 77,
@@ -488,6 +501,14 @@ mod tests {
         assert_eq!(result.key_override_entries.len(), 1);
         assert_eq!(result.macro_texts[0], b"hi");
         assert_eq!(result.combo_term, Some(200));
+        assert!(result.supports_universal_symbols, "the board has symbols");
+        let update = result.about_info.firmware_update_target.as_ref().unwrap();
+        assert_eq!(update.asset_prefix, "k04", "the same release as over Vial");
+        assert_eq!(update.current_version, "2.3.1");
+        assert!(
+            !result.supports_universal_russian_letters,
+            "but not Russian letters"
+        );
         assert_eq!(result.supported_qmk_settings, [2, 200, 201]);
         assert_eq!(
             result.keyboard_id,
@@ -549,5 +570,37 @@ mod tests {
         assert_eq!(app.combo_entries.len(), 2);
         assert_eq!(app.keycode_picker.macro_texts[0], b"hi");
         assert!(app.import_report_open, "the losses are shown after connect");
+    }
+
+    #[test]
+    fn a_locked_rynk_board_locks_its_matrix_but_not_its_edits() {
+        let mut stored = stored();
+        stored.lock = Some(rmk_types_rynk::protocol::rynk::LockStatus {
+            locked: true,
+            unlocking: false,
+            remaining_keys: 1,
+            key_positions: [(0, 1)].as_slice().try_into().unwrap(),
+        });
+        let (board, _) = board(stored);
+        let _held = link("connect-locked", &board);
+        let mut app = EntropyApp::new_inert_for_test();
+        app.device_manager
+            .replace_devices(vec![rynk_device("connect-locked")]);
+
+        app.start_connect(0);
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while matches!(app.connect_state, ConnectState::Loading { .. }) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "connect never finished"
+            );
+            app.poll_connect(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(app.is_matrix_locked(), "the matrix waits for an unlock");
+        assert!(!app.is_vial_locked(), "edits do not");
+        assert!(app.has_keyboard_lock());
     }
 }

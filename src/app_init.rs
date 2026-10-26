@@ -384,6 +384,25 @@ impl EntropyApp {
             && self.vial_unlocked != Some(true)
     }
 
+    /// Whether the board has a lock Entropy unlocks: Vial and Rynk boards do.
+    pub(crate) fn has_keyboard_lock(&self) -> bool {
+        matches!(
+            self.firmware,
+            FirmwareProtocol::Vial | FirmwareProtocol::Rynk
+        )
+    }
+
+    /// Whether reading the key matrix waits for an unlock. A Rynk board serves
+    /// its matrix only unlocked, as a Vial board does, but takes writes while
+    /// locked, so [`Self::is_vial_locked`] stays Vial's.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn is_matrix_locked(&self) -> bool {
+        self.has_keyboard_lock()
+            && self.layout.is_some()
+            && !self.vial_unlock_polling
+            && self.vial_unlocked != Some(true)
+    }
+
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn is_vial_locked(&self) -> bool {
         false

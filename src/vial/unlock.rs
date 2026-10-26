@@ -157,7 +157,7 @@ impl EntropyApp {
 
     pub(super) fn draw_vial_unlock_overlay(&mut self, ctx: &egui::Context) {
         // Vial unlock modal
-        if self.unlock_open && self.firmware == FirmwareProtocol::Vial {
+        if self.unlock_open && self.has_keyboard_lock() {
             let preflight = !self.vial_unlock_session_started && !self.vial_unlock_polling;
             if preflight && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.dismiss_vial_unlock_preflight();
