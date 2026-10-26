@@ -3360,8 +3360,8 @@ const LAYOUT_SIGNALS_RETRY: Duration = Duration::from_secs(10);
 fn follow_layout_signals(events: LayoutEvents) {
     while kde_desktop_session() || gnome_desktop_session() {
         futures_lite::future::block_on(async {
-            if let Some((kde, ibus)) = layout_signal_streams().await {
-                watch_layout_signals(kde, ibus, &events).await;
+            if let Some(streams) = layout_signal_streams().await {
+                watch_layout_signals(streams, &events).await;
             }
         });
         if !events.following(false) {
@@ -3371,8 +3371,26 @@ fn follow_layout_signals(events: LayoutEvents) {
     }
 }
 
+/// The signals the layout lane follows.
 #[cfg(target_os = "linux")]
-type LayoutSignalStreams = (Option<zbus::MessageStream>, Option<zbus::MessageStream>);
+struct LayoutSignalStreams {
+    kde: Option<zbus::MessageStream>,
+    ibus: Option<zbus::MessageStream>,
+    /// While no IBus runs: IBus taking its name on the session bus.
+    ibus_started: Option<zbus::MessageStream>,
+}
+
+/// What setting up IBus's engine signal found.
+#[cfg(target_os = "linux")]
+enum IbusSignal {
+    Subscribed(zbus::MessageStream),
+    /// No IBus runs, so it switches no engine until `started` says it runs.
+    Absent {
+        started: zbus::MessageStream,
+    },
+    /// IBus runs, but its engine signal could not be subscribed to.
+    Unreached,
+}
 
 /// KDE's layout signals while KDE serves layouts, and IBus's engine signal
 /// while IBus runs; None unless together they announce every layout change.
@@ -3390,17 +3408,71 @@ async fn layout_signal_streams() -> Option<LayoutSignalStreams> {
     } else {
         None
     };
+    // Watched before IBus is looked for, so that one starting in between is
+    // not missed.
+    let started = ibus_started_stream(&session).await?;
     // With no IBus daemon there is no engine switch to miss. With one, its
     // switches count too: the Entropy engine takes precedence over KDE.
     let ibus = match zbus::connection::Builder::ibus() {
         Ok(builder) => match builder.build().await {
-            Ok(ibus) => Some(layout_signal_stream(&ibus, IBUS_INTERFACE, IBUS_PATH).await?),
-            Err(_) => None,
+            Ok(ibus) => match layout_signal_stream(&ibus, IBUS_INTERFACE, IBUS_PATH).await {
+                Some(stream) => IbusSignal::Subscribed(stream),
+                None => IbusSignal::Unreached,
+            },
+            Err(error) if ibus_is_absent(&error) => IbusSignal::Absent { started },
+            Err(_) => IbusSignal::Unreached,
         },
-        Err(_) => None,
+        Err(_) => IbusSignal::Absent { started },
     };
-    // KDE announces its own switches; elsewhere only IBus does (GNOME).
-    (kde.is_some() || (ibus.is_some() && gnome_desktop_session())).then_some((kde, ibus))
+    followed_layout_signals(kde, ibus, gnome_desktop_session())
+}
+
+/// `ibus address` named no daemon to connect to. Any other failure is one of
+/// a daemon that runs.
+#[cfg(target_os = "linux")]
+fn ibus_is_absent(error: &zbus::Error) -> bool {
+    matches!(error, zbus::Error::Address(_))
+}
+
+/// The streams to follow, if together they announce every layout change.
+/// KDE announces its own switches; elsewhere only IBus does (GNOME). An IBus
+/// that runs unfollowed switches engines unannounced, so the lane must keep
+/// polling for it.
+#[cfg(target_os = "linux")]
+fn followed_layout_signals(
+    kde: Option<zbus::MessageStream>,
+    ibus: IbusSignal,
+    gnome: bool,
+) -> Option<LayoutSignalStreams> {
+    let (ibus, ibus_started) = match ibus {
+        IbusSignal::Subscribed(stream) => (Some(stream), None),
+        IbusSignal::Absent { started } => (None, Some(started)),
+        IbusSignal::Unreached => return None,
+    };
+    (kde.is_some() || (ibus.is_some() && gnome)).then_some(LayoutSignalStreams {
+        kde,
+        ibus,
+        ibus_started,
+    })
+}
+
+/// IBus taking its name on the session bus, as it does when it starts.
+#[cfg(target_os = "linux")]
+async fn ibus_started_stream(session: &zbus::Connection) -> Option<zbus::MessageStream> {
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender("org.freedesktop.DBus")
+        .ok()?
+        .interface("org.freedesktop.DBus")
+        .ok()?
+        .member("NameOwnerChanged")
+        .ok()?
+        .arg(0, IBUS_DESTINATION)
+        .ok()?
+        .build();
+    zbus::MessageStream::for_match_rule(rule, session, None)
+        .await
+        .ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -3421,30 +3493,41 @@ async fn layout_signal_stream(
         .ok()
 }
 
-/// Turns layout signals into lane events until a stream ends or fails.
+/// Turns layout signals into lane events until a stream ends or fails, or
+/// IBus starts and its engine signal is to be followed too.
 #[cfg(target_os = "linux")]
-async fn watch_layout_signals(
-    mut kde: Option<zbus::MessageStream>,
-    mut ibus: Option<zbus::MessageStream>,
-    events: &LayoutEvents,
-) {
+async fn watch_layout_signals(streams: LayoutSignalStreams, events: &LayoutEvents) {
     use futures_lite::StreamExt as _;
 
+    let LayoutSignalStreams {
+        mut kde,
+        mut ibus,
+        mut ibus_started,
+    } = streams;
     // Whatever changed while nobody listened is read again first.
     if !events.following(true) || !events.changed(true) {
         return;
     }
     loop {
         let next = futures_lite::future::race(
+            futures_lite::future::race(
+                async {
+                    match kde.as_mut() {
+                        Some(kde) => kde.next().await.map(|message| (true, message)),
+                        None => std::future::pending().await,
+                    }
+                },
+                async {
+                    match ibus.as_mut() {
+                        Some(ibus) => ibus.next().await.map(|message| (false, message)),
+                        None => std::future::pending().await,
+                    }
+                },
+            ),
             async {
-                match kde.as_mut() {
-                    Some(kde) => kde.next().await.map(|message| (true, message)),
-                    None => std::future::pending().await,
-                }
-            },
-            async {
-                match ibus.as_mut() {
-                    Some(ibus) => ibus.next().await.map(|message| (false, message)),
+                match ibus_started.as_mut() {
+                    // Ends the watch: the next setup subscribes to IBus too.
+                    Some(started) => started.next().await.and(None),
                     None => std::future::pending().await,
                 }
             },
