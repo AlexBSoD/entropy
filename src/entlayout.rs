@@ -643,6 +643,30 @@ enum EntLayoutSkipReason {
     MissingTapDanceSlot,
 }
 
+/// What an import's firmware writes did not land: a line for each failure,
+/// and the dynamic sections a write failed in.
+#[derive(Debug, Default)]
+struct EntFirmwareFailures {
+    lines: Vec<String>,
+    sections: Vec<&'static str>,
+}
+
+impl EntFirmwareFailures {
+    fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    fn push(&mut self, line: String) {
+        self.lines.push(line);
+    }
+
+    /// A failed write of the dynamic section `label_key` names.
+    fn push_section(&mut self, label_key: &'static str, line: String) {
+        self.sections.push(label_key);
+        self.lines.push(line);
+    }
+}
+
 #[derive(Default)]
 struct EntLayoutSectionImportStats {
     imported: usize,
@@ -1797,7 +1821,7 @@ impl EntropyApp {
         &mut self,
         bundle: &EntLayoutFile,
     ) -> Result<(
-        Vec<String>,
+        EntFirmwareFailures,
         EntLayoutImportMapping,
         EntPortableSettingsImportReport,
     )> {
@@ -2017,7 +2041,7 @@ impl EntropyApp {
         if bundle.application_layouts.is_some() && !firmware_failures.is_empty() {
             bail!(
                 "Macropad resource import failed; host profiles were not published: {}",
-                firmware_failures.join(", ")
+                firmware_failures.lines.join(", ")
             );
         }
         if let Some((temporary, destination, settings)) = staged_settings {
@@ -2098,7 +2122,11 @@ impl EntropyApp {
             .any(|part| part.to_ascii_lowercase().contains("rmk"))
     }
 
-    fn entlayout_dynamic_import_report(&self, bundle: &EntLayoutFile) -> String {
+    fn entlayout_dynamic_import_report(
+        &self,
+        bundle: &EntLayoutFile,
+        failed: &[&'static str],
+    ) -> String {
         if self.current_device_is_likely_rmk() {
             return "firmware-backed dynamic sections skipped for RMK safety mode".to_owned();
         }
@@ -2164,12 +2192,24 @@ impl EntropyApp {
         }
 
         let lang = self.app_settings.language;
+        // A section whose write failed counts nothing as imported.
+        let summary = |stats: EntLayoutSectionImportStats, label_key| {
+            if failed.contains(&label_key) {
+                crate::i18n::tr_catalog_format(
+                    lang,
+                    "entlayout.summary_failed",
+                    &[("section", crate::i18n::tr_catalog(lang, label_key))],
+                )
+            } else {
+                stats.summary(lang, label_key)
+            }
+        };
         [
-            macro_stats.summary(lang, "entlayout.macros"),
-            combo_stats.summary(lang, "entlayout.combos"),
-            tap_dance_stats.summary(lang, "entlayout.tap_dance"),
-            key_override_stats.summary(lang, "entlayout.key_overrides"),
-            alt_repeat_stats.summary(lang, "entlayout.alt_repeat"),
+            summary(macro_stats, "entlayout.macros"),
+            summary(combo_stats, "entlayout.combos"),
+            summary(tap_dance_stats, "entlayout.tap_dance"),
+            summary(key_override_stats, "entlayout.key_overrides"),
+            summary(alt_repeat_stats, "entlayout.alt_repeat"),
         ]
         .join("; ")
     }
@@ -2179,7 +2219,7 @@ impl EntropyApp {
         &self,
         bundle: &EntLayoutFile,
         backup_path: &Path,
-        firmware_failures: &[String],
+        firmware_failures: &EntFirmwareFailures,
         mapping: &EntLayoutImportMapping,
         portable_settings: &EntPortableSettingsImportReport,
     ) -> String {
@@ -2293,17 +2333,27 @@ impl EntropyApp {
         } else {
             skipped.join(", ")
         };
+        let dynamic_report =
+            self.entlayout_dynamic_import_report(bundle, &firmware_failures.sections);
+        // Whatever else landed, a write that failed is no complete import.
+        let complete = crate::i18n::tr_catalog(
+            lang,
+            if firmware_failures.is_empty() {
+                "entlayout.import_complete"
+            } else {
+                "entlayout.import_complete_with_errors"
+            },
+        );
         let firmware_failures = if firmware_failures.is_empty() {
             none.to_owned()
         } else {
-            firmware_failures.join(", ")
+            firmware_failures.lines.join(", ")
         };
         let mode = if mapping.exact_layout {
             crate::i18n::tr_catalog(lang, "entlayout.exact")
         } else {
             crate::i18n::tr_catalog(lang, "entlayout.universal")
         };
-        let dynamic_report = self.entlayout_dynamic_import_report(bundle);
         let firmware_failures = if firmware_failures == none {
             none.to_owned()
         } else {
@@ -2379,7 +2429,7 @@ impl EntropyApp {
 
 {auto_backup}:
 {backup_path}",
-            complete = crate::i18n::tr_catalog(lang, "entlayout.import_complete"),
+            complete = complete,
             mode_label = crate::i18n::tr_catalog(lang, "entlayout.mode"),
             mapped_layout = crate::i18n::tr_catalog(lang, "entlayout.mapped_layout"),
             keys = crate::i18n::tr_catalog(lang, "entlayout.keys"),
@@ -2408,7 +2458,7 @@ impl EntropyApp {
         &mut self,
         bundle: &EntLayoutFile,
         mapping: &EntLayoutImportMapping,
-    ) -> Result<(Vec<String>, EntPortableSettingsImportReport)> {
+    ) -> Result<(EntFirmwareFailures, EntPortableSettingsImportReport)> {
         let lang = self.app_settings.language;
         let Some(hid) = &self.hid_device else {
             bail!(
@@ -2430,7 +2480,7 @@ impl EntropyApp {
         let supports_rmk_native_tap_dance_actions =
             self.keycode_picker.supports_rmk_native_tap_dance_actions;
         let supports_rmk_combo_layers = self.supports_rmk_combo_layers;
-        let mut failures = Vec::new();
+        let mut failures = EntFirmwareFailures::default();
         let target_portable_settings = self.entlayout_portable_settings_snapshot();
         let EntPortableSettingsImportPlan {
             compatible: portable_settings,
@@ -2635,7 +2685,7 @@ impl EntropyApp {
                 }
                 Ok(())
             })() {
-                failures.push(format!("macros ({err})"));
+                failures.push_section("entlayout.macros", format!("macros ({err})"));
             }
         }
 
@@ -2669,12 +2719,12 @@ impl EntropyApp {
             }
             Ok(())
         })() {
-            failures.push(format!("combos ({err})"));
+            failures.push_section("entlayout.combos", format!("combos ({err})"));
         }
         if let Some(term) = bundle.data.combos.term {
             if self.combo_term.is_some() && self.combo_term != Some(term) {
                 if let Err(err) = hid.set_qmk_setting_u16(2, term) {
-                    failures.push(format!("combo term ({err})"));
+                    failures.push_section("entlayout.combos", format!("combo term ({err})"));
                 }
             }
         }
@@ -2718,7 +2768,7 @@ impl EntropyApp {
             }
             Ok(())
         })() {
-            failures.push(format!("tap dance ({err})"));
+            failures.push_section("entlayout.tap_dance", format!("tap dance ({err})"));
         }
 
         if let Err(err) = (|| -> Result<()> {
@@ -2757,7 +2807,7 @@ impl EntropyApp {
             }
             Ok(())
         })() {
-            failures.push(format!("key overrides ({err})"));
+            failures.push_section("entlayout.key_overrides", format!("key overrides ({err})"));
         }
 
         if let Err(err) = (|| -> Result<()> {
@@ -2790,7 +2840,7 @@ impl EntropyApp {
             }
             Ok(())
         })() {
-            failures.push(format!("alt repeat ({err})"));
+            failures.push_section("entlayout.alt_repeat", format!("alt repeat ({err})"));
         }
         for setting in &verified_portable_settings {
             self.apply_entlayout_portable_setting_local(setting);
@@ -4276,7 +4326,7 @@ mod tests {
         let report = app.entlayout_import_report(
             &bundle,
             Path::new("unused-backup.entlayout"),
-            &[],
+            &EntFirmwareFailures::default(),
             &mapping,
             &EntPortableSettingsImportReport::default(),
         );
@@ -4284,6 +4334,47 @@ mod tests {
             app.app_settings.language,
             "entlayout.layout_options_exact_only"
         )));
+    }
+
+    #[test]
+    fn an_import_with_a_failed_write_is_not_reported_complete() {
+        let (bundle, target) = offset_alternative_backup();
+        let mut app = EntropyApp::new_inert_for_test();
+        app.layout = Some(target);
+        let mapping = app.entlayout_import_mapping(&bundle).unwrap();
+        let lang = app.app_settings.language;
+        let report = |failures: &EntFirmwareFailures| {
+            app.entlayout_import_report(
+                &bundle,
+                Path::new("unused-backup.entlayout"),
+                failures,
+                &mapping,
+                &EntPortableSettingsImportReport::default(),
+            )
+        };
+        let macros_failed = crate::i18n::tr_catalog_format(
+            lang,
+            "entlayout.summary_failed",
+            &[("section", crate::i18n::tr_catalog(lang, "entlayout.macros"))],
+        );
+
+        let clean = report(&EntFirmwareFailures::default());
+        assert!(clean.starts_with(crate::i18n::tr_catalog(lang, "entlayout.import_complete")));
+        assert!(!clean.contains(&macros_failed), "{clean}");
+
+        let mut failures = EntFirmwareFailures::default();
+        failures.push_section("entlayout.macros", "macros (refused)".to_owned());
+        let failed = report(&failures);
+        assert!(
+            failed.starts_with(crate::i18n::tr_catalog(
+                lang,
+                "entlayout.import_complete_with_errors"
+            )),
+            "{failed}"
+        );
+        // The macros the file holds are not counted as imported.
+        assert!(failed.contains(&macros_failed), "{failed}");
+        assert!(failed.contains("macros (refused)"), "{failed}");
     }
 
     #[test]
@@ -4304,7 +4395,7 @@ mod tests {
             app.entlayout_import_report(
                 bundle,
                 Path::new("unused-backup.entlayout"),
-                &[],
+                &EntFirmwareFailures::default(),
                 &mapping,
                 &EntPortableSettingsImportReport::default(),
             )
