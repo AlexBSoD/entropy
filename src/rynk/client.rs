@@ -21,6 +21,8 @@ use rmk_types_rynk::protocol::rynk::{
 };
 use serde::Serialize;
 
+use super::read_only::{read_only_rynk_session, ReadOnlyRynkSession};
+
 /// Payload budget before the board reports its own: enough for the handshake.
 const HANDSHAKE_MAX_PAYLOAD: usize = 64;
 /// Receive buffer: the largest frame a `u16` payload size allows, COBS-encoded.
@@ -92,6 +94,10 @@ pub(crate) enum RynkClientError {
     BulkProtocol {
         cmd: u16,
     },
+    /// A read-only session refused a command that is not a known read.
+    ReadOnly {
+        cmd: u16,
+    },
 }
 
 impl fmt::Display for RynkClientError {
@@ -116,6 +122,9 @@ impl fmt::Display for RynkClientError {
                 board.major, board.minor, host.major, host.minor
             ),
             Self::BulkProtocol { cmd } => write!(f, "Rynk command {cmd:#06x}: bad bulk page"),
+            Self::ReadOnly { cmd } => {
+                write!(f, "Read-only Rynk session refused command {cmd:#06x}")
+            }
         }
     }
 }
@@ -190,6 +199,7 @@ pub(crate) struct RynkClient<T> {
     next_seq: u8,
     max_payload: usize,
     timeouts: RynkTimeouts,
+    read_only: Option<ReadOnlyRynkSession>,
 }
 
 impl<T: RynkTransport> RynkClient<T> {
@@ -201,6 +211,20 @@ impl<T: RynkTransport> RynkClient<T> {
             next_seq: 1,
             max_payload: HANDSHAKE_MAX_PAYLOAD,
             timeouts,
+            read_only: read_only_rynk_session(),
+        }
+    }
+
+    /// A client inside `session`, as `enforce_read_only_rynk` would make it.
+    #[cfg(test)]
+    pub(crate) fn test_read_only(
+        transport: T,
+        timeouts: RynkTimeouts,
+        session: ReadOnlyRynkSession,
+    ) -> Self {
+        Self {
+            read_only: Some(session),
+            ..Self::new(transport, timeouts)
         }
     }
 
@@ -229,16 +253,29 @@ impl<T: RynkTransport> RynkClient<T> {
         request: &E::Request,
     ) -> Result<E::Response, RynkClientError> {
         let seq = self.send::<E>(request)?;
-        let frame = self.wait_reply(E::CMD, seq)?;
-        decode_reply::<E>(&frame)
+        let reply = self
+            .wait_reply(E::CMD, seq)
+            .and_then(|frame| decode_reply::<E>(&frame));
+        if let (Err(_), Some(session)) = (&reply, &self.read_only) {
+            session.record_failed_read(E::CMD);
+        }
+        reply
     }
 
     /// Sends a request without waiting; its reply is dropped when it comes.
-    /// Returns the request's SEQ.
+    /// Returns the request's SEQ. Every frame leaves through here, so this is
+    /// where a read-only session refuses what is not a read.
     pub(crate) fn send<E: Endpoint>(
         &mut self,
         request: &E::Request,
     ) -> Result<u8, RynkClientError> {
+        if self
+            .read_only
+            .as_ref()
+            .is_some_and(|session| !session.admit(E::CMD))
+        {
+            return Err(RynkClientError::ReadOnly { cmd: E::CMD.raw() });
+        }
         let seq = self.next_seq;
         self.next_seq = if seq == u8::MAX { 1 } else { seq + 1 };
         let frame = encode_request::<E>(seq, request, self.max_payload)?;
@@ -605,5 +642,82 @@ mod tests {
         });
         let (mut client, _) = RynkClient::connect(&mut board, quick()).unwrap();
         assert_eq!(client.read_keymap_layer(1, 3, 5).unwrap(), keys);
+    }
+
+    #[test]
+    fn read_only_sessions_send_reads_and_refuse_everything_else() {
+        let mut board = FakeBoard::new(|header, _| {
+            vec![match header.cmd {
+                Cmd::GetVersion => ok(header, ProtocolVersion::CURRENT),
+                Cmd::GetCapabilities => ok(header, capabilities(512)),
+                Cmd::GetKeyAction => ok(header, KeyAction::No),
+                Cmd::GetMacro => ok(header, Macro::new()),
+                _ => err(header, RynkError::Locked),
+            }]
+        });
+        let session = ReadOnlyRynkSession::default();
+        let mut client = RynkClient::test_read_only(&mut board, quick(), session.clone());
+        client.request::<command::GetVersion>(&()).unwrap();
+        client.max_payload = client
+            .request::<command::GetCapabilities>(&())
+            .unwrap()
+            .max_payload_size as usize;
+        let position = rmk_types_rynk::protocol::rynk::KeyPosition {
+            layer: 0,
+            row: 0,
+            col: 0,
+        };
+        assert_eq!(
+            client.request::<command::GetKeyAction>(&position).unwrap(),
+            KeyAction::No
+        );
+        assert_eq!(client.read_macro(0).unwrap(), []);
+        assert!(matches!(
+            client.request::<command::GetMatrixState>(&()),
+            Err(RynkClientError::Device {
+                error: RynkError::Locked,
+                ..
+            })
+        ));
+
+        enum SetAgents {}
+        impl Endpoint for SetAgents {
+            const CMD: Cmd = Cmd::from_raw(0x7EF0);
+            type Request = ();
+            type Response = ();
+        }
+        let refused = [
+            client.request::<command::SetKeyAction>(
+                &rmk_types_rynk::protocol::rynk::SetKeyRequest {
+                    position,
+                    action: KeyAction::No,
+                },
+            ),
+            client.write_macro(0, &[]),
+            client.request::<command::StorageReset>(
+                &rmk_types_rynk::protocol::rynk::StorageResetMode::Full,
+            ),
+            client.request::<command::Reboot>(&()),
+            client.request::<command::BootloaderJump>(&()),
+            client.request::<command::Lock>(&()),
+            client.request::<command::UnlockPoll>(&()).map(|_| ()),
+            client.request::<command::SwitchBleProfile>(&1),
+            client.request::<SetAgents>(&()),
+            client.send::<command::SetDefaultLayer>(&1).map(|_| ()),
+        ];
+        for result in refused {
+            assert!(
+                matches!(result, Err(RynkClientError::ReadOnly { .. })),
+                "{result:?}"
+            );
+        }
+        drop(client);
+        let sent: Vec<u16> = board.sent.iter().map(|header| header.cmd.raw()).collect();
+        assert_eq!(sent, [0x0001, 0x0002, 0x0101, 0x0201, 0x0802]);
+        assert_eq!(
+            session.refused_requests(),
+            [0x0102, 0x0202, 0x0005, 0x0003, 0x0004, 0x0008, 0x0007, 0x0704, 0x7EF0, 0x0104]
+        );
+        assert_eq!(session.failed_reads(), [0x0802]);
     }
 }
