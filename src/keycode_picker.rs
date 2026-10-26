@@ -167,6 +167,9 @@ pub struct KeycodePicker {
     pub supports_universal_russian_letters: bool,
     pub supports_rmk_native_combo_output: bool,
     pub supports_rmk_native_tap_dance_actions: bool,
+    /// The connected board speaks Rynk: tap dance fields take the native v1
+    /// actions the picker builds as their Rynk upgrade.
+    pub rynk_board: bool,
     pub rmk_native_key_actions_allowed_for_target: bool,
     value_policy: PickerValuePolicy,
     pub macro_ext_keycodes_disabled_reason: Option<MacroExtKeycodesDisabledReason>,
@@ -1100,6 +1103,7 @@ impl Default for KeycodePicker {
             supports_universal_russian_letters: false,
             supports_rmk_native_combo_output: false,
             supports_rmk_native_tap_dance_actions: false,
+            rynk_board: false,
             rmk_native_key_actions_allowed_for_target: false,
             value_policy: PickerValuePolicy::default(),
             macro_ext_keycodes_disabled_reason: None,

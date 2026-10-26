@@ -570,6 +570,7 @@ macro_op = "шаг {op} не сохранить"
 not_an_action = "Tap Dance выполняет одиночные действия, а не {action}"
 too_many_combo_keys = "больше {max} клавиш"
 too_many_patterns = "больше {max} паттернов"
+not_on_rynk = "Прошивка Rynk не примет это действие в таком виде; ничего не изменено"
 
 [rynk_client]
 transport = "связь с клавиатурой потеряна: {error}"

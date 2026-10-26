@@ -8,7 +8,6 @@ impl EntropyApp {
         }
 
         if let Some(binding) = self.keycode_picker.result.take() {
-            let kc_value = binding.vial_keycode();
             let native_target_supported = if self.application_layout_editor_active
                 || self.key_override_pick_target.is_some()
                 || self.alt_repeat_pick_target.is_some()
@@ -28,6 +27,13 @@ impl EntropyApp {
                     "This lossless RMK action is not supported for this target".into();
                 return;
             }
+            let Some(binding) = self.board_binding(binding) else {
+                self.status_msg =
+                    crate::i18n::tr_catalog(self.app_settings.language, "rynk_import.not_on_rynk")
+                        .into();
+                return;
+            };
+            let kc_value = binding.vial_keycode();
             if let Some((combo_idx, field)) = self.combo_pick_target.take() {
                 self.push_combo_undo();
                 if let Some(combo) = self.combo_entries.get_mut(combo_idx) {
@@ -241,6 +247,32 @@ impl EntropyApp {
         }
     }
 
+    /// Whether the connected board speaks Rynk.
+    pub(super) fn rynk_board_connected(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        let connected = self
+            .hid_device
+            .as_ref()
+            .is_some_and(crate::device_session::DeviceSession::is_rynk);
+        #[cfg(target_arch = "wasm32")]
+        let connected = false;
+        connected
+    }
+
+    /// `binding` as the connected board takes it: on a Rynk board the native
+    /// v1 actions the picker builds become Rynk ones. `None` when that would
+    /// change the action, and the target stays as it is.
+    pub(super) fn board_binding(
+        &self,
+        binding: crate::keyboard::KeyBinding,
+    ) -> Option<crate::keyboard::KeyBinding> {
+        if self.rynk_board_connected() {
+            crate::rynk::keycode::rynk_board_binding(binding)
+        } else {
+            Some(binding)
+        }
+    }
+
     pub(super) fn handle_secondary_target(
         &mut self,
         ctx: &egui::Context,
@@ -250,17 +282,30 @@ impl EntropyApp {
         encoder_target: Option<usize>,
     ) {
         let kc = binding.vial_keycode();
-        if let crate::keyboard::KeyBinding::Rmk(action) = binding {
+        // A Rynk mod-tap without a keycode reads through its v1 label.
+        let native = match binding {
+            crate::keyboard::KeyBinding::Rmk(action) => Some(action),
+            crate::keyboard::KeyBinding::Rynk(action) => {
+                crate::rynk::native_v1::v1_label_action(action)
+            }
+            crate::keyboard::KeyBinding::Vial(_) => None,
+        };
+        if let Some(action) = native {
             if let Some(parts) = crate::rmk_native::rmk_mod_tap_parts(action) {
                 if ctrl_held {
                     if let Some(ki) = key_target {
-                        let swapped = crate::rmk_native::toggle_handed_key_action(action);
+                        let swapped = match binding {
+                            crate::keyboard::KeyBinding::Rynk(action) => {
+                                crate::rynk::keycode::key_binding(
+                                    crate::rynk::keycode::toggle_handed_key_action(action),
+                                )
+                            }
+                            _ => crate::keyboard::KeyBinding::Rmk(
+                                crate::rmk_native::toggle_handed_key_action(action),
+                            ),
+                        };
                         self.drop_queued_middle_click_assignment(self.selected_layer, ki);
-                        self.pending_handed_swap = Some((
-                            self.selected_layer,
-                            ki,
-                            crate::keyboard::KeyBinding::Rmk(swapped),
-                        ));
+                        self.pending_handed_swap = Some((self.selected_layer, ki, swapped));
                     }
                 } else {
                     self.open_picker_for_target(key_target, encoder_target);
@@ -1238,5 +1283,110 @@ mod tests {
             crate::keyboard::KeyBinding::Vial(0)
         );
         assert_eq!(app.undo_stack.len(), 2);
+    }
+
+    /// An app on a Rynk board serving `stored`, with the one-key test layout.
+    fn rynk_app(
+        ctx: &egui::Context,
+        name: &str,
+    ) -> (
+        EntropyApp,
+        std::sync::Arc<std::sync::Mutex<crate::rynk::session::testing::Stored>>,
+    ) {
+        use crate::rynk::session::testing::{board, link, Stored};
+        let creation_context = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = EntropyApp::new(&creation_context);
+        app.layout = Some(test_layout(&[0x0004], &[]));
+        let (board, state) = board(Stored::new(8, 8, 1));
+        let session = crate::rynk::session::RynkSession::new(link(name, &board));
+        app.hid_device = Some(session.into());
+        (app, state)
+    }
+
+    fn finish_write(app: &mut EntropyApp, ctx: &egui::Context) {
+        for _ in 0..400 {
+            app.poll_vial_hid_task(ctx);
+            if !app.hid_write_task_active() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("the key write did not finish");
+    }
+
+    #[test]
+    fn a_universal_symbol_reaches_a_rynk_board_as_its_rynk_action() {
+        use rmk_types_rynk::action::{Action, KeyAction};
+        let ctx = egui::Context::default();
+        let (mut app, state) = rynk_app(&ctx, "picker-universal-symbol");
+        let user_id = crate::universal_symbols::USER_SYMBOL_START;
+        app.selected_key = Some((0, 0));
+        app.keycode_picker.result = Some(crate::universal_symbols::binding(user_id));
+
+        app.apply_picker_results(&ctx);
+        finish_write(&mut app, &ctx);
+
+        let expected = KeyAction::Single(Action::User(user_id));
+        let held = app.layout.as_ref().unwrap().get_key_binding(0, 0);
+        assert_eq!(crate::rynk::keycode::binding_action(held), Ok(expected));
+        assert_eq!(state.lock().unwrap().keymap[0], expected);
+    }
+
+    #[test]
+    fn a_rynk_board_refuses_a_pick_that_would_change_on_the_way() {
+        let ctx = egui::Context::default();
+        let (mut app, state) = rynk_app(&ctx, "picker-custom-profile");
+        let custom = KeyAction::TapHold(
+            Action::Key(rmk_types::keycode::KeyCode::Hid(HidKeyCode::A)),
+            Action::Modifier(ModifierCombination::LCTRL),
+            rmk_types::morse::MorseProfile::from(0x4000_00C8),
+        );
+        app.selected_key = Some((0, 0));
+        app.keycode_picker.result = Some(crate::keyboard::KeyBinding::Rmk(custom));
+
+        app.apply_picker_results(&ctx);
+
+        assert!(!app.hid_write_task_active());
+        assert_eq!(
+            app.layout.as_ref().unwrap().get_key_binding(0, 0),
+            crate::keyboard::KeyBinding::Vial(0x0004)
+        );
+        assert!(state.lock().unwrap().writes().is_empty());
+        assert_eq!(
+            app.status_msg,
+            crate::i18n::tr_catalog(app.app_settings.language, "rynk_import.not_on_rynk")
+        );
+    }
+
+    #[test]
+    fn right_click_handles_a_rynk_mod_tap_without_a_keycode() {
+        use rmk_types_rynk::action::{Action, KeyAction};
+        use rmk_types_rynk::keycode::HidKeyCode;
+        use rmk_types_rynk::modifier::ModifierCombination;
+        let ctx = egui::Context::default();
+        let (mut app, _state) = rynk_app(&ctx, "picker-handed-swap");
+        // A profile index no keycode spells keeps the key a Rynk action.
+        let action = KeyAction::TapHold(
+            Action::KeyWithModifier(HidKeyCode::LeftBracket, ModifierCombination::LSHIFT),
+            Action::Modifier(ModifierCombination::RCTRL),
+            3,
+        );
+        let binding = crate::keyboard::KeyBinding::Rynk(action);
+        assert_eq!(crate::rynk::keycode::key_binding(action), binding);
+
+        app.handle_secondary_target(&ctx, true, binding, Some(0), None);
+        assert!(app.secondary_click_handled);
+        let swapped = crate::rynk::keycode::toggle_handed_key_action(action);
+        assert_eq!(
+            app.pending_handed_swap,
+            Some((0, 0, crate::rynk::keycode::key_binding(swapped)))
+        );
+
+        app.handle_secondary_target(&ctx, false, binding, Some(0), None);
+        assert!(app.keycode_picker.open);
+        assert_eq!(
+            app.keycode_picker.vial_quantum_pending_mt,
+            Some(0x2000 | ((ModifierCombination::RCTRL.into_packed_bits() as u16) << 8))
+        );
     }
 }

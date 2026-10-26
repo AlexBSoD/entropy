@@ -570,6 +570,7 @@ macro_op = "step {op} cannot be kept"
 not_an_action = "Tap Dance runs single actions, not {action}"
 too_many_combo_keys = "more than {max} keys"
 too_many_patterns = "more than {max} patterns"
+not_on_rynk = "The Rynk firmware cannot take this action as it is; nothing was changed"
 
 [rynk_client]
 transport = "lost the link to the keyboard: {error}"

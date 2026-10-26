@@ -560,7 +560,21 @@ impl EntropyApp {
         );
     }
 
-    fn paste_selected_layer(&mut self, desired: LayerSnapshot) {
+    fn paste_selected_layer(&mut self, mut desired: LayerSnapshot) {
+        // A layer copied from a Vial board brings native v1 actions.
+        for binding in &mut desired.keycodes {
+            match self.board_binding(*binding) {
+                Some(taken) => *binding = taken,
+                None => {
+                    self.status_msg = crate::i18n::tr_catalog(
+                        self.app_settings.language,
+                        "rynk_import.not_on_rynk",
+                    )
+                    .into();
+                    return;
+                }
+            }
+        }
         self.apply_layer_snapshot(self.selected_layer, desired, "layer_actions.paste");
     }
 
@@ -2660,5 +2674,58 @@ mod tests {
             Some((old, true))
         );
         assert_eq!(undo_after_layer_write(&context, false, true), None);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_layer_from_a_vial_board_pastes_onto_a_rynk_board_as_rynk_actions() {
+        use crate::rynk::session::testing::{board, link, Stored};
+        use rmk_types_rynk::action::{Action, KeyAction};
+        let ctx = egui::Context::default();
+        let creation_context = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = EntropyApp::new(&creation_context);
+        let positions = [(0.0, 0.0), (1.0, 0.0)];
+        app.layout = Some(layout(&positions, &[0x04, 0x05], &[]));
+        let (board, state) = board(Stored::new(8, 8, 1));
+        let session = crate::rynk::session::RynkSession::new(link("layer-paste", &board));
+        app.hid_device = Some(session.into());
+
+        // A tap-hold with its own timing changes on the way: nothing is pasted.
+        let mut source = layout(&positions, &[0x06, 0x07], &[]);
+        source.layers[0][0] = KeyBinding::Rmk(rmk_types::action::KeyAction::TapHold(
+            rmk_types::action::Action::Key(rmk_types::keycode::KeyCode::Hid(
+                rmk_types::keycode::HidKeyCode::A,
+            )),
+            rmk_types::action::Action::Modifier(rmk_types::modifier::ModifierCombination::LCTRL),
+            rmk_types::morse::MorseProfile::from(0x4000_00C8),
+        ));
+        app.layer_clipboard = capture_clipboard(&source, 0);
+        app.paste_selected_layer(app.layer_paste_snapshot().unwrap());
+        assert_eq!(
+            app.layout.as_ref().unwrap().layers[0],
+            bindings(&[0x04, 0x05])
+        );
+        assert!(app.layer_write_task.is_none() && app.pending_layer_write.is_none());
+        assert_eq!(
+            app.status_msg,
+            crate::i18n::tr_catalog(app.app_settings.language, "rynk_import.not_on_rynk")
+        );
+
+        let user_id = crate::universal_symbols::USER_SYMBOL_START;
+        source.layers[0][0] = crate::universal_symbols::binding(user_id);
+        app.layer_clipboard = capture_clipboard(&source, 0);
+        app.paste_selected_layer(app.layer_paste_snapshot().unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while app.layer_write_task.is_some() || app.pending_layer_write.is_some() {
+            app.maybe_start_pending_layer_write();
+            app.poll_layer_write(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+
+        let expected = KeyAction::Single(Action::User(user_id));
+        let held = app.layout.as_ref().unwrap().layers[0][0];
+        assert_eq!(crate::rynk::keycode::binding_action(held), Ok(expected));
+        assert_eq!(state.lock().unwrap().keymap[0], expected);
     }
 }

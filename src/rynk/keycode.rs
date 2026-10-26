@@ -41,6 +41,23 @@ pub(crate) fn key_binding(action: KeyAction) -> KeyBinding {
     exact_vial_keycode(action).map_or(KeyBinding::Rynk(action), KeyBinding::Vial)
 }
 
+/// What a Rynk board takes for a binding the editor built: the native v1
+/// actions the picker and other boards' layers bring cross as their upgrade,
+/// held as an action read from the board would be. `None` when the upgrade
+/// would change the action.
+pub(crate) fn rynk_board_binding(binding: KeyBinding) -> Option<KeyBinding> {
+    match binding {
+        KeyBinding::Rmk(action) => {
+            let upgrade = super::native_v1::upgrade_native_v1_key_action(action);
+            upgrade
+                .losses
+                .is_empty()
+                .then(|| key_binding(upgrade.action))
+        }
+        other => Some(other),
+    }
+}
+
 /// The action a binding writes to a Rynk board.
 pub(crate) fn binding_action(binding: KeyBinding) -> Result<KeyAction, KeyBindingError> {
     match binding {
@@ -689,5 +706,57 @@ mod tests {
         assert!(identical(toggle_handed_key_action(toggled), action));
         let key = KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::B)));
         assert!(identical(toggle_handed_key_action(key), key));
+    }
+
+    #[test]
+    fn picker_bindings_cross_to_a_rynk_board_as_their_upgrade() {
+        use rmk_types::action::{Action as V1Action, KeyAction as V1KeyAction};
+        use rmk_types::keycode::HidKeyCode as V1HidKeyCode;
+        use rmk_types::modifier::ModifierCombination as V1Modifiers;
+        use rmk_types::morse::MorseProfile as V1MorseProfile;
+
+        let user_ids = crate::universal_symbols::CONTROLS
+            .iter()
+            .map(|control| control.user_id)
+            .chain(
+                crate::universal_symbols::SYMBOLS
+                    .iter()
+                    .map(|symbol| symbol.user_id),
+            )
+            .chain(
+                crate::universal_symbols::RUSSIAN_LETTERS
+                    .iter()
+                    .map(|letter| letter.user_id),
+            );
+        for user_id in user_ids {
+            let taken = rynk_board_binding(crate::universal_symbols::binding(user_id)).unwrap();
+            assert_eq!(
+                binding_action(taken),
+                Ok(KeyAction::Single(Action::User(user_id)))
+            );
+        }
+
+        let tap = V1Action::KeyWithModifier(V1HidKeyCode::LeftBracket, V1Modifiers::LSHIFT);
+        let hold = V1Action::Modifier(V1Modifiers::RCTRL);
+        let mod_tap = V1KeyAction::TapHold(tap, hold, Default::default());
+        let taken = rynk_board_binding(KeyBinding::Rmk(mod_tap)).unwrap();
+        let upgraded = super::super::native_v1::upgrade_native_v1_key_action(mod_tap).action;
+        assert!(identical(binding_action(taken).unwrap(), upgraded));
+        assert_eq!(
+            taken,
+            key_binding(upgraded),
+            "held as if read from the board"
+        );
+
+        // A tap-hold with its own timing would change on the way.
+        let custom = V1KeyAction::TapHold(tap, hold, V1MorseProfile::from(0x4000_00C8));
+        assert_eq!(rynk_board_binding(KeyBinding::Rmk(custom)), None);
+
+        assert_eq!(
+            rynk_board_binding(KeyBinding::Vial(0x04)),
+            Some(KeyBinding::Vial(0x04))
+        );
+        let rynk = KeyBinding::Rynk(KeyAction::Single(Action::User(200)));
+        assert_eq!(rynk_board_binding(rynk), Some(rynk));
     }
 }
