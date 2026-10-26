@@ -473,7 +473,12 @@ mod tests {
                 tapping_term: 180,
             };
             let morse = merge_tap_dance(&Morse::default(), &entry, 4).unwrap();
-            assert_eq!(morse.get(TAP), (action != Action::No).then_some(action));
+            // An HID no-key is KC_NO in the editor, so it leaves the pattern empty.
+            let empty = matches!(
+                action,
+                Action::No | Action::Key(KeyCode::Hid(HidKeyCode::No))
+            );
+            assert_eq!(morse.get(TAP), (!empty).then_some(action));
             let (read, losses) = tap_dance_entry(&morse);
             assert!(losses.is_empty());
             assert_eq!(read, entry, "{action:?}");
@@ -670,6 +675,12 @@ mod tests {
         assert_eq!(
             encoder_keycodes(EncoderAction::new(user, KeyAction::No)),
             ([0, 0], vec![DynamicLoss::Key(user)])
+        );
+        // An encoder nobody set, as the firmware keeps it, loses nothing.
+        let unset = key(HidKeyCode::No);
+        assert_eq!(
+            encoder_keycodes(EncoderAction::new(unset, unset)),
+            ([0, 0], vec![])
         );
     }
 

@@ -89,14 +89,25 @@ pub(crate) fn binding_action(binding: KeyBinding) -> Result<KeyAction, KeyBindin
 /// back as `RSFT_T(KC_ENT)`, as it does over Vial.
 pub(crate) fn vial_keycode_action(keycode: u16) -> Option<KeyAction> {
     let action = from_vial_keycode(keycode);
-    if keycode != 0 && matches!(action, KeyAction::No) {
-        return None;
+    match exact_vial_keycode(action)? {
+        // A keycode the firmware has no action for decodes to an empty key,
+        // a hole in the HID page to an HID no-key.
+        0 if keycode != 0 => None,
+        _ => Some(action),
     }
-    exact_vial_keycode(action).map(|_| action)
 }
 
-/// The keycode that holds exactly `action`.
+/// The keycode that holds exactly `action`. An empty key is `KC_NO` in each
+/// shape the firmware stores it in, as its Vial path reads them all.
 pub(crate) fn exact_vial_keycode(action: KeyAction) -> Option<u16> {
+    if matches!(
+        action,
+        KeyAction::No
+            | KeyAction::Single(Action::No)
+            | KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::No)))
+    ) {
+        return Some(0);
+    }
     let keycode = to_vial_keycode(action);
     identical(from_vial_keycode(keycode), action).then_some(keycode)
 }
@@ -429,8 +440,10 @@ mod tests {
             let written = binding_action(binding).unwrap_or_else(|error| {
                 panic!("{action:?} shown as {binding:?} does not write back: {error}")
             });
+            // An empty key in any shape is KC_NO and writes back as `No`.
+            let empty = binding == KeyBinding::Vial(0) && written == KeyAction::No;
             assert!(
-                identical(written, action),
+                identical(written, action) || empty,
                 "{action:?} -> {binding:?} -> {written:?}"
             );
             native += usize::from(matches!(binding, KeyBinding::Rynk(_)));
@@ -504,6 +517,20 @@ mod tests {
             binding_action(KeyBinding::Rmk(rmk_types::action::KeyAction::No)),
             Err(KeyBindingError::NativeV1)
         );
+    }
+
+    #[test]
+    fn every_empty_key_is_kc_no() {
+        // The firmware stores `No` from keyboard.toml and an unset encoder as
+        // an HID no-key; its Vial path reads all three as KC_NO.
+        for empty in [
+            KeyAction::No,
+            KeyAction::Single(Action::No),
+            KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::No))),
+        ] {
+            assert_eq!(exact_vial_keycode(empty), Some(0), "{empty:?}");
+            assert_eq!(key_binding(empty), KeyBinding::Vial(0), "{empty:?}");
+        }
     }
 
     #[test]
