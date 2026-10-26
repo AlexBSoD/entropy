@@ -7,13 +7,14 @@
 
 use std::fmt;
 use std::io;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use rmk_types_rynk::action::KeyAction;
 use rmk_types_rynk::combo::Combo;
 use rmk_types_rynk::keyboard_macros::{Macro, MacroOp};
 use rmk_types_rynk::morse::Morse;
 use rmk_types_rynk::protocol::rynk::command::{self, Endpoint};
+use rmk_types_rynk::protocol::rynk::ergohaven::{self, ErgohavenInfo, ERGOHAVEN_RYNK_REVISION};
 use rmk_types_rynk::protocol::rynk::{
     encode_frame, max_wire_size, Cmd, Deframer, DeviceCapabilities, GetComboBulkRequest,
     GetKeymapBulkRequest, GetMorseBulkRequest, ProtocolVersion, RynkError, RynkHeader,
@@ -27,6 +28,10 @@ use super::read_only::{read_only_rynk_session, ReadOnlyRynkSession};
 const HANDSHAKE_MAX_PAYLOAD: usize = 64;
 /// Receive buffer: the largest frame a `u16` payload size allows, COBS-encoded.
 const RX_BUFFER_SIZE: usize = max_wire_size(RYNK_HEADER_SIZE + u16::MAX as usize);
+/// On connect, what an earlier session left in the link is read away until
+/// the link stays quiet this long, within `DRAIN_LIMIT`.
+const DRAIN_QUIET: Duration = Duration::from_millis(50);
+const DRAIN_LIMIT: Duration = Duration::from_millis(500);
 
 /// A byte link to one board: USB bulk endpoints, BLE GATT, or 32-byte HID
 /// reports. The client only frames; the transport moves bytes.
@@ -90,6 +95,17 @@ pub(crate) enum RynkClientError {
         board: ProtocolVersion,
         host: ProtocolVersion,
     },
+    /// The board speaks another ergohaven wire revision; `None` when it is
+    /// no ergohaven firmware at all.
+    RevisionMismatch {
+        board: Option<u16>,
+        host: u16,
+    },
+    /// The board definition read back does not hash to what the board reported.
+    DefinitionHash {
+        expected: u32,
+        actual: u32,
+    },
     /// A bulk reply that cannot be right, such as an empty page short of the end.
     BulkProtocol {
         cmd: u16,
@@ -121,6 +137,25 @@ impl fmt::Display for RynkClientError {
                 "Rynk protocol {}.{} on the board, {}.{} in Entropy",
                 board.major, board.minor, host.major, host.minor
             ),
+            Self::RevisionMismatch {
+                board: Some(board),
+                host,
+            } => {
+                write!(
+                    f,
+                    "ergohaven Rynk revision {board} on the board, {host} in Entropy"
+                )
+            }
+            Self::RevisionMismatch { board: None, host } => {
+                write!(
+                    f,
+                    "the board has no ergohaven Rynk revision, Entropy needs {host}"
+                )
+            }
+            Self::DefinitionHash { expected, actual } => write!(
+                f,
+                "board definition hashes to {actual:#010x}, the board reported {expected:#010x}"
+            ),
             Self::BulkProtocol { cmd } => write!(f, "Rynk command {cmd:#06x}: bad bulk page"),
             Self::ReadOnly { cmd } => {
                 write!(f, "Read-only Rynk session refused command {cmd:#06x}")
@@ -135,6 +170,15 @@ impl From<io::Error> for RynkClientError {
     fn from(error: io::Error) -> Self {
         Self::Transport(error)
     }
+}
+
+/// A frame from the board.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Incoming {
+    /// A reply, header included, for `decode_reply`.
+    Reply { seq: u8, frame: Vec<u8> },
+    /// A topic the board pushed.
+    Topic,
 }
 
 /// The frame for request `E` with `seq`, refused when its payload passes
@@ -192,6 +236,29 @@ fn postcard_len<T: Serialize>(value: &T) -> Option<usize> {
     postcard::serialize_with_flavor(value, postcard::ser_flavors::Size::default()).ok()
 }
 
+/// What a board is, as `connect` reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RynkBoard {
+    pub(crate) info: ErgohavenInfo,
+    pub(crate) capabilities: DeviceCapabilities,
+}
+
+/// A start SEQ that differs from session to session, so a reply left over
+/// from an earlier session rarely matches the first request.
+fn initial_seq() -> u8 {
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.subsec_nanos());
+    (nanos % 255) as u8 + 1
+}
+
+/// FNV-1a, the board definition's hash in `ErgohavenInfo`.
+pub(crate) fn fnv1a(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0x811c_9dc5, |hash, &byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+    })
+}
+
 pub(crate) struct RynkClient<T> {
     transport: T,
     rx: Vec<u8>,
@@ -208,7 +275,7 @@ impl<T: RynkTransport> RynkClient<T> {
             transport,
             rx: vec![0; RX_BUFFER_SIZE],
             deframer: Deframer::new(),
-            next_seq: 1,
+            next_seq: initial_seq(),
             max_payload: HANDSHAKE_MAX_PAYLOAD,
             timeouts,
             read_only: read_only_rynk_session(),
@@ -228,13 +295,16 @@ impl<T: RynkTransport> RynkClient<T> {
         }
     }
 
-    /// Checks the protocol version and reads the board's capabilities, which
-    /// size every later request.
+    /// Checks the protocol version and the ergohaven revision, then reads the
+    /// board's identity and capabilities; the capabilities size every later
+    /// request. The revision is checked before anything else is decoded, since
+    /// another revision may have reshaped the rest.
     pub(crate) fn connect(
         transport: T,
         timeouts: RynkTimeouts,
-    ) -> Result<(Self, DeviceCapabilities), RynkClientError> {
+    ) -> Result<(Self, RynkBoard), RynkClientError> {
         let mut client = Self::new(transport, timeouts);
+        client.drain()?;
         let board = client.request::<command::GetVersion>(&())?;
         if board != ProtocolVersion::CURRENT {
             return Err(RynkClientError::VersionMismatch {
@@ -242,9 +312,36 @@ impl<T: RynkTransport> RynkClient<T> {
                 host: ProtocolVersion::CURRENT,
             });
         }
+        let revision = client.probe_revision()?;
+        if revision != ERGOHAVEN_RYNK_REVISION {
+            return Err(RynkClientError::RevisionMismatch {
+                board: Some(revision),
+                host: ERGOHAVEN_RYNK_REVISION,
+            });
+        }
+        let info = client.request::<ergohaven::GetErgohavenInfo>(&())?;
         let capabilities = client.request::<command::GetCapabilities>(&())?;
         client.max_payload = capabilities.max_payload_size as usize;
-        Ok((client, capabilities))
+        Ok((client, RynkBoard { info, capabilities }))
+    }
+
+    /// The revision `GetErgohavenInfo` leads with, read without the rest.
+    fn probe_revision(&mut self) -> Result<u16, RynkClientError> {
+        let cmd = ergohaven::GetErgohavenInfo::CMD;
+        let seq = self.send::<ergohaven::GetErgohavenInfo>(&())?;
+        let frame = self.wait_reply(cmd, seq)?;
+        match postcard::take_from_bytes::<Result<u16, RynkError>>(&frame[RYNK_HEADER_SIZE..]) {
+            Ok((Ok(revision), _)) => Ok(revision),
+            Ok((Err(RynkError::UnknownCmd), _)) => Err(RynkClientError::RevisionMismatch {
+                board: None,
+                host: ERGOHAVEN_RYNK_REVISION,
+            }),
+            Ok((Err(error), _)) => Err(RynkClientError::Device {
+                cmd: cmd.raw(),
+                error,
+            }),
+            Err(_) => Err(RynkClientError::Malformed { cmd: cmd.raw() }),
+        }
     }
 
     /// One request and its reply.
@@ -283,17 +380,44 @@ impl<T: RynkTransport> RynkClient<T> {
         Ok(seq)
     }
 
+    fn next_frame(&mut self) -> Option<Incoming> {
+        let len = self.deframer.next(&mut self.rx)?;
+        let frame = &self.rx[..len];
+        let header = RynkHeader::parse(frame.first_chunk().expect("frames hold a header"));
+        Some(if header.cmd.is_topic() {
+            Incoming::Topic
+        } else {
+            Incoming::Reply {
+                seq: header.seq,
+                frame: frame.to_vec(),
+            }
+        })
+    }
+
+    /// Reads away what an earlier session left in the link.
+    fn drain(&mut self) -> Result<(), RynkClientError> {
+        let limit = Instant::now() + DRAIN_LIMIT;
+        loop {
+            let wait = DRAIN_QUIET.min(limit.saturating_duration_since(Instant::now()));
+            if wait.is_zero() || self.transport.recv(&mut self.rx, wait)? == 0 {
+                break;
+            }
+        }
+        self.deframer = Deframer::new();
+        Ok(())
+    }
+
     fn wait_reply(&mut self, cmd: Cmd, seq: u8) -> Result<Vec<u8>, RynkClientError> {
         let start = Instant::now();
         let mut last_byte = None::<Instant>;
         loop {
-            while let Some(len) = self.deframer.next(&mut self.rx) {
-                let frame = &self.rx[..len];
-                let header = RynkHeader::parse(frame.first_chunk().expect("frames hold a header"));
-                // Nothing on this side listens to topics; any other reply
-                // answers a request nobody waits for any more.
-                if !header.cmd.is_topic() && header.seq == seq {
-                    return Ok(frame.to_vec());
+            while let Some(incoming) = self.next_frame() {
+                match incoming {
+                    // Nothing on this side listens to topics.
+                    Incoming::Topic => {}
+                    Incoming::Reply { seq: reply, frame } if reply == seq => return Ok(frame),
+                    // Anything else answers a request nobody waits for any more.
+                    Incoming::Reply { .. } => {}
                 }
             }
             let now = Instant::now();
@@ -316,6 +440,48 @@ impl<T: RynkTransport> RynkClient<T> {
                 last_byte = Some(Instant::now());
             }
         }
+    }
+
+    /// The board definition (Vial's xz-compressed JSON), checked against the
+    /// hash `GetErgohavenInfo` reported.
+    pub(crate) fn read_board_definition(
+        &mut self,
+        expected_hash: u32,
+    ) -> Result<Vec<u8>, RynkClientError> {
+        let cmd = ergohaven::GetBoardDefinition::CMD.raw();
+        let mut definition = Vec::new();
+        let mut total = None;
+        loop {
+            let chunk =
+                self.request::<ergohaven::GetBoardDefinition>(&(definition.len() as u32))?;
+            let total = *total.get_or_insert(chunk.total_len as usize);
+            if chunk.total_len as usize != total || definition.len() + chunk.bytes.len() > total {
+                return Err(RynkClientError::BulkProtocol { cmd });
+            }
+            definition.extend_from_slice(&chunk.bytes);
+            if definition.len() == total {
+                break;
+            }
+            if chunk.bytes.is_empty() {
+                return Err(RynkClientError::BulkProtocol { cmd });
+            }
+        }
+        let actual = fnv1a(&definition);
+        if actual != expected_hash {
+            return Err(RynkClientError::DefinitionHash {
+                expected: expected_hash,
+                actual,
+            });
+        }
+        Ok(definition)
+    }
+
+    pub(crate) fn layout_options(&mut self) -> Result<u32, RynkClientError> {
+        self.request::<ergohaven::GetLayoutOption>(&())
+    }
+
+    pub(crate) fn set_layout_options(&mut self, options: u32) -> Result<(), RynkClientError> {
+        self.request::<ergohaven::SetLayoutOption>(&options)
     }
 
     /// Every key of `layer`, row by row, in as few pages as the board sends.
@@ -494,9 +660,27 @@ mod tests {
         }
     }
 
+    fn info(revision: u16) -> ErgohavenInfo {
+        ErgohavenInfo {
+            revision,
+            firmware: rmk_types_rynk::protocol::rynk::FirmwareVersion {
+                major: 2,
+                minor: 3,
+                patch: 1,
+            },
+            keyboard_uid: [0x80, 0x04, 1, 2, 3, 4, 5, 6],
+            caps: ergohaven::caps::LAYOUT_OPTIONS,
+            definition_hash: fnv1a(DEFINITION),
+        }
+    }
+
+    /// A definition longer than two `GetBoardDefinition` pages.
+    const DEFINITION: &[u8] = &[0x5D; 600];
+
     fn handshake(header: RynkHeader, max_payload_size: u16) -> Option<Vec<u8>> {
         match header.cmd {
             Cmd::GetVersion => Some(ok(header, ProtocolVersion::CURRENT)),
+            Cmd::GetErgohavenInfo => Some(ok(header, info(ERGOHAVEN_RYNK_REVISION))),
             Cmd::GetCapabilities => Some(ok(header, capabilities(max_payload_size))),
             _ => None,
         }
@@ -505,9 +689,10 @@ mod tests {
     #[test]
     fn connect_checks_the_version_and_takes_the_payload_size() {
         let mut board = FakeBoard::new(|header, _| vec![handshake(header, 4000).unwrap()]);
-        let (client, capabilities) = RynkClient::connect(&mut board, quick()).unwrap();
+        let (client, board) = RynkClient::connect(&mut board, quick()).unwrap();
         assert_eq!(client.max_payload, 4000);
-        assert_eq!(capabilities.num_cols, 5);
+        assert_eq!(board.capabilities.num_cols, 5);
+        assert_eq!(board.info, info(ERGOHAVEN_RYNK_REVISION));
 
         let mut old =
             FakeBoard::new(|header, _| vec![ok(header, ProtocolVersion { major: 0, minor: 1 })]);
@@ -598,7 +783,7 @@ mod tests {
             })
         ));
         drop(client);
-        assert_eq!(board.sent.len(), 2, "only the handshake went out");
+        assert_eq!(board.sent.len(), 4, "only the handshake went out");
     }
 
     /// Endpoints declared outside the client, as the ergohaven vendor table and
@@ -719,5 +904,121 @@ mod tests {
             [0x0102, 0x0202, 0x0005, 0x0003, 0x0004, 0x0008, 0x0007, 0x0704, 0x7EF0, 0x0104]
         );
         assert_eq!(session.failed_reads(), [0x0802]);
+    }
+
+    #[test]
+    fn connect_refuses_another_revision_before_decoding_the_rest() {
+        let next = ERGOHAVEN_RYNK_REVISION + 1;
+        // A later revision may have reshaped the info: here it grew a field.
+        let mut later = FakeBoard::new(move |header, _| {
+            vec![match header.cmd {
+                Cmd::GetErgohavenInfo => ok(header, (next, [0xAAu8; 9], "more")),
+                _ => handshake(header, 512).unwrap(),
+            }]
+        });
+        assert!(matches!(
+            RynkClient::connect(&mut later, quick()),
+            Err(RynkClientError::RevisionMismatch { board: Some(board), .. }) if board == next
+        ));
+        // Plain RMK firmware has no ergohaven table.
+        let mut plain = FakeBoard::new(|header, _| {
+            vec![match header.cmd {
+                Cmd::GetErgohavenInfo => err(header, RynkError::UnknownCmd),
+                _ => handshake(header, 512).unwrap(),
+            }]
+        });
+        assert!(matches!(
+            RynkClient::connect(&mut plain, quick()),
+            Err(RynkClientError::RevisionMismatch { board: None, .. })
+        ));
+        drop(plain);
+    }
+
+    #[test]
+    fn the_board_definition_is_paged_in_and_checked_against_its_hash() {
+        let serve = |definition: &'static [u8], total: Option<u32>| {
+            move |header: RynkHeader, payload: &[u8]| {
+                if let Some(reply) = handshake(header, 512) {
+                    return vec![reply];
+                }
+                assert_eq!(header.cmd, Cmd::GetBoardDefinition);
+                let offset: u32 = postcard::from_bytes(payload).unwrap();
+                let start = (offset as usize).min(definition.len());
+                let end = (start + 244).min(definition.len());
+                let chunk = rmk_types_rynk::protocol::rynk::LayoutChunk {
+                    total_len: total.unwrap_or(definition.len() as u32),
+                    bytes: definition[start..end].try_into().unwrap(),
+                };
+                vec![ok(header, chunk)]
+            }
+        };
+        let mut board = FakeBoard::new(serve(DEFINITION, None));
+        let (mut client, info) = RynkClient::connect(&mut board, quick()).unwrap();
+        let hash = info.info.definition_hash;
+        assert_eq!(client.read_board_definition(hash).unwrap(), DEFINITION);
+        assert!(matches!(
+            client.read_board_definition(hash ^ 1),
+            Err(RynkClientError::DefinitionHash { .. })
+        ));
+        drop(client);
+        let pages = board
+            .sent
+            .iter()
+            .filter(|h| h.cmd == Cmd::GetBoardDefinition)
+            .count();
+        assert_eq!(pages, 6, "three 244-byte pages per read");
+
+        // A board that claims more than it sends.
+        let mut short = FakeBoard::new(serve(DEFINITION, Some(700)));
+        let (mut client, _) = RynkClient::connect(&mut short, quick()).unwrap();
+        assert!(matches!(
+            client.read_board_definition(hash),
+            Err(RynkClientError::BulkProtocol { cmd: 0x7E02 })
+        ));
+    }
+
+    #[test]
+    fn layout_options_read_and_write() {
+        let stored = std::rc::Rc::new(std::cell::Cell::new(5u32));
+        let cell = stored.clone();
+        let mut board = FakeBoard::new(move |header, payload| {
+            if let Some(reply) = handshake(header, 512) {
+                return vec![reply];
+            }
+            vec![match header.cmd {
+                Cmd::GetLayoutOption => ok(header, cell.get()),
+                Cmd::SetLayoutOption => {
+                    cell.set(postcard::from_bytes(payload).unwrap());
+                    ok(header, ())
+                }
+                _ => return vec![],
+            }]
+        });
+        let (mut client, _) = RynkClient::connect(&mut board, quick()).unwrap();
+        assert_eq!(client.layout_options().unwrap(), 5);
+        client.set_layout_options(0x1_0002).unwrap();
+        assert_eq!(client.layout_options().unwrap(), 0x1_0002);
+        assert_eq!(stored.get(), 0x1_0002);
+    }
+
+    #[test]
+    fn connect_drains_the_link() {
+        let mut board = FakeBoard::new(|header, _| {
+            vec![handshake(header, 512).unwrap_or_else(|| ok(header, 7u8))]
+        });
+        // Left over from an earlier session: a reply and half a frame.
+        let stale = frame(Cmd::GetCurrentLayer, 9, &Ok::<u8, RynkError>(1));
+        board.pending.extend(stale.iter().chain(&stale[..3]));
+        let (mut client, _) = RynkClient::connect(&mut board, quick()).unwrap();
+        assert!(!client.deframer.has_pending());
+        assert_eq!(client.next_frame(), None);
+        assert_eq!(client.request::<command::GetCurrentLayer>(&()).unwrap(), 7);
+    }
+
+    #[test]
+    fn sessions_start_at_a_seq_in_range() {
+        for _ in 0..100 {
+            assert!((1..=u8::MAX).contains(&initial_seq()));
+        }
     }
 }

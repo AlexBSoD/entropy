@@ -62,8 +62,8 @@ impl ReadOnlyRynkSession {
 }
 
 /// Commands that only read the board. Anything else fails closed, a command
-/// added to a table later included. Unlock polling arms an unlock attempt, so
-/// it is not a read.
+/// added to a table later included. Unlock polling arms an unlock attempt and
+/// `GetBatteryHalves` wakes the halves, so neither is a read.
 pub(crate) fn is_read_cmd(cmd: Cmd) -> bool {
     matches!(
         cmd,
@@ -93,5 +93,11 @@ pub(crate) fn is_read_cmd(cmd: Cmd) -> bool {
             | Cmd::GetWpm
             | Cmd::GetSleepState
             | Cmd::GetLedIndicator
+            | Cmd::GetErgohavenInfo
+            | Cmd::GetBoardDefinition
+            | Cmd::GetSettingKeys
+            | Cmd::GetSetting
+            | Cmd::GetLayoutOption
+            | Cmd::GetWriteStatus
     )
 }
