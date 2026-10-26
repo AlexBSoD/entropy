@@ -15,8 +15,10 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{mpsc, Arc};
 
 const PROTOCOL_VERSION: u32 = 1;
-/// A connected client has this long to send its request line.
+/// A connected client has this long to send its request line, in all.
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Far more than any request; a longer line is not one.
+const MAX_REQUEST_BYTES: usize = 4096;
 /// The longest export the GUI runs, whatever timeout the console asks for.
 const MAX_EXPORT_TIME: Duration = Duration::from_secs(10 * 60);
 /// How often a request waiting for the GUI checks that its console is there.
@@ -104,15 +106,12 @@ fn bind_private(path: &Path) -> std::io::Result<UnixListener> {
 }
 
 fn serve(stream: UnixStream, jobs: &mpsc::Sender<ExportJob>, ctx: &egui::Context) {
-    let mut line = String::new();
-    let read = stream
-        .set_read_timeout(Some(REQUEST_READ_TIMEOUT))
-        .and_then(|()| BufReader::new(&stream).read_line(&mut line));
+    let read = read_request(&stream, Instant::now() + REQUEST_READ_TIMEOUT);
     let reply = match read {
         Err(error) => Reply::Failed {
             message: format!("request not read: {error}"),
         },
-        Ok(_) => match serde_json::from_str::<Request>(&line) {
+        Ok(line) => match serde_json::from_str::<Request>(&line) {
             Ok(Request::ExportLayout {
                 version,
                 device,
@@ -164,6 +163,42 @@ fn serve(stream: UnixStream, jobs: &mpsc::Sender<ExportJob>, ctx: &egui::Context
         let _ = stream
             .set_write_timeout(Some(REPLY_WRITE_TIMEOUT))
             .and_then(|()| stream.write_all(json.as_bytes()));
+    }
+}
+
+/// The request: one line, sent whole by `deadline` and at most
+/// `MAX_REQUEST_BYTES` long, however its bytes trickle in.
+fn read_request(stream: &UnixStream, deadline: Instant) -> std::io::Result<String> {
+    let mut console = stream;
+    let mut line = Vec::new();
+    let mut chunk = [0; 256];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        console.set_read_timeout(Some(remaining))?;
+        let read = match console.read(&mut chunk) {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(std::io::ErrorKind::TimedOut.into())
+            }
+            read => read?,
+        };
+        if read == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        let end = chunk[..read].iter().position(|byte| *byte == b'\n');
+        line.extend_from_slice(&chunk[..end.unwrap_or(read)]);
+        if line.len() > MAX_REQUEST_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "request too long",
+            ));
+        }
+        if end.is_some() {
+            return String::from_utf8(line)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+        }
     }
 }
 
@@ -521,6 +556,39 @@ mod tests {
         let socket = dir.join("export.sock");
         let server = ExportServer::start(&socket, egui::Context::default()).unwrap();
         (socket, server)
+    }
+
+    #[test]
+    fn a_request_line_has_one_deadline_however_it_trickles() {
+        let (gui, mut console) = UnixStream::pair().unwrap();
+        let trickle = std::thread::spawn(move || {
+            // A byte well inside any single read's timeout, and no newline.
+            while console.write_all(b"{").is_ok() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let deadline = Instant::now() + Duration::from_millis(300);
+
+        let error = read_request(&gui, deadline).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(Instant::now() < deadline + Duration::from_millis(200));
+        drop(gui);
+        trickle.join().unwrap();
+    }
+
+    #[test]
+    fn a_request_line_longer_than_any_request_is_refused_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, server) = listening(dir.path());
+        let started = Instant::now();
+
+        // No newline: the channel must not wait for one.
+        let answer = ask(&socket, &"x".repeat(MAX_REQUEST_BYTES + 1));
+
+        assert!(answer.contains("request too long"), "{answer}");
+        assert!(started.elapsed() < REQUEST_READ_TIMEOUT);
+        assert!(server.jobs.try_recv().is_err());
     }
 
     #[test]
