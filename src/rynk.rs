@@ -5,5 +5,7 @@
 //! revision as `rmk_types_rynk`. The two never meet at runtime: only .entlayout
 //! migration converts between them, plus key labels, which reuse the v1 code.
 
+pub(crate) mod dynamic;
 pub(crate) mod keycode;
+pub(crate) mod macros;
 pub(crate) mod native_v1;
