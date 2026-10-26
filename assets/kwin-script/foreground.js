@@ -1,5 +1,5 @@
-// Loaded once per Entropy process. KWin calls back on every focus or title
-// change instead of Entropy loading a fresh script to ask each time.
+// Loaded once per Entropy process. KWin calls back on every focus, title or
+// class change instead of Entropy loading a fresh script to ask each time.
 const SERVICE = "@ENTROPY_BUS_NAME@";
 const OBJECT_PATH = "/org/ergohaven/Entropy/KWinForeground1";
 const INTERFACE = "org.ergohaven.Entropy.KWinForeground1";
@@ -20,13 +20,17 @@ function activated(window) {
     if (current) {
         try {
             current.captionChanged.disconnect(report);
+            current.windowClassChanged.disconnect(report);
         } catch (error) {
             // The previous window may already be gone.
         }
     }
     current = window;
     if (current) {
+        // Profiles match the class as well as the title, and a window can
+        // change either while it keeps the focus.
         current.captionChanged.connect(report);
+        current.windowClassChanged.connect(report);
     }
     report();
 }

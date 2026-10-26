@@ -3208,6 +3208,154 @@ mod tests {
         );
     }
 
+    // Runs the shipped script against stand-ins for the KWin objects it uses
+    // and returns what it reported at each step.
+    const KWIN_SCRIPT_HARNESS: &str = r#"
+        const source = require("fs").readFileSync(0, "utf8");
+        function signal() {
+            const slots = [];
+            return {
+                connect: (slot) => slots.push(slot),
+                disconnect(slot) {
+                    const index = slots.indexOf(slot);
+                    if (index < 0) throw new Error("not connected");
+                    slots.splice(index, 1);
+                },
+                emit: (...args) => slots.slice().forEach((slot) => slot(...args)),
+            };
+        }
+        const window = (caption, resourceClass) => ({
+            caption, resourceClass, pid: 0,
+            captionChanged: signal(), windowClassChanged: signal(),
+        });
+        const editor = window("Draft", "org.kde.kate");
+        const browser = window("Docs", "firefox");
+        const workspace = { activeWindow: editor, windowActivated: signal() };
+        const focus = (window) => {
+            workspace.activeWindow = window;
+            workspace.windowActivated.emit(window);
+        };
+        const calls = [];
+        const steps = {};
+        const step = (name, action) => {
+            const before = calls.length;
+            action();
+            steps[name] = calls.slice(before);
+        };
+        step("load", () => new Function("workspace", "callDBus", source)(
+            workspace, (...args) => calls.push(args)));
+        step("class", () => {
+            editor.resourceClass = "org.kde.kwrite";
+            editor.windowClassChanged.emit();
+        });
+        step("caption", () => {
+            editor.caption = "Notes";
+            editor.captionChanged.emit();
+        });
+        step("focus", () => focus(browser));
+        step("unfocused", () => {
+            editor.caption = "Old";
+            editor.captionChanged.emit();
+            editor.resourceClass = "old";
+            editor.windowClassChanged.emit();
+        });
+        step("no window", () => focus(null));
+        step("after no window", () => {
+            browser.captionChanged.emit();
+            browser.windowClassChanged.emit();
+        });
+        process.stdout.write(JSON.stringify(steps));
+    "#;
+
+    #[test]
+    fn kwin_script_reports_title_and_class_changes_of_the_focused_window() {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        let node = Command::new("node")
+            .args(["-e", KWIN_SCRIPT_HARNESS])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+        let mut node = match node {
+            Ok(node) => node,
+            // CI always runs the script; a local checkout may lack Node.js.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && std::env::var_os("CI").is_none() =>
+            {
+                eprintln!("Skipping the KWin script run: Node.js is not installed");
+                return;
+            }
+            Err(error) => panic!("Cannot run Node.js: {error}"),
+        };
+        node.stdin
+            .take()
+            .unwrap()
+            .write_all(kwin_foreground_script_source(":1.42").as_bytes())
+            .unwrap();
+        let output = node.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let steps: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let reports = |step: &str| -> Vec<serde_json::Value> {
+            steps[step]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|call| {
+                    let call: Vec<&str> = call
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|arg| arg.as_str().unwrap())
+                        .collect();
+                    assert_eq!(
+                        call[..4],
+                        [
+                            ":1.42",
+                            KWIN_FOREGROUND_PATH,
+                            KWIN_FOREGROUND_INTERFACE,
+                            "ActiveWindow"
+                        ]
+                    );
+                    serde_json::from_str(call[4]).unwrap()
+                })
+                .collect()
+        };
+        let window = |caption: &str, class: &str| serde_json::json!({ "caption": caption, "resourceClass": class, "pid": 0 });
+
+        assert_eq!(reports("load"), [window("Draft", "org.kde.kate")]);
+        // The class changes while the title and the focus stay.
+        let class_change = reports("class");
+        assert_eq!(class_change, [window("Draft", "org.kde.kwrite")]);
+        let ForegroundState::Focused(application) =
+            kwin_status_from_payload(&class_change[0].to_string())
+                .unwrap()
+                .state
+        else {
+            panic!("expected a focused application");
+        };
+        assert!(application
+            .identities
+            .iter()
+            .any(|identity| identity.contains("kwrite")));
+        assert!(!application
+            .identities
+            .iter()
+            .any(|identity| identity.contains("kate")));
+        assert_eq!(reports("caption"), [window("Notes", "org.kde.kwrite")]);
+        assert_eq!(reports("focus"), [window("Docs", "firefox")]);
+        // A window that lost the focus no longer reports its changes.
+        assert!(reports("unfocused").is_empty());
+        assert_eq!(reports("no window"), [serde_json::Value::Null]);
+        assert!(reports("after no window").is_empty());
+    }
+
     #[test]
     fn kwin_receiver_accepts_only_the_kwin_connection() {
         let (events, received) = mpsc::channel();
