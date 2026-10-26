@@ -101,8 +101,9 @@ fn upgrade_action(action: V1Action) -> Result<Action, NativeV1Loss> {
 }
 
 /// The v1 action that labels a Rynk action in the key editor, which still
-/// draws native actions through the v1 code. Never written to a board.
-/// `None` for actions v1 cannot hold, such as steno keys.
+/// draws native actions through the v1 code. Written to a board only through
+/// [`downgrade_key_action`]. `None` for actions v1 cannot hold, such as steno
+/// keys.
 pub(crate) fn v1_label_action(action: KeyAction) -> Option<V1KeyAction> {
     Some(match action {
         KeyAction::No => V1KeyAction::No,
@@ -115,6 +116,16 @@ pub(crate) fn v1_label_action(action: KeyAction) -> Option<V1KeyAction> {
         KeyAction::Morse(index) => V1KeyAction::Morse(index),
         _ => return None,
     })
+}
+
+/// The native v1 action a Vial board takes for a Rynk action from a file, if
+/// it is the same action: one that upgrades back unchanged. A tap-hold key
+/// with a profile from the table has none.
+pub(crate) fn downgrade_key_action(action: KeyAction) -> Option<V1KeyAction> {
+    let v1 = v1_label_action(action)?;
+    let upgrade = upgrade_native_v1_key_action(v1);
+    (upgrade.losses.is_empty() && crate::rynk::keycode::identical(upgrade.action, action))
+        .then_some(v1)
 }
 
 /// The label of a Rynk action the v1 code cannot draw: its variant name and
@@ -346,6 +357,34 @@ mod tests {
         ] {
             assert_eq!(upgrade(v1), (rynk, vec![]));
             assert_eq!(v1_label_action(rynk), Some(v1));
+            assert_eq!(downgrade_key_action(rynk), Some(v1));
         }
+    }
+
+    #[test]
+    fn only_an_action_that_comes_back_unchanged_goes_down_to_v1() {
+        // A universal symbol, as a Rynk test build exported it from a K:04.
+        let symbol = KeyAction::Single(Action::User(0x82));
+        assert_eq!(
+            downgrade_key_action(symbol),
+            Some(V1KeyAction::Single(V1Action::User(0x82)))
+        );
+        let tap_hold = |profile| {
+            KeyAction::TapHold(
+                Action::Key(KeyCode::Hid(HidKeyCode::A)),
+                Action::LayerOn(2),
+                profile,
+            )
+        };
+        assert_eq!(
+            downgrade_key_action(tap_hold(u8::MAX)),
+            Some(V1KeyAction::TapHold(
+                V1Action::Key(V1KeyCode::Hid(V1HidKeyCode::A)),
+                V1Action::LayerOn(2),
+                Default::default()
+            ))
+        );
+        // v1 packs its own profile; an index into the table means nothing there.
+        assert_eq!(downgrade_key_action(tap_hold(5)), None);
     }
 }

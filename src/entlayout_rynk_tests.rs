@@ -59,7 +59,7 @@ fn rynk_actions_export_as_version_11_and_read_back() {
         crate::rynk::entlayout::RYNK_ENTLAYOUT_VERSION
     );
     assert!(native_keymap_is_empty(&bundle.data.native_keymap));
-    let key = |index| entlayout_native_key_action(&bundle, 0, index, true).unwrap();
+    let key = |index| entlayout_native_key_action(&bundle, 0, index, NativeTarget::Rynk).unwrap();
     assert!(matches!(key(0), Some(KeyBinding::Rynk(action)) if identical(action, user)));
     assert_eq!(key(1), None);
     assert_eq!(bundle.data.keymap[0][1], 0x05);
@@ -71,21 +71,46 @@ fn rynk_actions_export_as_version_11_and_read_back() {
             combo.output,
             combo.native_output.as_deref(),
             combo.rynk_output,
-            true
+            NativeTarget::Rynk
         )
         .unwrap(),
         KeyBinding::Rynk(user)
     );
     assert_eq!(bundle.data.tap_dance.entries[0].rynk_on_hold, Some(user));
 
-    // A keyboard on the old firmware cannot take the file.
-    let error = app
-        .validate_entlayout_file(&bundle)
-        .unwrap_err()
-        .to_string();
+    // A Vial board takes these only as native v1 actions, and the error lists
+    // every place it cannot.
+    use crate::rynk::entlayout::BindingPlace;
+    let lang = app.app_settings.language;
+    let refused = |places: &[(BindingPlace, KeyAction)]| {
+        std::iter::once(crate::i18n::tr_catalog(lang, "entlayout.off_vial").to_owned())
+            .chain(places.iter().map(|(place, action)| {
+                crate::rynk::entlayout::describe_place(lang, *place, &format!("{action:?}"))
+            }))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     assert_eq!(
-        error,
-        crate::i18n::tr_catalog(app.app_settings.language, "entlayout.rynk_only")
+        app.validate_entlayout_file(&bundle)
+            .unwrap_err()
+            .to_string(),
+        refused(&[
+            (BindingPlace::Key { layer: 0, key: 0 }, user),
+            (BindingPlace::Key { layer: 0, key: 2 }, tap_hold),
+            (BindingPlace::ComboOutput { index: 0 }, user),
+            (BindingPlace::TapDance { index: 0, field: 1 }, user),
+        ]),
+        "firmware without native actions takes none of them"
+    );
+    app.keycode_picker.supports_rmk_native_key_actions = true;
+    app.keycode_picker.supports_rmk_native_combo_output = true;
+    app.keycode_picker.supports_rmk_native_tap_dance_actions = true;
+    assert_eq!(
+        app.validate_entlayout_file(&bundle)
+            .unwrap_err()
+            .to_string(),
+        refused(&[(BindingPlace::Key { layer: 0, key: 2 }, tap_hold)]),
+        "v1 has no form for a profile from the table"
     );
 
     // Without Rynk actions an export stays version 7.
@@ -102,43 +127,116 @@ fn native_fields_decode_by_file_version_and_target() {
     let usb = V1KeyAction::Single(V1Action::KeyboardControl(V1Control::OutputUsb));
     let encoded = encode_native_key_action(usb).unwrap();
     assert_eq!(
-        entlayout_native_binding(7, Some(&encoded), None, false).unwrap(),
+        entlayout_native_binding(7, Some(&encoded), None, NativeTarget::Vial).unwrap(),
         Some(KeyBinding::Rmk(usb))
     );
     assert_eq!(
-        entlayout_native_binding(7, Some(&encoded), None, true).unwrap(),
+        entlayout_native_binding(7, Some(&encoded), None, NativeTarget::Rynk).unwrap(),
         Some(KeyBinding::Rynk(KeyAction::Single(Action::User(38))))
     );
     // The same bytes mean different actions: version 10 wrote the Rynk layout.
     let bytes = BASE64_STANDARD.encode([2, 17, 6]);
     assert_eq!(
-        entlayout_native_binding(10, Some(&bytes), None, false).unwrap(),
+        entlayout_native_binding(10, Some(&bytes), None, NativeTarget::AsWritten).unwrap(),
         Some(KeyBinding::Rynk(KeyAction::Single(
             Action::KeyboardControl(KeyboardAction::CapsWordToggle)
         )))
     );
     assert_eq!(
-        entlayout_native_binding(7, Some(&bytes), None, false).unwrap(),
+        entlayout_native_binding(10, Some(&bytes), None, NativeTarget::Vial).unwrap(),
+        Some(KeyBinding::Rmk(V1KeyAction::Single(
+            V1Action::KeyboardControl(V1Control::CapsWordToggle)
+        ))),
+        "a Vial board gets the v1 form"
+    );
+    assert_eq!(
+        entlayout_native_binding(7, Some(&bytes), None, NativeTarget::Vial).unwrap(),
         Some(KeyBinding::Rmk(V1KeyAction::Single(
             V1Action::KeyboardControl(V1Control::OutputBluetooth)
         )))
     );
     let user = KeyAction::Single(Action::User(70));
     assert_eq!(
-        entlayout_native_binding(11, Some(&encoded), Some(user), false).unwrap(),
+        entlayout_native_binding(11, Some(&encoded), Some(user), NativeTarget::AsWritten).unwrap(),
         Some(KeyBinding::Rynk(user)),
         "a Rynk field wins over a native one"
     );
-    assert_eq!(entlayout_native_binding(7, None, None, true).unwrap(), None);
+    assert_eq!(
+        entlayout_native_binding(11, None, Some(user), NativeTarget::Vial).unwrap(),
+        Some(KeyBinding::Rmk(V1KeyAction::Single(V1Action::User(70))))
+    );
+    assert_eq!(
+        entlayout_native_binding(7, None, None, NativeTarget::Rynk).unwrap(),
+        None
+    );
 
-    // Version 10 files with native actions are for Rynk boards only; the
-    // version itself is readable.
+    // The version itself is readable; its native actions need a board that
+    // takes native actions.
     let mut bundle = exported(&app_with(vec![KeyBinding::Vial(0x04); 3]));
     bundle.version = crate::rynk::entlayout::NATIVE_V2_ENTLAYOUT_VERSION;
-    let app = app_with(vec![KeyBinding::Vial(0x04); 3]);
+    let mut app = app_with(vec![KeyBinding::Vial(0x04); 3]);
     app.validate_entlayout_file(&bundle).unwrap();
     bundle.data.native_keymap = vec![vec![Some(bytes), None, None]];
     assert!(app.validate_entlayout_file(&bundle).is_err());
+    app.keycode_picker.supports_rmk_native_key_actions = true;
+    app.validate_entlayout_file(&bundle).unwrap();
+}
+
+/// A Vial board on native v1 firmware that keeps the actions it is sent.
+fn native_v1_board() -> (crate::hid::HidDevice, crate::hid::TestHidRecorder) {
+    let (hid, recorder) = crate::hid::HidDevice::test_device();
+    let mut stored = std::collections::HashMap::new();
+    recorder.respond_by(move |request| {
+        // Ergohaven namespace, native key action.
+        if request[1..3] != [0xE8, 0x03] {
+            return None;
+        }
+        let mut response = [0; 32];
+        response[..4].copy_from_slice(&request[..4]);
+        let place = (request[4], request[5], request[6]);
+        if request[0] == 0x07 {
+            stored.insert(place, request[8..8 + usize::from(request[7])].to_vec());
+        } else {
+            let payload = stored.get(&place).cloned().unwrap_or(vec![0]);
+            response[5] = payload.len() as u8;
+            response[6..6 + payload.len()].copy_from_slice(&payload);
+        }
+        Some(Ok(response))
+    });
+    (hid, recorder)
+}
+
+#[test]
+fn a_version_10_layout_goes_to_a_vial_board_as_native_v1_actions() {
+    // A universal symbol, as the K:04 backup from a Rynk test build holds it.
+    let symbol = BASE64_STANDARD.encode([2, 19, 0x82]);
+    let mut bundle = exported(&app_with(vec![KeyBinding::Vial(0x04); 3]));
+    bundle.version = crate::rynk::entlayout::NATIVE_V2_ENTLAYOUT_VERSION;
+    bundle.data.keymap[0][1] = 0;
+    bundle.data.native_keymap = vec![vec![None, Some(symbol), None]];
+
+    let mut app = app_with(vec![KeyBinding::Vial(0x04); 3]);
+    app.layer_count = 1;
+    app.keycode_picker.supports_rmk_native_key_actions = true;
+    let (hid, recorder) = native_v1_board();
+    app.hid_device = Some(hid.into());
+    app.validate_entlayout_file(&bundle).unwrap();
+    let (failures, _, _) = app.apply_entlayout(&bundle).unwrap();
+    assert!(failures.is_empty(), "{failures:?}");
+
+    let v1 = V1KeyAction::Single(V1Action::User(0x82));
+    assert_eq!(
+        app.layout.as_ref().unwrap().layers[0][1],
+        KeyBinding::Rmk(v1)
+    );
+    let writes = recorder
+        .requests()
+        .into_iter()
+        .filter(|request| request[..3] == [0x07, 0xE8, 0x03])
+        .map(|request| request[3..11].to_vec())
+        .collect::<Vec<_>>();
+    // Protocol v1, layer 0, row 0, col 1, and the file's three bytes.
+    assert_eq!(writes, [vec![1, 0, 0, 1, 3, 2, 19, 0x82]]);
 }
 
 #[test]
@@ -287,7 +385,7 @@ fn rynk_losses_wait_for_consent_and_then_go_as_over_vial() {
     assert_eq!(data.keymap[0][1..], [0, 0x06]);
     assert!(
         matches!(
-            entlayout_native_key_action(&bundle, 0, 0, true).unwrap(),
+            entlayout_native_key_action(&bundle, 0, 0, NativeTarget::Rynk).unwrap(),
             Some(KeyBinding::Rynk(_))
         ),
         "a native v1 action goes as its upgrade"

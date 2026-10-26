@@ -429,32 +429,47 @@ fn encode_rynk_key_action(
     binding.rynk_action()
 }
 
+/// The board an import reads a file's native fields for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeTarget {
+    /// A Vial board: native v1 actions.
+    Vial,
+    /// A Rynk board: Rynk actions.
+    Rynk,
+    /// As the file holds them, so the Rynk import can list what changes.
+    AsWritten,
+}
+
 /// The native binding a file carries for one key or field, if any: a Rynk
 /// action (version 11), or a native action, which version 10 wrote in the Rynk
 /// layout and older versions as native v1. A Rynk board gets native v1 actions
-/// upgraded; what that loses was listed before the import began.
+/// upgraded; what that loses was listed before the import began. A Vial board
+/// gets Rynk actions as native v1 ones; the check before the import refused
+/// those without a v1 form.
 fn entlayout_native_binding(
     version: u16,
     native: Option<&str>,
     rynk: Option<rmk_types_rynk::action::KeyAction>,
-    rynk_target: bool,
+    target: NativeTarget,
 ) -> Result<Option<crate::keyboard::KeyBinding>> {
     use crate::keyboard::KeyBinding;
-    if let Some(action) = rynk {
-        return Ok(Some(KeyBinding::Rynk(action)));
-    }
-    let Some(encoded) = native else {
-        return Ok(None);
+    let binding = match (rynk, native) {
+        (Some(action), _) => KeyBinding::Rynk(action),
+        (None, None) => return Ok(None),
+        (None, Some(encoded)) if version == crate::rynk::entlayout::NATIVE_V2_ENTLAYOUT_VERSION => {
+            KeyBinding::Rynk(crate::rynk::entlayout::decode_v10_native_field(encoded)?)
+        }
+        (None, Some(encoded)) => KeyBinding::Rmk(decode_native_key_action(encoded)?),
     };
-    if version == crate::rynk::entlayout::NATIVE_V2_ENTLAYOUT_VERSION {
-        return crate::rynk::entlayout::decode_v10_native_field(encoded)
-            .map(|action| Some(KeyBinding::Rynk(action)));
-    }
-    let action = decode_native_key_action(encoded)?;
-    Ok(Some(if rynk_target {
-        KeyBinding::Rynk(crate::rynk::native_v1::upgrade_native_v1_key_action(action).action)
-    } else {
-        KeyBinding::Rmk(action)
+    Ok(Some(match (binding, target) {
+        (KeyBinding::Rmk(action), NativeTarget::Rynk) => {
+            KeyBinding::Rynk(crate::rynk::native_v1::upgrade_native_v1_key_action(action).action)
+        }
+        (KeyBinding::Rynk(action), NativeTarget::Vial) => KeyBinding::Rmk(
+            crate::rynk::native_v1::downgrade_key_action(action)
+                .with_context(|| format!("{action:?} has no native v1 form"))?,
+        ),
+        (binding, _) => binding,
     }))
 }
 
@@ -463,19 +478,17 @@ fn entlayout_dynamic_binding(
     keycode: u16,
     native: Option<&str>,
     rynk: Option<rmk_types_rynk::action::KeyAction>,
-    rynk_target: bool,
+    target: NativeTarget,
 ) -> Result<crate::keyboard::KeyBinding> {
-    Ok(
-        entlayout_native_binding(version, native, rynk, rynk_target)?
-            .unwrap_or(crate::keyboard::KeyBinding::Vial(keycode)),
-    )
+    Ok(entlayout_native_binding(version, native, rynk, target)?
+        .unwrap_or(crate::keyboard::KeyBinding::Vial(keycode)))
 }
 
 fn entlayout_native_key_action(
     bundle: &EntLayoutFile,
     layer: usize,
     key: usize,
-    rynk_target: bool,
+    target: NativeTarget,
 ) -> Result<Option<crate::keyboard::KeyBinding>> {
     let native = bundle
         .data
@@ -490,39 +503,65 @@ fn entlayout_native_key_action(
         .and_then(|layer| layer.get(key))
         .copied()
         .flatten();
-    entlayout_native_binding(bundle.version, native, rynk, rynk_target)
+    entlayout_native_binding(bundle.version, native, rynk, target)
 }
 
-/// Whether the file holds actions only a Rynk board takes: version 10 native
-/// fields or version 11 Rynk fields.
-fn entlayout_has_rynk_actions(bundle: &EntLayoutFile) -> bool {
-    let data = &bundle.data;
-    let v10_native = bundle.version == crate::rynk::entlayout::NATIVE_V2_ENTLAYOUT_VERSION
-        && (!native_keymap_is_empty(&data.native_keymap)
-            || data
-                .combos
-                .entries
-                .iter()
-                .any(|entry| entry.native_output.is_some())
-            || data.tap_dance.entries.iter().any(|entry| {
-                entry.native_on_tap.is_some()
-                    || entry.native_on_hold.is_some()
-                    || entry.native_on_double_tap.is_some()
-                    || entry.native_on_tap_hold.is_some()
-            }));
-    v10_native
-        || !rynk_keymap_is_empty(&data.rynk_keymap)
-        || data
-            .combos
-            .entries
-            .iter()
-            .any(|entry| entry.rynk_output.is_some())
-        || data.tap_dance.entries.iter().any(|entry| {
-            entry.rynk_on_tap.is_some()
-                || entry.rynk_on_hold.is_some()
-                || entry.rynk_on_double_tap.is_some()
-                || entry.rynk_on_tap_hold.is_some()
-        })
+/// The Rynk actions in a file a Vial board cannot take, with their places: an
+/// action without a native v1 form, or any where the firmware takes no native
+/// actions.
+fn entlayout_actions_off_vial(
+    bundle: &EntLayoutFile,
+    key_actions: bool,
+    combo_outputs: bool,
+    tap_dance_actions: bool,
+) -> Result<
+    Vec<(
+        crate::rynk::entlayout::BindingPlace,
+        rmk_types_rynk::action::KeyAction,
+    )>,
+> {
+    use crate::keyboard::KeyBinding;
+    use crate::rynk::entlayout::BindingPlace;
+    let mut misfits = Vec::new();
+    let mut check = |binding, place, supported: bool| {
+        if let Some(KeyBinding::Rynk(action)) = binding {
+            if !supported || crate::rynk::native_v1::downgrade_key_action(action).is_none() {
+                misfits.push((place, action));
+            }
+        }
+    };
+    for (layer, codes) in bundle.data.keymap.iter().enumerate() {
+        for key in 0..codes.len() {
+            let binding = entlayout_native_key_action(bundle, layer, key, NativeTarget::AsWritten)?;
+            check(binding, BindingPlace::Key { layer, key }, key_actions);
+        }
+    }
+    for (index, entry) in bundle.data.combos.entries.iter().enumerate() {
+        let binding = entlayout_native_binding(
+            bundle.version,
+            entry.native_output.as_deref(),
+            entry.rynk_output,
+            NativeTarget::AsWritten,
+        )?;
+        check(binding, BindingPlace::ComboOutput { index }, combo_outputs);
+    }
+    for (index, entry) in bundle.data.tap_dance.entries.iter().enumerate() {
+        let mut entry = entry.clone();
+        for (field, (_, native, rynk)) in enttap_dance_fields(&mut entry).into_iter().enumerate() {
+            let binding = entlayout_native_binding(
+                bundle.version,
+                native.as_deref(),
+                *rynk,
+                NativeTarget::AsWritten,
+            )?;
+            check(
+                binding,
+                BindingPlace::TapDance { index, field },
+                tap_dance_actions,
+            );
+        }
+    }
+    Ok(misfits)
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1865,13 +1904,34 @@ impl EntropyApp {
         {
             bail!("inconsistent Rynk key-action counts");
         }
-        if !self.entlayout_target_is_rynk() && entlayout_has_rynk_actions(bundle) {
-            bail!(
-                "{}",
-                crate::i18n::tr_catalog(self.app_settings.language, "entlayout.rynk_only")
-            );
+        if !self.entlayout_target_is_rynk() {
+            let misfits = entlayout_actions_off_vial(
+                bundle,
+                self.keycode_picker.supports_rmk_native_key_actions,
+                self.keycode_picker.supports_rmk_native_combo_output,
+                self.keycode_picker.supports_rmk_native_tap_dance_actions,
+            )?;
+            if !misfits.is_empty() {
+                let lang = self.app_settings.language;
+                let header = crate::i18n::tr_catalog(lang, "entlayout.off_vial");
+                bail!(
+                    "{}",
+                    std::iter::once(header.to_owned())
+                        .chain(misfits.iter().map(|(place, action)| {
+                            crate::rynk::entlayout::describe_place(
+                                lang,
+                                *place,
+                                &format!("{action:?}"),
+                            )
+                        }))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+            }
         }
-        let decode = |encoded| entlayout_native_binding(bundle.version, Some(encoded), None, false);
+        let decode = |encoded| {
+            entlayout_native_binding(bundle.version, Some(encoded), None, NativeTarget::AsWritten)
+        };
         for layer in &bundle.data.native_keymap {
             for encoded in layer.iter().flatten() {
                 decode(encoded)?;
@@ -2281,6 +2341,14 @@ impl EntropyApp {
             .is_some_and(crate::device_session::DeviceSession::is_rynk)
     }
 
+    fn entlayout_native_target(&self) -> NativeTarget {
+        if self.entlayout_target_is_rynk() {
+            NativeTarget::Rynk
+        } else {
+            NativeTarget::Vial
+        }
+    }
+
     /// What `bundle` would lose on a Rynk board: the editor state after the
     /// import, built the way the import builds it, checked whole.
     fn entlayout_rynk_losses(
@@ -2310,7 +2378,7 @@ impl EntropyApp {
                     bundle,
                     source_layer_idx,
                     source_key_idx,
-                    false,
+                    NativeTarget::AsWritten,
                 )? {
                     Some(binding) => binding,
                     None => map_entlayout_keycode(keycode, bundle, layout, limits).into(),
@@ -2373,7 +2441,7 @@ impl EntropyApp {
                         entry.output,
                         entry.native_output.as_deref(),
                         entry.rynk_output,
-                        false,
+                        NativeTarget::AsWritten,
                     )?,
                     layer: entry.layer,
                 };
@@ -2391,7 +2459,13 @@ impl EntropyApp {
         {
             if let Some(entry) = remap_enttap_dance_entry(entry, bundle, layout, limits) {
                 let binding = |keycode, native: &Option<String>, rynk| {
-                    entlayout_dynamic_binding(version, keycode, native.as_deref(), rynk, false)
+                    entlayout_dynamic_binding(
+                        version,
+                        keycode,
+                        native.as_deref(),
+                        rynk,
+                        NativeTarget::AsWritten,
+                    )
                 };
                 tap_dances[idx] = crate::keycode_picker::TapDanceEntry {
                     on_tap: binding(entry.on_tap, &entry.native_on_tap, entry.rynk_on_tap)?,
@@ -2998,6 +3072,7 @@ impl EntropyApp {
         let limits = self.entlayout_keycode_import_limits();
         // Rynk boards take every native action and combo layers.
         let rynk_target = self.entlayout_target_is_rynk();
+        let target = self.entlayout_native_target();
         let supports_rmk_native_key_actions =
             self.keycode_picker.supports_rmk_native_key_actions || rynk_target;
         let supports_rmk_native_combo_output = self.keycode_picker.supports_rmk_native_combo_output;
@@ -3031,7 +3106,7 @@ impl EntropyApp {
                         bundle,
                         source_layer_idx,
                         source_key_idx,
-                        rynk_target,
+                        target,
                     )? {
                         Some(binding) => {
                             if !supports_rmk_native_key_actions {
@@ -3219,7 +3294,7 @@ impl EntropyApp {
                     combo.output,
                     combo.native_output.as_deref(),
                     combo.rynk_output,
-                    rynk_target,
+                    target,
                 )?;
                 if output.rmk_action().is_some() && !supports_rmk_native_combo_output {
                     bail!("target firmware does not support native RMK Combo outputs");
@@ -3269,7 +3344,7 @@ impl EntropyApp {
                         keycode,
                         native.as_deref(),
                         rynk,
-                        rynk_target,
+                        target,
                     )
                 };
                 let actions = [
@@ -3387,6 +3462,7 @@ impl EntropyApp {
     ) -> Result<()> {
         let limits = self.entlayout_keycode_import_limits();
         let rynk_target = self.entlayout_target_is_rynk();
+        let target = self.entlayout_native_target();
         let supports_rmk_native_key_actions =
             self.keycode_picker.supports_rmk_native_key_actions || rynk_target;
         if let Some(layout) = &mut self.layout {
@@ -3410,7 +3486,7 @@ impl EntropyApp {
                             bundle,
                             source_layer_idx,
                             source_key_idx,
-                            rynk_target,
+                            target,
                         )? {
                             Some(binding) if supports_rmk_native_key_actions => {
                                 *slot = binding;
@@ -3677,7 +3753,7 @@ impl EntropyApp {
                             entry.output,
                             entry.native_output.as_deref(),
                             entry.rynk_output,
-                            rynk_target,
+                            target,
                         )?,
                         layer,
                     };
@@ -3701,28 +3777,28 @@ impl EntropyApp {
                             entry.on_tap,
                             entry.native_on_tap.as_deref(),
                             entry.rynk_on_tap,
-                            rynk_target,
+                            target,
                         )?,
                         on_hold: entlayout_dynamic_binding(
                             bundle.version,
                             entry.on_hold,
                             entry.native_on_hold.as_deref(),
                             entry.rynk_on_hold,
-                            rynk_target,
+                            target,
                         )?,
                         on_double_tap: entlayout_dynamic_binding(
                             bundle.version,
                             entry.on_double_tap,
                             entry.native_on_double_tap.as_deref(),
                             entry.rynk_on_double_tap,
-                            rynk_target,
+                            target,
                         )?,
                         on_tap_hold: entlayout_dynamic_binding(
                             bundle.version,
                             entry.on_tap_hold,
                             entry.native_on_tap_hold.as_deref(),
                             entry.rynk_on_tap_hold,
-                            rynk_target,
+                            target,
                         )?,
                         tapping_term: entry.tapping_term,
                     };
@@ -4289,7 +4365,13 @@ fn rynk_tap_dance(
     entry: &EntTapDanceEntry,
 ) -> Result<[crate::keyboard::KeyBinding; 4]> {
     let binding = |keycode, native: &Option<String>, rynk| {
-        entlayout_dynamic_binding(version, keycode, native.as_deref(), rynk, true)
+        entlayout_dynamic_binding(
+            version,
+            keycode,
+            native.as_deref(),
+            rynk,
+            NativeTarget::Rynk,
+        )
     };
     Ok([
         binding(entry.on_tap, &entry.native_on_tap, entry.rynk_on_tap)?,
@@ -5480,11 +5562,19 @@ mod tests {
             .expect("universal symbol should fit");
 
         assert_eq!(
-            entlayout_dynamic_binding(ENTLAYOUT_VERSION, 0, Some(&encoded), None, false).unwrap(),
+            entlayout_dynamic_binding(
+                ENTLAYOUT_VERSION,
+                0,
+                Some(&encoded),
+                None,
+                NativeTarget::Vial
+            )
+            .unwrap(),
             binding
         );
         assert_eq!(
-            entlayout_dynamic_binding(ENTLAYOUT_VERSION, 0x0004, None, None, false).unwrap(),
+            entlayout_dynamic_binding(ENTLAYOUT_VERSION, 0x0004, None, None, NativeTarget::Vial)
+                .unwrap(),
             crate::keyboard::KeyBinding::Vial(0x0004)
         );
 

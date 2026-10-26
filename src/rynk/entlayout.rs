@@ -408,31 +408,41 @@ pub(crate) fn describe_macro_write_losses(
     lines.join("\n")
 }
 
-fn describe_loss(language: crate::i18n::Language, loss: &ImportLoss) -> String {
+/// One line of an import error: where it is and what is wrong there.
+pub(crate) fn describe_place(
+    language: crate::i18n::Language,
+    place: BindingPlace,
+    detail: &str,
+) -> String {
     let tr = |key, vars: &[(&str, &str)]| crate::i18n::tr_catalog_format(language, key, vars);
-    let keycode = |keycode: u16| format!("{keycode:#06x}");
-    let at = |place: BindingPlace, detail: String| match place {
+    match place {
         BindingPlace::Key { layer, key } => tr(
             "rynk_import.key",
             &[
                 ("layer", &layer.to_string()),
                 ("key", &key.to_string()),
-                ("detail", &detail),
+                ("detail", detail),
             ],
         ),
         BindingPlace::ComboOutput { index } => tr(
             "rynk_import.combo_output",
-            &[("index", &index.to_string()), ("detail", &detail)],
+            &[("index", &index.to_string()), ("detail", detail)],
         ),
         BindingPlace::TapDance { index, field } => tr(
             "rynk_import.tap_dance_field",
             &[
                 ("index", &index.to_string()),
                 ("field", &(field + 1).to_string()),
-                ("detail", &detail),
+                ("detail", detail),
             ],
         ),
-    };
+    }
+}
+
+fn describe_loss(language: crate::i18n::Language, loss: &ImportLoss) -> String {
+    let tr = |key, vars: &[(&str, &str)]| crate::i18n::tr_catalog_format(language, key, vars);
+    let keycode = |keycode: u16| format!("{keycode:#06x}");
+    let at = |place: BindingPlace, detail: String| describe_place(language, place, &detail);
     let binding = |error: &KeyBindingError| match error {
         KeyBindingError::UnsupportedKeycode(code) => tr(
             "rynk_import.unsupported_keycode",
