@@ -38,25 +38,31 @@ pub(super) fn scan() -> Result<Vec<Device>, String> {
     })
 }
 
+/// A hidraw node: its name, its `device` link and the inode of its sysfs
+/// directory, which is made anew whenever the node is.
+#[cfg(target_os = "linux")]
+type HidrawNode = (std::ffi::OsString, std::path::PathBuf, u64);
+
 /// A complete scan and the hidraw nodes it was taken over.
 #[cfg(target_os = "linux")]
 struct LinuxSnapshot {
-    nodes: Vec<(std::ffi::OsString, std::path::PathBuf)>,
+    nodes: Vec<HidrawNode>,
     devices: Vec<Device>,
 }
 
 // hidapi reads every sysfs attribute of every hidraw node and all its ancestors:
 // about 100 ms of CPU a pass, every 2 s. A node's `device` link names its HID
-// instance, which the kernel numbers anew on every registration, so while the
-// links stay the same the last complete result still holds. Only a complete
-// (validated) result is kept; an incomplete one is retried in full.
+// instance, which the kernel numbers anew on every registration, and a driver
+// rebind that keeps the instance still makes the node anew, under a new inode.
+// So while the nodes stay the same the last complete result still holds. Only
+// a complete (validated) result is kept, and only one the nodes did not change
+// under; anything else is retried in full.
 #[cfg(target_os = "linux")]
 fn scan_unless_unchanged(
     root: &std::path::Path,
     last: &std::sync::Mutex<Option<LinuxSnapshot>>,
     scan: impl FnOnce() -> Result<Vec<Device>, String>,
 ) -> Result<Vec<Device>, String> {
-    // Read before the scan: a node that changes during it differs next time.
     let nodes = hidraw_nodes(root);
     if let (Some(nodes), Some(last)) = (&nodes, &*last.lock().unwrap_or_else(|e| e.into_inner())) {
         if last.nodes == *nodes {
@@ -64,7 +70,10 @@ fn scan_unless_unchanged(
         }
     }
     let result = scan();
-    *last.lock().unwrap_or_else(|e| e.into_inner()) = match (nodes, &result) {
+    // A node unbound or rebound while hidapi enumerated reads differently
+    // after the scan than before it: what the scan saw is not kept.
+    let unchanged = nodes.filter(|nodes| hidraw_nodes(root).as_ref() == Some(nodes));
+    *last.lock().unwrap_or_else(|e| e.into_inner()) = match (unchanged, &result) {
         (Some(nodes), Ok(devices)) => Some(LinuxSnapshot {
             nodes,
             devices: devices.clone(),
@@ -74,16 +83,20 @@ fn scan_unless_unchanged(
     result
 }
 
-/// Every hidraw node with its `device` link, sorted; `None` when any is unreadable.
+/// Every hidraw node, sorted; `None` when any is unreadable.
 #[cfg(target_os = "linux")]
-fn hidraw_nodes(root: &std::path::Path) -> Option<Vec<(std::ffi::OsString, std::path::PathBuf)>> {
+fn hidraw_nodes(root: &std::path::Path) -> Option<Vec<HidrawNode>> {
+    use std::os::unix::fs::MetadataExt;
+
     let mut nodes = std::fs::read_dir(root)
         .ok()?
         .map(|entry| {
             let entry = entry.ok()?;
+            let path = entry.path();
             Some((
                 entry.file_name(),
-                std::fs::read_link(entry.path().join("device")).ok()?,
+                std::fs::read_link(path.join("device")).ok()?,
+                std::fs::metadata(&path).ok()?.ino(),
             ))
         })
         .collect::<Option<Vec<_>>>()?;
@@ -531,6 +544,48 @@ mod tests {
         // Re-enumerated under the same node name: a new HID instance.
         link_node(root, "hidraw0", "0003:FFFF:FFFF.0003");
         assert_eq!(pass(root, &last, Ok(vec![])), (Ok(vec![]), true));
+    }
+
+    /// Makes the node `name` anew under the same HID instance, as a driver
+    /// rebind does. The new directory exists before the old one goes.
+    #[cfg(target_os = "linux")]
+    fn rebind_node(root: &std::path::Path, name: &str, instance: &str) {
+        let staged = root.join(format!("{name}.rebound"));
+        std::fs::create_dir_all(&staged).unwrap();
+        std::os::unix::fs::symlink(format!("../../../{instance}"), staged.join("device")).unwrap();
+        std::fs::remove_dir_all(root.join(name)).unwrap();
+        std::fs::rename(&staged, root.join(name)).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_usb_scan_keeps_nothing_a_rebind_ran_under() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let keyboard = Ok(vec![fixture_device("/dev/hidraw0")]);
+        let found = || (Ok(vec!["/dev/hidraw0".to_owned()]), true);
+
+        // Unbound while hidapi enumerated, then bound again to the same HID
+        // instance under the same node name: its link reads as before.
+        let last = std::sync::Mutex::new(None);
+        link_node(root, "hidraw0", "0003:FFFF:FFFF.0001");
+        let unbound = scan_unless_unchanged(root, &last, || {
+            std::fs::remove_dir_all(root.join("hidraw0")).unwrap();
+            Ok(vec![])
+        });
+        assert!(unbound.is_ok_and(|devices| devices.is_empty()));
+        link_node(root, "hidraw0", "0003:FFFF:FFFF.0001");
+        assert_eq!(pass(root, &last, keyboard.clone()), found());
+
+        // Unbound and bound again, both while hidapi enumerated.
+        let last = std::sync::Mutex::new(None);
+        let rebound = scan_unless_unchanged(root, &last, || {
+            rebind_node(root, "hidraw0", "0003:FFFF:FFFF.0001");
+            Ok(vec![])
+        });
+        assert!(rebound.is_ok_and(|devices| devices.is_empty()));
+        assert_eq!(pass(root, &last, keyboard), found());
+        assert!(!pass(root, &last, Ok(vec![])).1, "a steady node is kept");
     }
 
     #[test]
