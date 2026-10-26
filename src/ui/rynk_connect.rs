@@ -62,12 +62,15 @@ impl EntropyApp {
         layout.firmware = FirmwareProtocol::Rynk;
         // The definition names the host data the screen shows; the firmware
         // says which of it SetHostData takes. The volume it shows nowhere.
+        // Universal Symbols follow the host layout whether a screen shows it
+        // or not, as over Vial.
         let takes = |cap| info.caps & cap != 0;
         let live = &mut layout.live_features;
         live.extended_host_protocol = false;
         live.time &= takes(caps::HOST_TIME);
         live.volume = false;
-        live.layout &= takes(caps::HOST_KEYBOARD_LAYOUT);
+        live.layout =
+            (live.layout || takes(caps::UNIVERSAL_SYMBOLS)) && takes(caps::HOST_KEYBOARD_LAYOUT);
         live.media &= takes(caps::HOST_MEDIA);
         use_device_name_for_unnamed_layout(&mut layout, &dev.name);
         if (layout.rows, layout.cols)
@@ -392,10 +395,13 @@ mod tests {
     use rmk_types_rynk::keyboard_macros::MacroOp;
     use rmk_types_rynk::keycode::{HidKeyCode, KeyCode};
     use rmk_types_rynk::morse::{Morse, TAP};
-    use rmk_types_rynk::protocol::rynk::ergohaven::BatteryHalves;
+    use rmk_types_rynk::protocol::rynk::ergohaven::{BatteryHalves, HostDataUpdate};
 
     use super::*;
     use crate::keyboard::KeyBinding;
+    use crate::qmk_hid_host::rynk_bridge::testing::{
+        await_updates, board as host_board, link as host_link, Desktop,
+    };
     use crate::rynk::session::testing::{board, link, Stored};
 
     fn key(code: HidKeyCode) -> KeyAction {
@@ -546,6 +552,43 @@ mod tests {
             panic!("a board whose matrix differs connected");
         };
         assert!(error.contains("differs"), "{error}");
+    }
+
+    /// The Rynk side of `universal_symbols_capability_enables_existing_layout_sync_bridge`:
+    /// Phenom's definition names no host data, yet its Universal Symbols need
+    /// the layout, so the board's caps turn the layout sync on.
+    #[test]
+    fn universal_symbols_cap_enables_the_layout_sync_bridge() {
+        for (caps, layout) in [
+            (caps::UNIVERSAL_SYMBOLS | caps::HOST_KEYBOARD_LAYOUT, true),
+            (caps::UNIVERSAL_SYMBOLS, false),
+            (caps::HOST_KEYBOARD_LAYOUT, false),
+        ] {
+            let mut stored = stored();
+            stored.caps = caps;
+            let (board, _) = board(stored);
+            let path = format!("connect-layout-{caps:#x}");
+            let _held = link(&path, &board);
+
+            let result = connect(&path).unwrap();
+
+            assert_eq!(result.layout.live_features.layout, layout, "{caps:#x}");
+            let mode =
+                EntropyApp::qmk_hid_host_mode_for(&result.layout, result.layout_options_value);
+            assert_eq!(mode.layout, layout, "{caps:#x}");
+            if !layout {
+                continue;
+            }
+            // That mode's bridge gives such a board the desktop's layout.
+            let desktop = Desktop::new();
+            desktop.show(Some(1), None);
+            let (host, received) = host_board(caps);
+            let _bridge = desktop.bridge(host_link(&format!("{path}-host"), &host), mode);
+            assert_eq!(
+                await_updates(&received, 1),
+                [HostDataUpdate::KeyboardLayout(1)]
+            );
+        }
     }
 
     #[test]

@@ -460,6 +460,36 @@ mod tests {
         HostDataUpdate::MediaTitle(text.as_bytes().try_into().unwrap())
     }
 
+    /// The firmware's Universal Symbols read 0 as English and 1 as Russian
+    /// (`HostLayout::from_host_code`): the desktop's layout index goes as it
+    /// is, as over Vial, so `us,ru` is EN then RU.
+    #[test]
+    fn the_layout_index_is_the_code_the_firmware_reads() {
+        let desktop = Desktop::new();
+        desktop.show(Some(0), None);
+        let (board, received) = board(ALL_HOST_DATA);
+        let link = link("rynk-bridge-layout-index", &board);
+        let layout_only = HostDataMode {
+            time: false,
+            volume: false,
+            layout: true,
+            media: false,
+        };
+        let bridge = desktop.bridge(link, layout_only);
+        assert_eq!(
+            await_updates(&received, 1),
+            [HostDataUpdate::KeyboardLayout(0)]
+        );
+        assert_eq!(bridge.layout_label(), Some("EN"));
+
+        desktop.show(Some(1), None);
+        assert_eq!(
+            await_updates(&received, 2)[1..],
+            [HostDataUpdate::KeyboardLayout(1)]
+        );
+        assert_eq!(bridge.layout_label(), Some("RU"));
+    }
+
     #[test]
     fn the_board_gets_everything_at_start_then_only_what_changes() {
         let desktop = Desktop::new();
