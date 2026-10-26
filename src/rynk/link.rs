@@ -53,7 +53,9 @@ impl<T: RynkTransport + ?Sized> RynkTransport for Box<T> {
     }
 }
 
-type Client = RynkClient<BoxedTransport>;
+/// The client a link's owner holds, as [`RynkLink::run`] hands it out.
+pub(crate) type LinkClient = RynkClient<BoxedTransport>;
+type Client = LinkClient;
 type Job = Box<dyn FnOnce(&mut Client) -> Result<(), RynkClientError> + Send>;
 
 enum Event {
@@ -194,6 +196,12 @@ impl RynkLink {
         &self.id
     }
 
+    /// Whether the link can still carry requests: false once the board went
+    /// away under it.
+    pub(crate) fn is_open(&self) -> bool {
+        !self.closed.is_done()
+    }
+
     /// What the board reported when the link opened.
     pub(crate) fn board(&self) -> &RynkBoard {
         &self.board
@@ -206,9 +214,21 @@ impl RynkLink {
         E::Request: Send + 'static,
         E::Response: Send + 'static,
     {
+        self.run(move |client| client.request::<E>(&request))
+    }
+
+    /// Runs `operation` on the client as one editor request, so the requests
+    /// it makes in a row (a paged read, a bulk write) are not interleaved.
+    pub(crate) fn run<R>(
+        &self,
+        operation: impl FnOnce(&mut LinkClient) -> Result<R, RynkClientError> + Send + 'static,
+    ) -> Result<R, RynkClientError>
+    where
+        R: Send + 'static,
+    {
         let (reply, answer) = mpsc::channel();
         let job: Job = Box::new(move |client| {
-            let result = client.request::<E>(&request);
+            let result = operation(client);
             let failed = result.as_ref().err().map(link_failed).unwrap_or(false);
             let _ = reply.send(result);
             if failed {
@@ -257,8 +277,12 @@ impl Drop for RynkLink {
     }
 }
 
+/// Worded so the UI reads it as a disconnect, as it does a Vial board's.
 fn closed_error() -> RynkClientError {
-    RynkClientError::Transport(io::ErrorKind::NotConnected.into())
+    RynkClientError::Transport(io::Error::new(
+        io::ErrorKind::NotConnected,
+        "the board is disconnected",
+    ))
 }
 
 /// Errors after which the link cannot carry another request.
@@ -522,6 +546,42 @@ mod tests {
     }
 
     #[test]
+    fn a_run_keeps_its_requests_together() {
+        let (board, log, release, held) = gated_board();
+        let link = RynkLink::acquire(id("run"), quick(), open(&board)).unwrap();
+        let blocker = {
+            let link = link.clone();
+            std::thread::spawn(move || link.request::<command::GetDefaultLayer>(()))
+        };
+        held.recv_timeout(Duration::from_secs(3)).unwrap();
+        link.post::<command::SetDefaultLayer>(0, 7).unwrap();
+        let run = {
+            let link = link.clone();
+            std::thread::spawn(move || {
+                link.run(|client| {
+                    let first = client.request::<command::GetCurrentLayer>(&())?;
+                    let second = client.request::<command::GetCurrentLayer>(&())?;
+                    Ok(first + second)
+                })
+            })
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        release.send(()).unwrap();
+        assert_eq!(run.join().unwrap().unwrap(), 6);
+        blocker.join().unwrap().unwrap();
+        eventually("the post is sent", || commands(&log).len() == 4);
+
+        assert_eq!(
+            commands(&log)[1..],
+            [
+                (Cmd::GetCurrentLayer, 0),
+                (Cmd::GetCurrentLayer, 0),
+                (Cmd::SetDefaultLayer, 7),
+            ]
+        );
+    }
+
+    #[test]
     fn a_post_keeps_only_the_latest_value_of_its_slot() {
         let (board, log, release, held) = gated_board();
         let link = RynkLink::acquire(id("coalesce"), quick(), open(&board)).unwrap();
@@ -607,9 +667,12 @@ mod tests {
         let broken = RynkLink::acquire(id("broken"), quick(), &mut open).unwrap();
         unplugged.store(true, Ordering::SeqCst);
         assert!(broken.request::<command::GetCurrentLayer>(()).is_err());
+        let stopped = broken
+            .request::<command::GetCurrentLayer>(())
+            .expect_err("the stopped owner answers nothing more");
         assert!(
-            broken.request::<command::GetCurrentLayer>(()).is_err(),
-            "the stopped owner answers nothing more"
+            crate::hid::is_disconnect_error(&anyhow::Error::new(stopped)),
+            "the UI sees the board gone"
         );
 
         unplugged.store(false, Ordering::SeqCst);

@@ -549,7 +549,7 @@ impl EntropyApp {
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn read_behavior_settings(
         supported_qmk_settings: &[u16],
-        dev_conn: &crate::hid::HidDevice,
+        dev_conn: &impl crate::device_session::QmkSettingsSource,
     ) -> BehaviorSettingsState {
         let has_qmk_setting = |qsid: u16| supported_qmk_settings.contains(&qsid);
 
@@ -781,7 +781,7 @@ impl EntropyApp {
     pub(super) fn read_touchpad_settings(
         json: &serde_json::Value,
         supported_qmk_settings: &[u16],
-        dev_conn: &crate::hid::HidDevice,
+        dev_conn: &impl crate::device_session::QmkSettingsSource,
     ) -> TouchpadSettingsState {
         let mut settings = TouchpadSettingsState::default();
         if !Self::layout_json_has_touchpad_settings(json)
@@ -868,7 +868,7 @@ impl EntropyApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn read_bluetooth_select_setting(
-        dev_conn: &crate::hid::HidDevice,
+        dev_conn: &impl crate::device_session::QmkSettingsSource,
         field: &serde_json::Value,
         qsid: u16,
         label: &str,
@@ -899,7 +899,7 @@ impl EntropyApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn read_bluetooth_boolean_setting(
-        dev_conn: &crate::hid::HidDevice,
+        dev_conn: &impl crate::device_session::QmkSettingsSource,
         field: &serde_json::Value,
         qsid: u16,
         label: &str,
@@ -918,7 +918,7 @@ impl EntropyApp {
     pub(super) fn read_bluetooth_settings(
         json: &serde_json::Value,
         supported_qmk_settings: &[u16],
-        dev_conn: &crate::hid::HidDevice,
+        dev_conn: &impl crate::device_session::QmkSettingsSource,
     ) -> BluetoothSettingsState {
         let has_qmk_setting = |qsid: u16| supported_qmk_settings.contains(&qsid);
         let mut charge_indicator = None;
@@ -1129,7 +1129,7 @@ impl EntropyApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn read_layer_led_numeric_setting(
-        dev_conn: &crate::hid::HidDevice,
+        dev_conn: &impl crate::device_session::QmkSettingsSource,
         qsid: u16,
         width: u8,
         max: u16,
@@ -1203,7 +1203,7 @@ impl EntropyApp {
         json: &serde_json::Value,
         supported_qmk_settings: &[u16],
         layer_count: usize,
-        dev_conn: &crate::hid::HidDevice,
+        dev_conn: &impl crate::device_session::QmkSettingsSource,
     ) -> LayerLedSettingsState {
         let has_qmk_setting = |qsid: u16| supported_qmk_settings.contains(&qsid);
         let mut brightness = None;
@@ -1350,7 +1350,7 @@ impl EntropyApp {
     fn read_legacy_layer_led_settings(
         supported_qmk_settings: &[u16],
         layer_count: usize,
-        dev_conn: &crate::hid::HidDevice,
+        dev_conn: &impl crate::device_session::QmkSettingsSource,
     ) -> LayerLedSettingsState {
         let has_qmk_setting = |qsid: u16| supported_qmk_settings.contains(&qsid);
         let mut leds = LayerLedSettingsState::default();
@@ -1699,7 +1699,7 @@ impl EntropyApp {
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn read_initial_module_values(
         settings: &mut ModuleSettingsState,
-        dev_conn: &crate::hid::HidDevice,
+        dev_conn: &impl crate::device_session::QmkSettingsSource,
     ) {
         let selectors = settings
             .groups
@@ -1739,7 +1739,7 @@ impl EntropyApp {
     pub(super) fn read_module_settings(
         json: &serde_json::Value,
         supported_qmk_settings: &[u16],
-        dev_conn: &crate::hid::HidDevice,
+        dev_conn: &impl crate::device_session::QmkSettingsSource,
     ) -> ModuleSettingsState {
         let mut settings = Self::module_settings_from_definition(json, supported_qmk_settings);
         if !settings.supported {

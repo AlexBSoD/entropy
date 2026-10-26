@@ -235,7 +235,8 @@ enum VialHidOutcome {
     Battery(Option<crate::hid::BatteryHalves>),
     KeyWritten,
     EncoderWritten,
-    MacrosWritten,
+    /// What of the macros the board does not run, by macro.
+    MacrosWritten(Vec<(usize, crate::rynk::macros::MacroLoss)>),
     BackgroundUploaded(crate::app::standby_background::BackgroundUploadResult),
     BackgroundCleared,
     BackgroundCancelled {
@@ -339,8 +340,8 @@ fn run_vial_hid_operation_with_progress(
         VialHidOperation::MacroWrite { macros, .. } => {
             let size = hid.get_macro_buffer_size()?;
             let buffer = crate::hid::HidDevice::encode_macros(&macros, size);
-            hid.set_macro_buffer(&buffer)?;
-            Ok(VialHidOutcome::MacrosWritten)
+            hid.set_macro_buffer(&buffer)
+                .map(VialHidOutcome::MacrosWritten)
         }
         VialHidOperation::BackgroundUpload {
             path,
@@ -866,18 +867,30 @@ impl EntropyApp {
                     );
                 }
             }
-            Ok(VialHidOutcome::MacrosWritten) => {
+            Ok(VialHidOutcome::MacrosWritten(losses)) => {
                 let VialHidOperation::MacroWrite { revision, .. } = &result.operation else {
                     unreachable!("macro outcome must come from a macro write operation");
                 };
                 if self.keycode_picker.macro_edit_revision == *revision {
                     self.keycode_picker.mark_macros_clean();
                 }
-                self.status_msg = crate::i18n::tr_catalog(
-                    self.app_settings.language,
-                    "status_messages.macros_saved",
-                )
-                .into();
+                let language = self.app_settings.language;
+                self.status_msg =
+                    crate::i18n::tr_catalog(language, "status_messages.macros_saved").into();
+                if !losses.is_empty() {
+                    // As an import would: the editor still shows what the
+                    // board left out, so say it where it is seen.
+                    let message =
+                        crate::rynk::entlayout::describe_macro_write_losses(language, &losses);
+                    log::warn!("{message}");
+                    self.import_report_title = crate::i18n::tr_catalog(
+                        language,
+                        "status_messages.macros_saved_with_losses_title",
+                    )
+                    .into();
+                    self.import_report_body = message;
+                    self.import_report_open = true;
+                }
             }
             Ok(VialHidOutcome::BackgroundUploaded(upload)) => {
                 self.app_settings.standby_background_source_path = Some(upload.source_path.clone());
@@ -1861,6 +1874,59 @@ mod tests {
             run_vial_hid_operation(&hid, operation).unwrap();
         }
         crate::golden_frames::assert_vial_frames("hid_operations", &recorder.requests());
+    }
+
+    #[test]
+    fn a_macro_write_with_losses_opens_the_report_as_an_import_would() {
+        use crate::rynk::macros::MacroLoss;
+        let language = crate::i18n::Language::English;
+        let rynk = vec![(0, MacroLoss::Byte(0xD0)), (0, MacroLoss::Byte(0x96))];
+        for losses in [rynk, Vec::new()] {
+            let mut app = EntropyApp::new_inert_for_test();
+            app.app_settings.language = language;
+            let ctx = egui::Context::default();
+            let operation = VialHidOperation::MacroWrite {
+                macros: vec!["a\u{416}".as_bytes().to_vec()],
+                revision: 0,
+            };
+            let (sender, receiver) = std::sync::mpsc::channel();
+            app.vial_hid_task = Some(VialHidTask {
+                receiver,
+                operation: operation.clone(),
+                generation: app.connection_generation,
+                progress: Default::default(),
+                cancel: Default::default(),
+            });
+            sender
+                .send(VialHidTaskResult {
+                    hid_device: None,
+                    operation,
+                    outcome: Ok(VialHidOutcome::MacrosWritten(losses.clone())),
+                    disconnected: false,
+                    generation: app.connection_generation,
+                })
+                .unwrap();
+
+            app.poll_vial_hid_task_with_settings_save(&ctx, |_| panic!("no settings write"));
+
+            assert_eq!(
+                app.status_msg,
+                crate::i18n::tr_catalog(language, "status_messages.macros_saved")
+            );
+            if losses.is_empty() {
+                assert!(!app.import_report_open, "a Vial board stores the bytes");
+                continue;
+            }
+            assert!(app.import_report_open);
+            assert_eq!(
+                app.import_report_title,
+                crate::i18n::tr_catalog(language, "status_messages.macros_saved_with_losses_title")
+            );
+            assert_eq!(
+                app.import_report_body,
+                crate::rynk::entlayout::describe_macro_write_losses(language, &losses)
+            );
+        }
     }
 
     #[test]

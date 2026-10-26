@@ -2171,7 +2171,7 @@ impl EntropyApp {
             .as_ref()
             .and_then(crate::device_session::DeviceSession::rynk_import_context)
         {
-            let losses = self.entlayout_rynk_losses(bundle, &mapping, capabilities, morses)?;
+            let losses = self.entlayout_rynk_losses(bundle, &mapping, &capabilities, &morses)?;
             if !losses.is_empty() {
                 bail!(
                     "{}",
@@ -2284,11 +2284,11 @@ impl EntropyApp {
         Ok((firmware_failures, mapping, portable_settings))
     }
 
-    /// Whether the connected board is a Rynk one: any session but a Vial one.
+    /// Whether the connected board is a Rynk one.
     fn entlayout_target_is_rynk(&self) -> bool {
         self.hid_device
             .as_ref()
-            .is_some_and(|session| session.as_vial().is_none())
+            .is_some_and(crate::device_session::DeviceSession::is_rynk)
     }
 
     /// What `bundle` would lose on a Rynk board: the editor state after the
@@ -3070,12 +3070,16 @@ impl EntropyApp {
                     bail!("target firmware does not support layer-specific Combos");
                 }
                 let current = &self.combo_entries[idx];
-                if current.keys != combo.keys || current.output != output {
-                    hid.set_combo_binding(idx as u8, combo.keys, output)?;
-                }
-                if supports_rmk_combo_layers && current.layer != combo.layer {
-                    hid.set_rmk_combo_layer(idx as u8, combo.layer)?;
-                }
+                hid.set_combo_entry(
+                    idx as u8,
+                    &ComboEntry {
+                        keys: combo.keys,
+                        output,
+                        layer: combo.layer,
+                    },
+                    current.keys != combo.keys || current.output != output,
+                    supports_rmk_combo_layers && current.layer != combo.layer,
+                )?;
             }
             Ok(())
         })() {

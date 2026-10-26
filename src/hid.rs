@@ -187,7 +187,7 @@ pub(crate) use hid_keymap::keycode_writeback_readback;
 
 #[path = "hid_settings.rs"]
 mod hid_settings;
-pub(crate) use hid_settings::BatteryHalves;
+pub(crate) use hid_settings::{qmk_setting_string_value, BatteryHalves};
 
 #[path = "hid_vial.rs"]
 mod hid_vial;

@@ -155,15 +155,12 @@ impl EntropyApp {
                     #[cfg(target_os = "macos")]
                     let _hid_lock = hid_device.macos_hid_operation_lock();
 
-                    let write_result = hid_device
-                        .set_combo_binding(index as u8, task_entry.keys, task_entry.output)
-                        .and_then(|_| {
-                            if supports_rmk_combo_layers {
-                                hid_device.set_rmk_combo_layer(index as u8, task_entry.layer)
-                            } else {
-                                Ok(())
-                            }
-                        });
+                    let write_result = hid_device.set_combo_entry(
+                        index as u8,
+                        &task_entry,
+                        true,
+                        supports_rmk_combo_layers,
+                    );
                     let disconnected = write_result
                         .as_ref()
                         .err()

@@ -326,6 +326,52 @@ pub(crate) fn describe_import_losses(
         .join("\n")
 }
 
+/// What a board left out of the macros the editor wrote, one line each in the
+/// import's words. The bytes it does not type make one line a macro: a pasted
+/// Cyrillic text would otherwise list every byte.
+pub(crate) fn describe_macro_write_losses(
+    language: crate::i18n::Language,
+    losses: &[(usize, MacroLoss)],
+) -> String {
+    let mut lines =
+        vec![crate::i18n::tr_catalog(language, "rynk_import.macro_write_losses").to_owned()];
+    let mut indices: Vec<usize> = losses.iter().map(|(index, _)| *index).collect();
+    indices.dedup();
+    for index in indices {
+        let of_macro = losses.iter().filter(|(at, _)| *at == index);
+        let bytes = of_macro
+            .clone()
+            .filter(|(_, loss)| matches!(loss, MacroLoss::Byte(_)))
+            .count();
+        if bytes > 0 {
+            let detail = crate::i18n::tr_catalog_format(
+                language,
+                "rynk_import.macro_bytes",
+                &[("count", &bytes.to_string())],
+            );
+            lines.push(crate::i18n::tr_catalog_format(
+                language,
+                "rynk_import.macro",
+                &[("index", &index.to_string()), ("detail", &detail)],
+            ));
+        }
+        lines.extend(
+            of_macro
+                .filter(|(_, loss)| !matches!(loss, MacroLoss::Byte(_)))
+                .map(|(index, loss)| {
+                    describe_loss(
+                        language,
+                        &ImportLoss::Macro {
+                            index: *index,
+                            loss: loss.clone(),
+                        },
+                    )
+                }),
+        );
+    }
+    lines.join("\n")
+}
+
 fn describe_loss(language: crate::i18n::Language, loss: &ImportLoss) -> String {
     let tr = |key, vars: &[(&str, &str)]| crate::i18n::tr_catalog_format(language, key, vars);
     let keycode = |keycode: u16| format!("{keycode:#06x}");
@@ -1017,6 +1063,37 @@ mod tests {
         ] {
             let message = describe_import_losses(language, &losses);
             assert_eq!(message.lines().count(), losses.len() + 1, "{message}");
+            assert!(
+                !message.contains('{') && !message.contains("rynk_import."),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_macro_write_lists_the_untyped_bytes_once_a_macro() {
+        let mut losses: Vec<_> = "Привет"
+            .bytes()
+            .map(|byte| (0, MacroLoss::Byte(byte)))
+            .collect();
+        losses.push((2, MacroLoss::Byte(0xE2)));
+        losses.push((2, MacroLoss::UnknownOp(0x09)));
+        for language in [
+            crate::i18n::Language::English,
+            crate::i18n::Language::Russian,
+        ] {
+            let message = describe_macro_write_losses(language, &losses);
+            let lines: Vec<_> = message.lines().collect();
+            assert_eq!(
+                lines.len(),
+                4,
+                "header, macro 0, macro 2 bytes and op: {message}"
+            );
+            assert!(lines[1].contains("12"), "{message}");
+            assert!(
+                lines[2].contains('1') && lines[3].contains("0x09"),
+                "{message}"
+            );
             assert!(
                 !message.contains('{') && !message.contains("rynk_import."),
                 "{message}"
