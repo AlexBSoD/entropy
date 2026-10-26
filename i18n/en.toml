@@ -599,6 +599,20 @@ writes_pending = "saving is not finished: keys ({keys}) and macro parts ({chunks
 bulk = "command {cmd}: a reply page that cannot be right"
 read_only = "read-only session: command {cmd} was not sent"
 
+[rynk_read]
+losses = "the editor cannot show all of these entries from the keyboard:"
+combo = "combo {index}: {detail}"
+tap_dance = "Tap Dance {index}: {detail}"
+key_override = "Key Override {index}: {detail}"
+encoder = "layer {layer}, encoder {encoder}: {detail}"
+key = "{action} has no keycode in the editor; editing the entry replaces it"
+combo_keys = "{count} keys, the editor shows 4; editing keeps only those"
+morse_pattern = "pattern {pattern} has no field in the editor; editing keeps it"
+negative_output = "outputs {action} instead of the trigger outside the condition; editing restores the trigger"
+state_match = "matches LED or mouse button state; editing drops that"
+bindable = "triggers other key overrides; editing turns that off"
+layers = "also works on layers above 15; editing keeps layers 0–15 only"
+
 [entsettings]
 exported_app_settings = "Exported app settings: {path}"
 export_app_settings_failed = "Export app settings failed: {error}"

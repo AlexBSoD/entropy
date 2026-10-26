@@ -599,6 +599,20 @@ writes_pending = "сохранение не закончено: во флеш е
 bulk = "команда {cmd}: страница ответа не может быть такой"
 read_only = "сессия только для чтения: команда {cmd} не отправлена"
 
+[rynk_read]
+losses = "редактор показывает не всё из этих записей клавиатуры:"
+combo = "комбо {index}: {detail}"
+tap_dance = "Tap Dance {index}: {detail}"
+key_override = "Key Override {index}: {detail}"
+encoder = "слой {layer}, энкодер {encoder}: {detail}"
+key = "у действия {action} нет кода в редакторе; правка записи его заменит"
+combo_keys = "{count} клавиш, редактор показывает 4; правка оставит только их"
+morse_pattern = "паттерн {pattern} без поля в редакторе; правка его сохранит"
+negative_output = "вне условия выдаёт {action}, а не триггер; правка вернёт триггер"
+state_match = "условие по LED или кнопкам мыши; правка его уберёт"
+bindable = "запускает другие Key Override; правка это отключит"
+layers = "работает и на слоях выше 15; правка оставит слои 0–15"
+
 [entsettings]
 exported_app_settings = "Настройки приложения экспортированы: {path}"
 export_app_settings_failed = "Экспорт настроек приложения не удался: {error}"

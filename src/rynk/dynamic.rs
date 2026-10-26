@@ -81,6 +81,90 @@ pub(crate) enum DynamicLoss {
     Layers(u32),
 }
 
+/// Where a `DynamicLoss` was read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DynamicSlot {
+    Combo,
+    TapDance,
+    KeyOverride,
+    Encoder { layer: u8 },
+}
+
+/// The warning for what the editor cannot show of the entries read from the
+/// board, one line each, with what editing the entry does to it.
+pub(crate) fn describe_dynamic_losses(
+    language: crate::i18n::Language,
+    losses: &[(DynamicSlot, u8, DynamicLoss)],
+) -> String {
+    let header = crate::i18n::tr_catalog(language, "rynk_read.losses");
+    std::iter::once(header.to_owned())
+        .chain(
+            losses
+                .iter()
+                .map(|&(slot, index, loss)| describe_dynamic_loss(language, slot, index, loss)),
+        )
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn describe_dynamic_loss(
+    language: crate::i18n::Language,
+    slot: DynamicSlot,
+    index: u8,
+    loss: DynamicLoss,
+) -> String {
+    let tr = |key, vars: &[(&str, &str)]| crate::i18n::tr_catalog_format(language, key, vars);
+    let action = |action: KeyAction| format!("{action:?}");
+    let detail = match loss {
+        DynamicLoss::Key(key) => tr("rynk_read.key", &[("action", &action(key))]),
+        DynamicLoss::ComboKeys(count) => {
+            tr("rynk_read.combo_keys", &[("count", &count.to_string())])
+        }
+        DynamicLoss::MorsePattern(pattern) => tr(
+            "rynk_read.morse_pattern",
+            &[("pattern", &morse_steps(pattern))],
+        ),
+        DynamicLoss::NegativeOutput(output) => {
+            tr("rynk_read.negative_output", &[("action", &action(output))])
+        }
+        DynamicLoss::StateMatch => tr("rynk_read.state_match", &[]),
+        DynamicLoss::Bindable => tr("rynk_read.bindable", &[]),
+        DynamicLoss::Layers(_) => tr("rynk_read.layers", &[]),
+    };
+    let index = index.to_string();
+    let entry = |key| tr(key, &[("index", &index), ("detail", &detail)]);
+    match slot {
+        DynamicSlot::Combo => entry("rynk_read.combo"),
+        DynamicSlot::TapDance => entry("rynk_read.tap_dance"),
+        DynamicSlot::KeyOverride => entry("rynk_read.key_override"),
+        DynamicSlot::Encoder { layer } => tr(
+            "rynk_read.encoder",
+            &[
+                ("layer", &layer.to_string()),
+                ("encoder", &index),
+                ("detail", &detail),
+            ],
+        ),
+    }
+}
+
+/// A morse pattern as Morse code: `·` a tap, `—` a hold, in press order.
+fn morse_steps(pattern: MorsePattern) -> String {
+    let bits = pattern.to_u16();
+    // The highest set bit marks where the presses start.
+    let presses = 15 - bits.leading_zeros().min(15);
+    (0..presses)
+        .rev()
+        .map(|press| {
+            if (bits >> press) & 1 == 1 {
+                '—'
+            } else {
+                '·'
+            }
+        })
+        .collect()
+}
+
 /// The combo a Vial-shaped entry writes: its non-empty keys in order, as the
 /// firmware keeps them.
 pub(crate) fn combo(entry: &ComboEntry, max_keys: usize) -> Result<Combo, DynamicError> {
@@ -587,5 +671,43 @@ mod tests {
             encoder_keycodes(EncoderAction::new(user, KeyAction::No)),
             ([0, 0], vec![DynamicLoss::Key(user)])
         );
+    }
+
+    #[test]
+    fn every_read_loss_reads_in_both_languages() {
+        assert_eq!(morse_steps(TAP), "·");
+        assert_eq!(morse_steps(HOLD), "—");
+        assert_eq!(morse_steps(DOUBLE_TAP), "··");
+        assert_eq!(morse_steps(HOLD_AFTER_TAP), "·—");
+        let user = KeyAction::Single(Action::User(90));
+        let losses = [
+            (DynamicSlot::Combo, 0, DynamicLoss::Key(user)),
+            (DynamicSlot::Combo, 1, DynamicLoss::ComboKeys(6)),
+            (
+                DynamicSlot::TapDance,
+                2,
+                DynamicLoss::MorsePattern(MorsePattern::from_u16(0b1001)),
+            ),
+            (
+                DynamicSlot::KeyOverride,
+                3,
+                DynamicLoss::NegativeOutput(user),
+            ),
+            (DynamicSlot::KeyOverride, 4, DynamicLoss::StateMatch),
+            (DynamicSlot::KeyOverride, 5, DynamicLoss::Bindable),
+            (DynamicSlot::KeyOverride, 6, DynamicLoss::Layers(1 << 20)),
+            (DynamicSlot::Encoder { layer: 1 }, 0, DynamicLoss::Key(user)),
+        ];
+        let english = describe_dynamic_losses(crate::i18n::Language::English, &losses);
+        let russian = describe_dynamic_losses(crate::i18n::Language::Russian, &losses);
+        for message in [&english, &russian] {
+            assert_eq!(message.lines().count(), losses.len() + 1, "{message}");
+            assert!(
+                !message.contains('{') && !message.contains("rynk_read."),
+                "{message}"
+            );
+        }
+        assert!(english.contains("pattern ··— "), "{english}");
+        assert_ne!(english, russian);
     }
 }
