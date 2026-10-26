@@ -252,6 +252,68 @@ pub(crate) fn rynk_import_losses(
     losses
 }
 
+/// After the user accepted the losses, what a keycode becomes on a Rynk
+/// board: itself, or `KC_NO` where it has no action, as the firmware stored
+/// it over Vial.
+pub(crate) fn lenient_keycode(keycode: u16) -> u16 {
+    if vial_keycode_action(keycode).is_some() {
+        keycode
+    } else {
+        0
+    }
+}
+
+/// Whether a tap dance field can run on a Rynk board: a single action or none.
+pub(crate) fn runs_in_tap_dance(binding: KeyBinding) -> bool {
+    matches!(
+        binding_action(binding),
+        Ok(KeyAction::No | KeyAction::Single(_))
+    )
+}
+
+/// A macro's Vial bytes without what the board would not run, or `None` when
+/// nothing is lost and the bytes stay as they are.
+pub(crate) fn lenient_macro(bytes: &[u8]) -> Option<Vec<u8>> {
+    let (ops, losses) = vial_macro_ops(bytes);
+    if losses.is_empty() {
+        return None;
+    }
+    Some(super::macros::macro_vial_bytes(&ops).0)
+}
+
+/// Empties macros from the last slot back until the rest fit the board's
+/// buffer, and the slots it does not have. Returns the emptied slots.
+pub(crate) fn fit_macros(macros: &mut [Vec<u8>], capabilities: &DeviceCapabilities) -> Vec<usize> {
+    let slots = capabilities.max_macros as usize;
+    let available = capabilities.macro_space_size as usize;
+    let mut emptied = Vec::new();
+    for (index, bytes) in macros.iter_mut().enumerate().skip(slots) {
+        if !bytes.is_empty() {
+            bytes.clear();
+            emptied.push(index);
+        }
+    }
+    loop {
+        let ops: Vec<_> = macros
+            .iter()
+            .take(slots)
+            .map(|bytes| vial_macro_ops(bytes).0)
+            .collect();
+        if macro_space_used(ops.iter().map(Vec::as_slice), slots) <= available {
+            return emptied;
+        }
+        let Some(index) = macros
+            .iter()
+            .take(slots)
+            .rposition(|bytes| !bytes.is_empty())
+        else {
+            return emptied;
+        };
+        macros[index].clear();
+        emptied.push(index);
+    }
+}
+
 /// The import error for `losses`, one line each.
 pub(crate) fn describe_import_losses(
     language: crate::i18n::Language,
@@ -960,5 +1022,31 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    #[test]
+    fn accepted_losses_become_what_the_firmware_stored_over_vial() {
+        assert_eq!(lenient_keycode(0x04), 0x04);
+        assert_eq!(lenient_keycode(0x7827), 0);
+        assert!(runs_in_tap_dance(KeyBinding::Vial(0x04)));
+        assert!(runs_in_tap_dance(KeyBinding::Vial(0)));
+        assert!(!runs_in_tap_dance(KeyBinding::Vial(0x4104)));
+        assert!(!runs_in_tap_dance(KeyBinding::Vial(0x7000)));
+
+        assert_eq!(lenient_macro(b"hi"), None);
+        assert_eq!(lenient_macro(b"h\xd0i\x01\x01\x00"), Some(b"hi".to_vec()));
+
+        let tight = DeviceCapabilities {
+            max_macros: 3,
+            macro_space_size: 9,
+            ..Default::default()
+        };
+        // Slot sizes: "abc" 7, "d" 3, empty 1; a fourth slot the board lacks.
+        let mut macros = vec![b"abc".to_vec(), b"d".to_vec(), Vec::new(), b"e".to_vec()];
+        assert_eq!(fit_macros(&mut macros, &tight), [3, 1]);
+        assert_eq!(
+            macros,
+            [b"abc".to_vec(), Vec::new(), Vec::new(), Vec::new()]
+        );
     }
 }
