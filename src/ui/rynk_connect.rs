@@ -273,16 +273,15 @@ impl EntropyApp {
         let keyboard_id = u64::from_le_bytes(info.keyboard_uid);
         let firmware = info.firmware;
         let firmware_version = format!("{}.{}.{}", firmware.major, firmware.minor, firmware.patch);
-        // The same release as over Vial: the definition names its asset, and a
-        // dongle shows host time and media.
+        // The board's release, as over Vial, but its Rynk package: the
+        // definition names the asset, and a dongle shows host time and media.
         let host_screen = caps::HOST_TIME | caps::HOST_MEDIA;
-        let firmware_update_target = crate::app::rmk_firmware_release_target(
+        let firmware_update_target = crate::app::rynk_firmware_release_target(
             dev.vendor_id,
             dev.product_id,
             Some(&firmware_version),
             &json,
             info.caps & host_screen == host_screen,
-            true,
         );
         let about_info = DeviceAboutInfo {
             manufacturer: dev.manufacturer.clone(),
@@ -510,7 +509,7 @@ mod tests {
         assert_eq!(result.combo_term, Some(200));
         assert!(result.supports_universal_symbols, "the board has symbols");
         let update = result.about_info.firmware_update_target.as_ref().unwrap();
-        assert_eq!(update.asset_prefix, "k04", "the same release as over Vial");
+        assert_eq!(update.asset_prefix, "k04-rynk", "the board's Rynk package");
         assert_eq!(update.current_version, "2.3.1");
         assert!(
             !result.supports_universal_russian_letters,
