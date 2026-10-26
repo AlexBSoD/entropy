@@ -504,6 +504,21 @@ mod tests {
         assert!(updates.windows(2).all(|pair| pair[0] != pair[1]));
     }
 
+    /// A background board's bridge holds its link alone: the media it clears
+    /// on the way out still reaches the board as the link closes.
+    #[test]
+    fn a_bridge_holding_the_last_link_still_clears_the_media() {
+        let desktop = Desktop::new();
+        desktop.show(None, Some(("Artist", "Title")));
+        let (board, received) = board(caps::HOST_MEDIA);
+        let bridge = desktop.bridge(link("rynk-bridge-last-holder", &board), EVERYTHING);
+        await_updates(&received, 2);
+
+        drop(bridge);
+
+        assert_eq!(await_updates(&received, 4)[2..], [artist(""), title("")]);
+    }
+
     #[test]
     fn a_new_link_gets_the_whole_snapshot_again() {
         let desktop = Desktop::new();
