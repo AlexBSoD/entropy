@@ -7,6 +7,7 @@
 
 use super::*;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -356,12 +357,13 @@ fn missing_sections(app: &EntropyApp, session: &crate::hid::ReadOnlyHidSession) 
 }
 
 /// Connects to `device_idx` and returns its `.entlayout` once one connection
-/// has delivered every section.
+/// has delivered every section, unless `cancelled` is set first.
 fn export_entlayout(
     app: &mut EntropyApp,
     device_idx: usize,
     session: &crate::hid::ReadOnlyHidSession,
     deadline: Instant,
+    cancelled: &AtomicBool,
 ) -> Result<String, ExportError> {
     // A window-less context still carries the repaint requests and input
     // state the connect and deferred-load pollers consult.
@@ -382,6 +384,9 @@ fn export_entlayout(
         if app.status_msg != last_status {
             last_status = app.status_msg.clone();
             log::info!("{last_status}");
+        }
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(ExportError::Failed("The export was cancelled".to_owned()));
         }
         if connection.step(app, &ctx)? {
             break;
@@ -486,7 +491,13 @@ pub(crate) fn run_headless_export(request: HeadlessExportRequest) -> i32 {
     log::info!("Exporting layout of {}", describe(&devices[device_idx]));
     app.device_manager.replace_devices(devices);
 
-    let exported = export_entlayout(&mut app, device_idx, &session, deadline);
+    let exported = export_entlayout(
+        &mut app,
+        device_idx,
+        &session,
+        deadline,
+        &AtomicBool::new(false),
+    );
     let refused = session.refused_requests().len();
     if refused > 0 {
         log::info!("Refused {refused} keyboard write(s) during the export");
@@ -701,7 +712,8 @@ mod tests {
         app.app_settings
             .application_layouts
             .insert("vial-0000000000000000-m4cr0pad-v2".into(), profiles);
-        let json = export_entlayout(&mut app, 0, &session, deadline()).unwrap();
+        let json =
+            export_entlayout(&mut app, 0, &session, deadline(), &AtomicBool::default()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["version"], 9);
         assert_eq!(value["application_layouts"].as_object().unwrap().len(), 2);
@@ -725,7 +737,9 @@ mod tests {
             "vial-0000000000000000-m4cr0pad-v2".into(),
             crate::application_layouts::DeviceApplicationLayouts::default(),
         );
-        assert!(export_entlayout(&mut app, 0, &session, deadline()).is_err());
+        assert!(
+            export_entlayout(&mut app, 0, &session, deadline(), &AtomicBool::default()).is_err()
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -826,7 +840,14 @@ mod tests {
         app.app_settings = crate::app::app_storage::load_app_settings();
         let (mut backup_app, backup_session, _) = scripted_export_app(|_| None);
         backup_app.app_settings = app.app_settings.clone();
-        let previous = export_entlayout(&mut backup_app, 0, &backup_session, deadline()).unwrap();
+        let previous = export_entlayout(
+            &mut backup_app,
+            0,
+            &backup_session,
+            deadline(),
+            &AtomicBool::default(),
+        )
+        .unwrap();
         let ctx = egui::Context::default();
         app.start_connect(0);
         let mut connection = ExportConnection::default();
@@ -974,7 +995,10 @@ mod tests {
             app.app_settings
                 .application_layouts
                 .insert("vial-0000000000000000-m4cr0pad-v2".into(), profiles);
-            assert!(export_entlayout(&mut app, 0, &session, deadline()).is_err());
+            assert!(
+                export_entlayout(&mut app, 0, &session, deadline(), &AtomicBool::default())
+                    .is_err()
+            );
             assert!(recorder.requests().iter().all(|request| !is_write(request)));
             assert!(!crate::app::app_storage::app_settings_path().exists());
         }
@@ -1137,7 +1161,8 @@ mod tests {
     fn export_reads_the_whole_keyboard_without_a_single_write() {
         let (mut app, session, recorder) = scripted_export_app(|_| None);
 
-        let json = export_entlayout(&mut app, 0, &session, deadline()).unwrap();
+        let json =
+            export_entlayout(&mut app, 0, &session, deadline(), &AtomicBool::default()).unwrap();
 
         let requests = recorder.requests();
         assert!(requests.len() > 10, "{requests:02x?}");
@@ -1188,7 +1213,8 @@ mod tests {
                 .then(|| "HID timeout".to_owned())
         });
 
-        let error = export_entlayout(&mut app, 0, &session, deadline()).unwrap_err();
+        let error = export_entlayout(&mut app, 0, &session, deadline(), &AtomicBool::default())
+            .unwrap_err();
 
         assert_eq!(
             error,
@@ -1204,7 +1230,8 @@ mod tests {
             (request[0] == 0x11).then(|| "HID device disconnected".to_owned())
         });
 
-        let error = export_entlayout(&mut app, 0, &session, deadline()).unwrap_err();
+        let error = export_entlayout(&mut app, 0, &session, deadline(), &AtomicBool::default())
+            .unwrap_err();
 
         assert!(matches!(error, ExportError::Failed(_)), "{error:?}");
         assert_eq!(error.exit_code(), EXIT_FAILED);
@@ -1435,25 +1462,67 @@ mod tests {
         assert!(!app.key_override_dirty);
     }
 
+    /// Holds the first definition read after `arm` until `open`: the GUI has
+    /// read its own by then, so it is an export's connect that waits here.
+    #[cfg(target_os = "linux")]
+    struct DefinitionGate {
+        armed: std::sync::Arc<AtomicBool>,
+        entered: std::sync::mpsc::Receiver<()>,
+        release: std::sync::mpsc::Sender<()>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl DefinitionGate {
+        /// The gate, and the keyboard's side of it to run on every request.
+        fn new() -> (Self, impl Fn(&[u8; 32]) + Send + 'static) {
+            let armed = std::sync::Arc::new(AtomicBool::new(false));
+            let (entered_tx, entered) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let hold = armed.clone();
+            let keyboard = move |request: &[u8; 32]| {
+                if request[..2] == [0xFE, 0x01] && hold.swap(false, Ordering::AcqRel) {
+                    entered_tx.send(()).unwrap();
+                    released.recv().unwrap();
+                }
+            };
+            let gate = Self {
+                armed,
+                entered,
+                release,
+            };
+            (gate, keyboard)
+        }
+
+        fn arm(&self) {
+            self.armed.store(true, Ordering::Release);
+        }
+
+        /// Pumps `app`'s frames until an export waits at the gate.
+        fn wait(&self, app: &mut EntropyApp, ctx: &egui::Context, started: Instant) {
+            while self.entered.try_recv().is_err() {
+                assert!(
+                    started.elapsed() < Duration::from_secs(20),
+                    "export never ran"
+                );
+                frame(app, ctx, started);
+            }
+        }
+
+        fn open(&self) {
+            self.release.send(()).unwrap();
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn an_edit_made_while_the_export_runs_is_written_after_it() {
         let _storage = crate::app::app_storage::ScopedTempConfig::new();
-        // The export's connect stops at the definition until released.
-        let (entered, export_entered) = std::sync::mpsc::channel();
-        let (release, released) = std::sync::mpsc::channel::<()>();
-        let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let hold = held.clone();
+        let (gate, at_gate) = DefinitionGate::new();
         let (mut app, recorder, dir, socket, ctx) = running_instance_with(move |recorder| {
             scripted_keyboard_answering(
                 recorder,
                 move |request| {
-                    if request[..2] == [0xFE, 0x01]
-                        && hold.swap(false, std::sync::atomic::Ordering::AcqRel)
-                    {
-                        entered.send(()).unwrap();
-                        released.recv().unwrap();
-                    }
+                    at_gate(request);
                     let mut response = [0u8; 32];
                     match request[..3] {
                         [0xFE, 0x0D, 0x00] => response[..3].copy_from_slice(&[1, 1, 1]),
@@ -1468,18 +1537,12 @@ mod tests {
                 None,
             );
         });
-        held.store(true, std::sync::atomic::Ordering::Release);
+        gate.arm();
         let before = recorder.requests().len();
         let path = dir.path().join("backup.entlayout");
         let client = start_console_export(&socket, export_to(&path, "export fixture"));
         let started = Instant::now();
-        while export_entered.try_recv().is_err() {
-            assert!(
-                started.elapsed() < Duration::from_secs(20),
-                "export never ran"
-            );
-            frame(&mut app, &ctx, started);
-        }
+        gate.wait(&mut app, &ctx, started);
 
         // The user edits the Key Override while the export has the keyboard.
         app.key_override_entries[0].replacement = 0x0006;
@@ -1493,7 +1556,7 @@ mod tests {
         );
         assert!(app.key_override_dirty, "the edit was dropped");
 
-        release.send(()).unwrap();
+        gate.open();
         assert_eq!(finish_console_export(&mut app, &ctx, client), Some(EXIT_OK));
         while app.key_override_dirty {
             assert!(
@@ -1509,6 +1572,56 @@ mod tests {
                 .any(|request| request[..4] == [0xFE, 0x0D, 0x06, 0] && request[6] == 0x06),
             "the edit was not written: {writes:02x?}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_console_that_hangs_up_gives_the_gui_its_connection_back() {
+        use std::io::Write;
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (gate, at_gate) = DefinitionGate::new();
+        let (mut app, recorder, dir, socket, ctx) = running_instance_with(move |recorder| {
+            scripted_keyboard_answering(
+                recorder,
+                move |request| {
+                    at_gate(request);
+                    None
+                },
+                None,
+            );
+        });
+        gate.arm();
+        let mut console = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        console
+            .write_all(b"{\"command\":\"export-layout\",\"version\":1,\"device\":null,\"timeout_ms\":20000}\n")
+            .unwrap();
+        let started = Instant::now();
+        gate.wait(&mut app, &ctx, started);
+
+        // The export is stuck on the keyboard when its console goes away.
+        drop(console);
+        while app.pending_console_export.is_some() || app.hid_device.is_none() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the abandoned export kept the connection"
+            );
+            frame(&mut app, &ctx, started);
+        }
+        let before = recorder.requests().len();
+        gate.open();
+        for _ in 0..10 {
+            frame(&mut app, &ctx, started);
+        }
+        assert!(
+            recorder.requests()[before..]
+                .iter()
+                .all(|request| request[0] != 0x12),
+            "the abandoned export went on reading the keymap"
+        );
+
+        let path = dir.path().join("backup.entlayout");
+        let code = console_export(&mut app, &ctx, &socket, export_to(&path, "export fixture"));
+        assert_eq!(code, Some(EXIT_OK));
     }
 
     #[cfg(target_os = "linux")]

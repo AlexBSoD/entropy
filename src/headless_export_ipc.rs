@@ -9,16 +9,20 @@
 //! reaches the GUI's own state.
 
 use super::*;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 
 const PROTOCOL_VERSION: u32 = 1;
 /// A connected client has this long to send its request line.
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// The longest export the GUI runs, whatever timeout the console asks for.
 const MAX_EXPORT_TIME: Duration = Duration::from_secs(10 * 60);
+/// How often a request waiting for the GUI checks that its console is there.
+const HANGUP_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+/// A console has this long to take its answer.
+const REPLY_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "command", rename_all = "kebab-case")]
@@ -48,10 +52,12 @@ pub(crate) fn socket_path() -> Option<PathBuf> {
     Some(base.join("entropy").join("export.sock"))
 }
 
-/// One console request waiting for the GUI thread.
+/// One console request waiting for the GUI thread. `cancel` is set once its
+/// console has gone or run out of time.
 pub(crate) struct ExportJob {
     device: Option<String>,
     deadline: Instant,
+    cancel: Arc<AtomicBool>,
     reply: mpsc::Sender<Reply>,
 }
 
@@ -114,11 +120,13 @@ fn serve(stream: UnixStream, jobs: &mpsc::Sender<ExportJob>, ctx: &egui::Context
             }) if version == PROTOCOL_VERSION => {
                 let deadline =
                     Instant::now() + Duration::from_millis(timeout_ms).min(MAX_EXPORT_TIME);
+                let cancel = Arc::new(AtomicBool::new(false));
                 let (reply, answer) = mpsc::channel();
                 if jobs
                     .send(ExportJob {
                         device,
                         deadline,
+                        cancel: cancel.clone(),
                         reply,
                     })
                     .is_err()
@@ -126,10 +134,21 @@ fn serve(stream: UnixStream, jobs: &mpsc::Sender<ExportJob>, ctx: &egui::Context
                     return;
                 }
                 ctx.request_repaint();
-                // The console side bounds the wait with its own timeout.
-                answer.recv().unwrap_or(Reply::Failed {
-                    message: "Entropy closed before the export finished".to_owned(),
-                })
+                match wait_for_answer(&stream, &answer, deadline) {
+                    Some(reply) => reply,
+                    None => {
+                        // The console has gone, or its time is up: stop the
+                        // export and free the channel for the next one.
+                        cancel.store(true, Ordering::Relaxed);
+                        ctx.request_repaint();
+                        if Instant::now() < deadline {
+                            return;
+                        }
+                        Reply::Failed {
+                            message: "The export did not finish in time".to_owned(),
+                        }
+                    }
+                }
             }
             Ok(Request::ExportLayout { version, .. }) => Reply::Failed {
                 message: format!("unsupported export protocol version {version}"),
@@ -142,7 +161,44 @@ fn serve(stream: UnixStream, jobs: &mpsc::Sender<ExportJob>, ctx: &egui::Context
     let mut stream = stream;
     if let Ok(mut json) = serde_json::to_string(&reply) {
         json.push('\n');
-        let _ = stream.write_all(json.as_bytes());
+        let _ = stream
+            .set_write_timeout(Some(REPLY_WRITE_TIMEOUT))
+            .and_then(|()| stream.write_all(json.as_bytes()));
+    }
+}
+
+/// The GUI's answer; `None` once the deadline passes or the console hangs up
+/// (or sends anything past its request).
+fn wait_for_answer(
+    stream: &UnixStream,
+    answer: &mpsc::Receiver<Reply>,
+    deadline: Instant,
+) -> Option<Reply> {
+    stream.set_read_timeout(Some(HANGUP_CHECK_INTERVAL)).ok()?;
+    let mut console = stream;
+    loop {
+        match answer.try_recv() {
+            Ok(reply) => return Some(reply),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Some(Reply::Failed {
+                    message: "Entropy closed before the export finished".to_owned(),
+                })
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        match console.read(&mut [0; 1]) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) => {}
+            _ => return None,
+        }
     }
 }
 
@@ -153,7 +209,15 @@ pub(crate) fn export_via_running_instance(request: &HeadlessExportRequest) -> Op
 }
 
 pub(super) fn export_via_socket(path: &Path, request: &HeadlessExportRequest) -> Option<i32> {
-    let mut stream = UnixStream::connect(path).ok()?;
+    let deadline = Instant::now() + request.timeout;
+    let mut stream = match connect_until(path, deadline) {
+        Some(Ok(stream)) => stream,
+        Some(Err(_)) => return None,
+        None => {
+            log::error!("The running Entropy did not take the export request in time");
+            return Some(EXIT_INSTANCE_RUNNING);
+        }
+    };
     log::info!("Asking the running Entropy for the layout");
     let mut line = serde_json::to_string(&Request::ExportLayout {
         version: PROTOCOL_VERSION,
@@ -163,9 +227,16 @@ pub(super) fn export_via_socket(path: &Path, request: &HeadlessExportRequest) ->
     .expect("export request serializes");
     line.push('\n');
     let mut answer = String::new();
+    // A zero timeout means none at all; keep at least a millisecond.
+    let remaining = || {
+        deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1))
+    };
     let exchanged = stream
-        .set_read_timeout(Some(request.timeout))
+        .set_write_timeout(Some(remaining()))
         .and_then(|()| stream.write_all(line.as_bytes()))
+        .and_then(|()| stream.set_read_timeout(Some(remaining())))
         .and_then(|()| BufReader::new(&stream).read_line(&mut answer));
     if let Err(error) = exchanged {
         log::error!("The running Entropy did not answer the export: {error}");
@@ -204,14 +275,29 @@ pub(super) fn export_via_socket(path: &Path, request: &HeadlessExportRequest) ->
     })
 }
 
+/// `UnixStream::connect` waits as long as the listener's queue is full; this
+/// gives up at `deadline` (`None`) and leaves the attempt behind.
+fn connect_until(path: &Path, deadline: Instant) -> Option<std::io::Result<UnixStream>> {
+    let (sender, connected) = mpsc::channel();
+    let path = path.to_owned();
+    std::thread::spawn(move || {
+        let _ = sender.send(UnixStream::connect(path));
+    });
+    connected
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()
+}
+
 /// Runs the standalone export over `hid`, the running instance's own
 /// connection, lent for the duration through a read-only view: every write
 /// is refused at the transport, failed reads are listed instead of exported,
-/// and what the export loads stays in its own app.
+/// and what the export loads stays in its own app. It ends early once
+/// `cancelled` is set.
 pub(crate) fn export_lent_keyboard(
     hid: &crate::hid::HidDevice,
     device: Device,
     deadline: Instant,
+    cancelled: &AtomicBool,
 ) -> Reply {
     let session = crate::hid::ReadOnlyHidSession::default();
     let Some(view) = hid.read_only_view(session.clone()) else {
@@ -223,7 +309,7 @@ pub(crate) fn export_lent_keyboard(
     let mut app = EntropyApp::new_headless();
     app.device_manager.replace_devices(vec![device]);
     app.connect_hid = Some(view);
-    let exported = export_entlayout(&mut app, 0, &session, deadline);
+    let exported = export_entlayout(&mut app, 0, &session, deadline, cancelled);
     // A worker the export leaves behind must not reach the keyboard once the
     // GUI has it back.
     session.close();
@@ -244,6 +330,7 @@ pub(crate) struct PendingConsoleExport {
     generation: u64,
     device: Device,
     deadline: Instant,
+    cancel: Arc<AtomicBool>,
     started: bool,
 }
 
@@ -263,6 +350,15 @@ impl EntropyApp {
 
     /// Answers console exports, one at a time, from the selected keyboard.
     pub(crate) fn poll_console_export(&mut self, ctx: &egui::Context) {
+        if self
+            .pending_console_export
+            .as_ref()
+            .is_some_and(|pending| pending.cancel.load(Ordering::Relaxed))
+        {
+            // Its console has gone: stop the export and take the next one.
+            self.cancel_console_export();
+            self.pending_console_export = None;
+        }
         if self.pending_console_export.is_none() {
             let Some(job) = self
                 .console_export_server
@@ -278,6 +374,7 @@ impl EntropyApp {
                         generation: self.connection_generation,
                         device,
                         deadline: job.deadline,
+                        cancel: job.cancel,
                         started: false,
                     })
                 }
@@ -394,6 +491,123 @@ mod tests {
         assert_eq!(mode(socket.parent().unwrap()), 0o700);
         assert_eq!(mode(&socket), 0o600);
         assert!(ExportServer::start(&socket, egui::Context::default()).is_err());
+    }
+
+    fn export_request(timeout_ms: u64) -> String {
+        format!(
+            "{}\n",
+            serde_json::to_string(&Request::ExportLayout {
+                version: PROTOCOL_VERSION,
+                device: None,
+                timeout_ms,
+            })
+            .unwrap()
+        )
+    }
+
+    /// Sends `line` and returns the answer line.
+    fn ask(socket: &Path, line: &str) -> String {
+        let mut stream = UnixStream::connect(socket).unwrap();
+        stream.write_all(line.as_bytes()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut answer = String::new();
+        BufReader::new(&stream).read_line(&mut answer).unwrap();
+        answer
+    }
+
+    fn listening(dir: &Path) -> (PathBuf, ExportServer) {
+        let socket = dir.join("export.sock");
+        let server = ExportServer::start(&socket, egui::Context::default()).unwrap();
+        (socket, server)
+    }
+
+    #[test]
+    fn a_console_that_hangs_up_cancels_its_export_and_frees_the_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, server) = listening(dir.path());
+        let mut console = UnixStream::connect(&socket).unwrap();
+        console
+            .write_all(export_request(60_000).as_bytes())
+            .unwrap();
+        let job = server.jobs.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // The GUI never answers; the console gives up.
+        drop(console);
+
+        let started = Instant::now();
+        while !job.cancel.load(Ordering::Relaxed) {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the export outlived its console"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let answer = ask(&socket, "{\"command\":\"set-keycode\"}\n");
+        assert!(answer.contains(r#""status":"failed""#), "{answer}");
+    }
+
+    #[test]
+    fn an_export_out_of_time_is_cancelled_and_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, server) = listening(dir.path());
+        let started = Instant::now();
+
+        let answer = std::thread::spawn(move || ask(&socket, &export_request(200)));
+        let job = server.jobs.recv_timeout(Duration::from_secs(5)).unwrap();
+        let answer = answer.join().unwrap();
+
+        assert!(answer.contains("did not finish in time"), "{answer}");
+        assert!(job.cancel.load(Ordering::Relaxed));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_console_that_never_reads_its_answer_cannot_hold_the_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, server) = listening(dir.path());
+        let mut console = UnixStream::connect(&socket).unwrap();
+        console
+            .write_all(export_request(60_000).as_bytes())
+            .unwrap();
+        let job = server.jobs.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Far more than the socket buffers, and the console reads none of it.
+        job.reply
+            .send(Reply::Exported {
+                entlayout: "x".repeat(16 << 20),
+            })
+            .unwrap();
+
+        let answer = ask(&socket, "{\"command\":\"set-keycode\"}\n");
+
+        assert!(answer.contains(r#""status":"failed""#), "{answer}");
+        drop(console);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_full_listen_queue_cannot_outlast_the_console_timeout() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("export.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        // Room for one pending connection, taken here: the next connect
+        // waits for an accept that never comes.
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let _queued = UnixStream::connect(&socket).unwrap();
+        let request = HeadlessExportRequest {
+            destination: ExportDestination::Stdout,
+            device: None,
+            timeout: Duration::from_millis(300),
+        };
+        let started = Instant::now();
+
+        assert_eq!(
+            export_via_socket(&socket, &request),
+            Some(EXIT_INSTANCE_RUNNING)
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

@@ -403,7 +403,7 @@ fn run_vial_hid_operation_with_progress(
         #[cfg(unix)]
         VialHidOperation::ConsoleExport { device, deadline } => {
             Ok(VialHidOutcome::ConsoleExported(
-                super::headless_export::export_lent_keyboard(hid, device, deadline),
+                super::headless_export::export_lent_keyboard(hid, device, deadline, cancel),
             ))
         }
     }
@@ -507,6 +507,18 @@ impl EntropyApp {
     pub(super) fn cancel_background_upload(&self) {
         if let Some(task) = &self.vial_hid_task {
             if matches!(task.operation, VialHidOperation::BackgroundUpload { .. }) {
+                task.cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Stops a console export whose console has gone; the connection comes
+    /// back as soon as the export notices.
+    #[cfg(unix)]
+    pub(super) fn cancel_console_export(&self) {
+        if let Some(task) = &self.vial_hid_task {
+            if matches!(task.operation, VialHidOperation::ConsoleExport { .. }) {
                 task.cancel
                     .store(true, std::sync::atomic::Ordering::Relaxed);
             }
