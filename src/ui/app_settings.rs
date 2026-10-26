@@ -802,14 +802,19 @@ pub(super) fn linux_vial_udev_rules_installed() -> bool {
 
 #[cfg(target_os = "linux")]
 fn vial_udev_rule_is_current(contents: &str) -> bool {
-    const VERSION_MARKER: &str = "# Entropy Vial hidraw access v2";
+    const VERSION_MARKER: &str = "# Entropy keyboard access v3";
     const USB_RULE_MARKER: &str = r#"ATTRS{serial}=="*vial:f64c2b3c*""#;
     const ERGOHAVEN_BLUETOOTH_RULE_MARKER: &str = r#"KERNELS=="0005:E126:*""#;
+    // Rynk boards are claimed through usbfs, so their rule grants the USB
+    // device itself rather than a hidraw node.
+    const RYNK_USB_RULE_MARKER: &str = r#"ATTR{serial}=="rynk:*""#;
 
     contents.contains(VERSION_MARKER)
         && contents.contains(USB_RULE_MARKER)
         && contents.contains(ERGOHAVEN_BLUETOOTH_RULE_MARKER)
+        && contents.contains(RYNK_USB_RULE_MARKER)
         && contents.contains("SUBSYSTEM==\"hidraw\"")
+        && contents.contains(r#"ENV{DEVTYPE}=="usb_device""#)
 }
 
 #[cfg(target_os = "linux")]
@@ -837,9 +842,13 @@ mod linux_udev_tests {
     use super::vial_udev_rule_is_current;
 
     const OLD_RULE: &str = r#"KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{serial}=="*vial:f64c2b3c*", MODE="0660", GROUP="1000", TAG+="uaccess""#;
-    const CURRENT_RULE: &str = r#"# Entropy Vial hidraw access v2
+    const VIAL_ONLY_RULE: &str = r#"# Entropy Vial hidraw access v2
 KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{serial}=="*vial:f64c2b3c*", MODE="0660", GROUP="1000", TAG+="uaccess"
 KERNEL=="hidraw*", SUBSYSTEM=="hidraw", KERNELS=="0005:E126:*", MODE="0660", GROUP="1000", TAG+="uaccess""#;
+    const CURRENT_RULE: &str = r#"# Entropy keyboard access v3
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{serial}=="*vial:f64c2b3c*", MODE="0660", GROUP="1000", TAG+="uaccess"
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", KERNELS=="0005:E126:*", MODE="0660", GROUP="1000", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="e126", ATTR{serial}=="rynk:*", MODE="0660", GROUP="1000", TAG+="uaccess""#;
 
     #[test]
     fn old_usb_only_rule_requires_upgrade() {
@@ -847,7 +856,12 @@ KERNEL=="hidraw*", SUBSYSTEM=="hidraw", KERNELS=="0005:E126:*", MODE="0660", GRO
     }
 
     #[test]
-    fn current_rule_covers_usb_and_ergohaven_bluetooth() {
+    fn rule_without_rynk_boards_requires_upgrade() {
+        assert!(!vial_udev_rule_is_current(VIAL_ONLY_RULE));
+    }
+
+    #[test]
+    fn current_rule_covers_usb_ergohaven_bluetooth_and_rynk() {
         assert!(vial_udev_rule_is_current(CURRENT_RULE));
     }
 
@@ -855,8 +869,9 @@ KERNEL=="hidraw*", SUBSYSTEM=="hidraw", KERNELS=="0005:E126:*", MODE="0660", GRO
     fn bundled_installer_writes_the_current_rule() {
         let installer = include_str!("../../linux/udev/install-vial-rules.sh");
 
-        assert!(installer.contains("# Entropy Vial hidraw access v2"));
+        assert!(installer.contains("# Entropy keyboard access v3"));
         assert!(installer.contains(r#"KERNELS==\"0005:E126:*\""#));
+        assert!(installer.contains(r#"ATTR{serial}==\"rynk:*\""#));
     }
 
     #[test]
