@@ -32,12 +32,16 @@ pub(crate) struct FoundBoard {
 
 /// The Rynk boards on every bus Entropy can reach.
 pub(crate) fn scan() -> io::Result<Vec<FoundBoard>> {
-    let mut boards = scan_usb()?;
+    let boards = scan_usb()?;
+    // Elsewhere a Bluetooth board shows through the OS HID stack instead.
     #[cfg(target_os = "linux")]
-    match ble_linux::scan() {
-        Ok(found) => boards.extend(found),
-        Err(error) => log::warn!("Rynk Bluetooth scan failed: {error}"),
-    }
+    let boards = match ble_linux::scan() {
+        Ok(found) => boards.into_iter().chain(found).collect(),
+        Err(error) => {
+            log::warn!("Rynk Bluetooth scan failed: {error}");
+            boards
+        }
+    };
     Ok(boards)
 }
 
