@@ -177,6 +177,97 @@ impl fmt::Display for RynkClientError {
     }
 }
 
+impl RynkClientError {
+    /// The error for the user, in `language`, with what to update where an
+    /// update helps. `Display` stays English for logs.
+    pub(crate) fn describe(&self, language: crate::i18n::Language) -> String {
+        let tr = |key, vars: &[(&str, &str)]| crate::i18n::tr_catalog_format(language, key, vars);
+        let cmd = |cmd: &u16| format!("{cmd:#06x}");
+        let version = |version: &ProtocolVersion| format!("{}.{}", version.major, version.minor);
+        match self {
+            Self::Transport(error) => tr("rynk_client.transport", &[("error", &error.to_string())]),
+            Self::Timeout { cmd: sent } => tr("rynk_client.timeout", &[("cmd", &cmd(sent))]),
+            Self::Device { cmd: sent, error } => {
+                let reason = match error {
+                    RynkError::Malformed => tr("rynk_client.reason_malformed", &[]),
+                    RynkError::NotReady => tr("rynk_client.reason_not_ready", &[]),
+                    RynkError::StorageFault => tr("rynk_client.reason_storage_fault", &[]),
+                    RynkError::Internal => tr("rynk_client.reason_internal", &[]),
+                    RynkError::Unimplemented => tr("rynk_client.reason_unimplemented", &[]),
+                    RynkError::Invalid => tr("rynk_client.reason_invalid", &[]),
+                    RynkError::UnknownCmd => tr("rynk_client.reason_unknown_cmd", &[]),
+                    RynkError::Locked => tr("rynk_client.reason_locked", &[]),
+                    RynkError::Busy => tr("rynk_client.reason_busy", &[]),
+                    other => tr(
+                        "rynk_client.reason_other",
+                        &[("error", &format!("{other:?}"))],
+                    ),
+                };
+                tr(
+                    "rynk_client.device",
+                    &[("cmd", &cmd(sent)), ("reason", &reason)],
+                )
+            }
+            Self::Malformed { cmd: sent } => tr("rynk_client.malformed", &[("cmd", &cmd(sent))]),
+            Self::CmdMismatch { sent, got } => tr(
+                "rynk_client.cmd_mismatch",
+                &[("sent", &cmd(sent)), ("got", &cmd(got))],
+            ),
+            Self::TooLarge {
+                cmd: sent,
+                len,
+                max,
+            } => tr(
+                "rynk_client.too_large",
+                &[
+                    ("cmd", &cmd(sent)),
+                    ("len", &len.to_string()),
+                    ("max", &max.to_string()),
+                ],
+            ),
+            Self::VersionMismatch { board, host } => tr(
+                if (board.major, board.minor) > (host.major, host.minor) {
+                    "rynk_client.board_protocol_newer"
+                } else {
+                    "rynk_client.board_protocol_older"
+                },
+                &[("board", &version(board)), ("host", &version(host))],
+            ),
+            Self::RevisionMismatch {
+                board: Some(board),
+                host,
+            } => tr(
+                if board > host {
+                    "rynk_client.board_revision_newer"
+                } else {
+                    "rynk_client.board_revision_older"
+                },
+                &[("board", &board.to_string()), ("host", &host.to_string())],
+            ),
+            Self::RevisionMismatch { board: None, host } => {
+                tr("rynk_client.no_revision", &[("host", &host.to_string())])
+            }
+            Self::DefinitionHash { expected, actual } => tr(
+                "rynk_client.definition_hash",
+                &[
+                    ("expected", &format!("{expected:#010x}")),
+                    ("actual", &format!("{actual:#010x}")),
+                ],
+            ),
+            Self::WriteFault => tr("rynk_client.write_fault", &[]),
+            Self::WritesPending(status) => tr(
+                "rynk_client.writes_pending",
+                &[
+                    ("keys", &status.pending_keys.to_string()),
+                    ("chunks", &status.pending_macro_chunks.to_string()),
+                ],
+            ),
+            Self::BulkProtocol { cmd: sent } => tr("rynk_client.bulk", &[("cmd", &cmd(sent))]),
+            Self::ReadOnly { cmd: sent } => tr("rynk_client.read_only", &[("cmd", &cmd(sent))]),
+        }
+    }
+}
+
 impl std::error::Error for RynkClientError {}
 
 impl From<io::Error> for RynkClientError {
@@ -1309,5 +1400,87 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn every_error_reads_in_both_languages_and_says_what_to_update() {
+        let version = |major, minor| ProtocolVersion { major, minor };
+        let status = WriteStatus {
+            pending_keys: 3,
+            pending_macro_chunks: 1,
+            fault: false,
+        };
+        let mut errors = vec![
+            RynkClientError::Transport(io::Error::other("gone")),
+            RynkClientError::Timeout { cmd: 0x0101 },
+            RynkClientError::Malformed { cmd: 0x0101 },
+            RynkClientError::CmdMismatch {
+                sent: 0x0101,
+                got: 0x0102,
+            },
+            RynkClientError::TooLarge {
+                cmd: 0x0101,
+                len: 600,
+                max: 512,
+            },
+            RynkClientError::VersionMismatch {
+                board: version(2, 0),
+                host: version(1, 0),
+            },
+            RynkClientError::VersionMismatch {
+                board: version(1, 0),
+                host: version(1, 1),
+            },
+            RynkClientError::RevisionMismatch {
+                board: Some(ERGOHAVEN_RYNK_REVISION + 1),
+                host: ERGOHAVEN_RYNK_REVISION,
+            },
+            RynkClientError::RevisionMismatch {
+                board: Some(0),
+                host: ERGOHAVEN_RYNK_REVISION,
+            },
+            RynkClientError::RevisionMismatch {
+                board: None,
+                host: ERGOHAVEN_RYNK_REVISION,
+            },
+            RynkClientError::DefinitionHash {
+                expected: 1,
+                actual: 2,
+            },
+            RynkClientError::WriteFault,
+            RynkClientError::WritesPending(status),
+            RynkClientError::BulkProtocol { cmd: 0x0101 },
+            RynkClientError::ReadOnly { cmd: 0x0101 },
+        ];
+        errors.extend(
+            [
+                RynkError::Malformed,
+                RynkError::NotReady,
+                RynkError::StorageFault,
+                RynkError::Internal,
+                RynkError::Unimplemented,
+                RynkError::Invalid,
+                RynkError::UnknownCmd,
+                RynkError::Locked,
+                RynkError::Busy,
+            ]
+            .map(|error| RynkClientError::Device { cmd: 0x0101, error }),
+        );
+        for error in &errors {
+            let english = error.describe(crate::i18n::Language::English);
+            let russian = error.describe(crate::i18n::Language::Russian);
+            for text in [&english, &russian] {
+                assert!(
+                    !text.is_empty() && !text.contains('{') && !text.contains("rynk_client."),
+                    "{error}: {text}"
+                );
+            }
+            assert_ne!(english, russian, "{error}");
+        }
+        let update = |error: &RynkClientError| error.describe(crate::i18n::Language::English);
+        assert!(update(&errors[5]).ends_with("update Entropy"));
+        assert!(update(&errors[6]).ends_with("update the firmware"));
+        assert!(update(&errors[7]).ends_with("update Entropy"));
+        assert!(update(&errors[8]).ends_with("update the firmware"));
     }
 }
