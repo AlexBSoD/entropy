@@ -480,8 +480,27 @@ impl<T: RynkTransport> RynkClient<T> {
         let seq = self.next_seq;
         self.next_seq = if seq == u8::MAX { 1 } else { seq + 1 };
         let frame = encode_request::<E>(seq, request, self.max_payload)?;
+        self.take_unasked()?;
         self.transport.send(&frame)?;
         Ok(seq)
+    }
+
+    /// Reads away what the board sent since the last reply: topics, or the
+    /// reply to a request given up on. Over USB the board takes no frame while
+    /// one of its own waits for the host, so a frame longer than a packet
+    /// would wait for it until the write timed out and broke the link. A read
+    /// that finds nothing stays queued and takes what the board sends next.
+    fn take_unasked(&mut self) -> Result<(), RynkClientError> {
+        loop {
+            while self.next_frame().is_some() {}
+            let n = self
+                .transport
+                .recv(self.deframer.tail(&mut self.rx), Duration::ZERO)?;
+            if n == 0 {
+                return Ok(());
+            }
+            self.deframer.commit(n);
+        }
     }
 
     fn next_frame(&mut self) -> Option<Incoming> {
@@ -977,6 +996,25 @@ mod tests {
         .hid_reports();
         let (mut client, _) = RynkClient::connect(board.transport(), quick()).unwrap();
         assert_eq!(client.request::<command::GetCurrentLayer>(&()).unwrap(), 2);
+    }
+
+    #[test]
+    fn a_frame_the_board_sent_unasked_does_not_hold_the_next_request() {
+        let board = FakeBoard::new(|header, _| {
+            vec![handshake(header, 4128).unwrap_or_else(|| ok(header, ()))]
+        })
+        .usb();
+        let (mut client, _) = RynkClient::connect(board.transport(), quick()).unwrap();
+        // A layer change between two requests, and the reply to a request
+        // given up on: neither is read by the time the next frame goes out.
+        board.push(&frame(Cmd::LayerChange, 0, &3u8));
+        board.push(&frame(Cmd::GetCurrentLayer, 9, &Ok::<u8, RynkError>(1)));
+        let text = vec![MacroOp::Char(b'a'); 1023];
+        client.write_macro(0, &text).unwrap();
+        assert_eq!(
+            board.sent().last().map(|header| header.cmd),
+            Some(Cmd::SetMacro)
+        );
     }
 
     #[test]
