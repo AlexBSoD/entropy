@@ -9,8 +9,6 @@ use std::collections::HashSet;
 use std::ffi::{CStr, CString};
 #[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "linux")]
-use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -514,7 +512,9 @@ fn platform_foreground_status() -> ForegroundStatus {
         LinuxForegroundBackend::GnomeWayland => linux_gnome_wayland_status(),
         // While the KWin script runs, it pushes focus changes to the monitor.
         LinuxForegroundBackend::KdeWayland
-            if KWIN_FOREGROUND_SCRIPT_LOADED.load(Ordering::Acquire) =>
+            if KWIN_FOREGROUND_SCRIPT
+                .lock()
+                .is_ok_and(|script| script.is_some()) =>
         {
             FOREGROUND_MONITOR
                 .get()
@@ -1909,8 +1909,13 @@ const KWIN_FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
 const KWIN_SCRIPT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(target_os = "linux")]
 const KWIN_RECONNECT_DELAY: Duration = Duration::from_secs(10);
+// kdotool gives KWin as long for the same scripting calls.
 #[cfg(target_os = "linux")]
-static KWIN_FOREGROUND_SCRIPT_LOADED: AtomicBool = AtomicBool::new(false);
+const KWIN_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+// Set while the script runs. Application exit unloads the script through this
+// proxy, on the monitor's own connection.
+#[cfg(target_os = "linux")]
+static KWIN_FOREGROUND_SCRIPT: Mutex<Option<zbus::blocking::Proxy<'static>>> = Mutex::new(None);
 
 #[cfg(target_os = "linux")]
 fn linux_kde_wayland_status() -> ForegroundStatus {
@@ -2034,6 +2039,24 @@ fn kwin_scripting_proxy(
     )
 }
 
+/// Builds a connection whose method calls give up after `timeout`. zbus
+/// applies no reply timeout of its own, so a KWin that is stalled but still
+/// connected would hold the monitor and its kdotool fallback for good.
+#[cfg(target_os = "linux")]
+fn kwin_connection(
+    builder: zbus::Result<zbus::blocking::connection::Builder<'_>>,
+    timeout: Duration,
+) -> zbus::Result<zbus::blocking::Connection> {
+    builder?.method_timeout(timeout).build()
+}
+
+// Nothing waits for the answer: unloading is best effort, and application
+// exit must not depend on KWin replying.
+#[cfg(target_os = "linux")]
+fn unload_kwin_script(scripting: &zbus::blocking::Proxy<'_>, script: &str) {
+    let _ = scripting.call_noreply("unloadScript", &(script,));
+}
+
 #[cfg(target_os = "linux")]
 fn kwin_foreground_script_name(pid: u32) -> String {
     format!("{KWIN_FOREGROUND_SCRIPT_PREFIX}{pid}")
@@ -2143,8 +2166,11 @@ struct KwinForegroundMonitor {
 #[cfg(target_os = "linux")]
 impl KwinForegroundMonitor {
     fn start(state: &'static Mutex<ForegroundStatus>) -> Result<Self, String> {
-        let connection = zbus::blocking::Connection::session()
-            .map_err(|error| format!("Cannot connect to the session bus: {error}"))?;
+        let connection = kwin_connection(
+            zbus::blocking::connection::Builder::session(),
+            KWIN_CALL_TIMEOUT,
+        )
+        .map_err(|error| format!("Cannot connect to the session bus: {error}"))?;
         let bus_name = connection
             .unique_name()
             .map(|name| name.to_string())
@@ -2176,7 +2202,7 @@ impl KwinForegroundMonitor {
             .map_err(|error| format!("Cannot reach KWin scripting: {error}"))?;
         let dir = kwin_foreground_script_dir();
         for script in stale_kwin_foreground_scripts(&dir, std::process::id()) {
-            let _ = scripting.call::<_, _, bool>("unloadScript", &(&script,));
+            unload_kwin_script(&scripting, &script);
             let _ = std::fs::remove_file(dir.join(format!("{script}.js")));
         }
 
@@ -2200,7 +2226,9 @@ impl KwinForegroundMonitor {
         if id < 0 {
             return Err("KWin refused the Entropy foreground script".to_owned());
         }
-        KWIN_FOREGROUND_SCRIPT_LOADED.store(true, Ordering::Release);
+        if let Ok(mut loaded) = KWIN_FOREGROUND_SCRIPT.lock() {
+            *loaded = Some(monitor.scripting.clone());
+        }
         zbus::blocking::Proxy::new(
             &connection,
             "org.kde.KWin",
@@ -2225,15 +2253,8 @@ impl KwinForegroundMonitor {
                     Err(error) => log::warn!("Application layouts: {error}"),
                 },
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    match self
-                        .scripting
-                        .call::<_, _, bool>("isScriptLoaded", &(&self.script,))
-                    {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            return "KWin unloaded the Entropy foreground script".to_owned()
-                        }
-                        Err(error) => return format!("Cannot reach KWin scripting: {error}"),
+                    if let Some(reason) = self.lost_script() {
+                        return reason;
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -2242,28 +2263,42 @@ impl KwinForegroundMonitor {
             }
         }
     }
+
+    // A KWin that no longer answers counts as one that dropped the script.
+    fn lost_script(&self) -> Option<String> {
+        match self
+            .scripting
+            .call::<_, _, bool>("isScriptLoaded", &(&self.script,))
+        {
+            Ok(true) => None,
+            Ok(false) => Some("KWin unloaded the Entropy foreground script".to_owned()),
+            Err(error) => Some(format!("Cannot reach KWin scripting: {error}")),
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
 impl Drop for KwinForegroundMonitor {
     fn drop(&mut self) {
-        KWIN_FOREGROUND_SCRIPT_LOADED.store(false, Ordering::Release);
-        let _ = self
-            .scripting
-            .call::<_, _, bool>("unloadScript", &(&self.script,));
+        if let Ok(mut loaded) = KWIN_FOREGROUND_SCRIPT.lock() {
+            *loaded = None;
+        }
+        unload_kwin_script(&self.scripting, &self.script);
         let _ = std::fs::remove_file(&self.path);
     }
 }
 
 #[cfg(target_os = "linux")]
 pub(crate) fn unload_kwin_foreground_script() {
-    if !KWIN_FOREGROUND_SCRIPT_LOADED.swap(false, Ordering::AcqRel) {
+    let Some(scripting) = KWIN_FOREGROUND_SCRIPT
+        .lock()
+        .ok()
+        .and_then(|mut loaded| loaded.take())
+    else {
         return;
-    }
+    };
     let script = kwin_foreground_script_name(std::process::id());
-    let _ = zbus::blocking::Connection::session()
-        .and_then(|connection| kwin_scripting_proxy(&connection))
-        .and_then(|scripting| scripting.call::<_, _, bool>("unloadScript", &(&script,)));
+    unload_kwin_script(&scripting, &script);
     let _ = std::fs::remove_file(kwin_foreground_script_dir().join(format!("{script}.js")));
 }
 
@@ -3383,6 +3418,86 @@ mod tests {
             .active_window(kwin.header(), "null".to_owned())
             .unwrap();
         assert_eq!(received.try_recv().unwrap(), "null");
+    }
+
+    #[test]
+    fn kwin_calls_do_not_wait_on_a_stalled_kwin() {
+        let (client, server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        let guid = zbus::Guid::generate();
+        let server = std::thread::spawn(move || {
+            zbus::blocking::connection::Builder::unix_stream(server)
+                .server(guid)
+                .expect("server guid")
+                .p2p()
+                .build()
+        });
+        let timeout = Duration::from_millis(500);
+        let connection = kwin_connection(
+            Ok(zbus::blocking::connection::Builder::unix_stream(client).p2p()),
+            timeout,
+        )
+        .expect("client connection");
+        let kwin = server
+            .join()
+            .expect("server thread")
+            .expect("server connection");
+
+        // A KWin that is still connected but answers only long after the
+        // deadline, so a call without one fails the test instead of hanging it.
+        let (calls_tx, calls) = mpsc::channel();
+        let messages = zbus::blocking::MessageIterator::from(&kwin);
+        std::thread::spawn(move || {
+            for message in messages {
+                let Ok(message) = message else {
+                    break;
+                };
+                let member = message.header().member().map(|member| member.to_string());
+                let script = message.body().deserialize::<String>().ok();
+                let no_reply = message
+                    .primary_header()
+                    .flags()
+                    .contains(zbus::message::Flags::NoReplyExpected);
+                let _ = calls_tx.send((member, script, no_reply));
+                if !no_reply {
+                    let kwin = kwin.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(timeout * 10);
+                        let _ = kwin.reply(&message.header(), &true);
+                    });
+                }
+            }
+        });
+        let script = kwin_foreground_script_name(std::process::id());
+        let monitor = KwinForegroundMonitor {
+            scripting: kwin_scripting_proxy(&connection).expect("scripting proxy"),
+            script: script.clone(),
+            path: std::env::temp_dir().join(format!("{script}-stalled.js")),
+            received: mpsc::channel().1,
+        };
+        let next_call = || calls.recv_timeout(timeout * 4).expect("a KWin call");
+        let call =
+            |member: &str, no_reply| (Some(member.to_owned()), Some(script.clone()), no_reply);
+
+        // The periodic check gives up and the monitor falls back to kdotool.
+        let reason = monitor
+            .lost_script()
+            .expect("a KWin that does not answer counts as lost");
+        assert!(reason.contains("timed out"), "{reason}");
+        assert_eq!(next_call(), call("isScriptLoaded", false));
+
+        // Application exit only sends the unload request.
+        *KWIN_FOREGROUND_SCRIPT.lock().unwrap() = Some(monitor.scripting.clone());
+        let started = Instant::now();
+        unload_kwin_foreground_script();
+        assert!(started.elapsed() < timeout, "{:?}", started.elapsed());
+        assert_eq!(next_call(), call("unloadScript", true));
+        assert!(KWIN_FOREGROUND_SCRIPT.lock().unwrap().is_none());
+
+        // So does the monitor when it stops.
+        let started = Instant::now();
+        drop(monitor);
+        assert!(started.elapsed() < timeout, "{:?}", started.elapsed());
+        assert_eq!(next_call(), call("unloadScript", true));
     }
 
     #[test]
