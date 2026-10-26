@@ -175,6 +175,19 @@ impl EntropyApp {
         }
     }
 
+    // Linux has no tray: background mode only minimizes the window, so device
+    // polling stays on, but nobody sees the window repaint.
+    fn main_window_in_background(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.linux_background_since.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.main_window_hidden_to_tray()
+        }
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     fn update_native_background(
         &mut self,
@@ -267,16 +280,8 @@ impl EntropyApp {
         // focused. Keep a lightweight runtime tick alive so auto-switching is
         // not accidentally tied to egui input/repaint events.
         if self.application_layouts_supported()
-            || self.qmk_hid_hosts.values().any(|bridge| {
-                super::application_layout_runtime::device_supports_application_layouts(
-                    bridge.device(),
-                ) && !self.app_settings.application_layouts.is_empty()
-                    && self
-                        .device_manager
-                        .devices()
-                        .iter()
-                        .any(|device| device.permits_hid_target(bridge.device()))
-            })
+            || (self.application_layout_bridge_connected()
+                && !self.app_settings.application_layouts.is_empty())
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
@@ -1381,6 +1386,8 @@ impl eframe::App for EntropyApp {
         self.flush_typing_trainer_symbol_stats();
         self.app_settings.dark_mode = self.dark_mode;
         save_app_settings(&self.app_settings);
+        #[cfg(target_os = "linux")]
+        crate::app_discovery::unload_kwin_foreground_script();
     }
 
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
@@ -1430,8 +1437,10 @@ impl eframe::App for EntropyApp {
                 .app_settings
                 .sticky_layout_window
                 .then(|| self.matrix_tester_poll_interval());
+            #[cfg(target_os = "linux")]
+            self.track_linux_background_window(ctx);
             ctx.request_repaint_after(native_repaint_interval(
-                main_window_hidden_to_tray,
+                self.main_window_in_background(),
                 bluetooth_visible_interval,
                 connect_pending,
                 update_check_pending,
