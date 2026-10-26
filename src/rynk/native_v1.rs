@@ -117,6 +117,19 @@ pub(crate) fn v1_label_action(action: KeyAction) -> Option<V1KeyAction> {
     })
 }
 
+/// The label of a Rynk action the v1 code cannot draw: its variant name and
+/// argument, so the key never shows up blank.
+pub(crate) fn fallback_label(action: KeyAction) -> String {
+    let debug = match action {
+        KeyAction::Single(action) | KeyAction::Tap(action) => format!("{action:?}"),
+        other => format!("{other:?}"),
+    };
+    match debug.split_once('(') {
+        Some((name, argument)) => format!("{name}\n{}", &argument[..argument.len() - 1]),
+        None => debug,
+    }
+}
+
 fn v1_action(action: Action) -> Option<V1Action> {
     let Action::KeyboardControl(control) = action else {
         return bridge(&action);
@@ -213,6 +226,12 @@ mod tests {
         let steno = postcard::from_bytes::<Action>(&[STENO as u8, 1]).unwrap();
         assert!(format!("{steno:?}").starts_with("Steno("));
         assert_eq!(v1_label_action(KeyAction::Single(steno)), None);
+        let label = fallback_label(KeyAction::Single(steno));
+        assert!(
+            label.starts_with("Steno\n") && label.len() > "Steno\n".len(),
+            "{label}"
+        );
+        assert_eq!(fallback_label(KeyAction::Transparent), "Transparent");
         for bits in 0..=u8::MAX {
             assert_eq!(
                 bridge::<_, ModifierCombination>(&V1Modifiers::from_bits(bits))

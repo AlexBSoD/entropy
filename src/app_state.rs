@@ -437,7 +437,7 @@ pub(crate) fn key_binding_label_with_macro_names(
                     tap_dance_names,
                     key_legend_layout,
                 ),
-                None => "RMK\nAction".to_owned(),
+                None => crate::rynk::native_v1::fallback_label(action),
             }
         }
     }
