@@ -230,12 +230,14 @@ impl RynkSession {
         Ok(losses)
     }
 
-    /// Every key of `layer`, row by row.
-    pub(crate) fn keymap_layer(&self, layer: u8) -> Result<Vec<KeyAction>> {
+    /// Every key of the first `layers` layers, row by row, a layer each.
+    pub(crate) fn keymap(&self, layers: u8) -> Result<Vec<Vec<KeyAction>>> {
         let (rows, cols) = (self.capabilities().num_rows, self.capabilities().num_cols);
-        Ok(self
+        let keys = self
             .link
-            .run(move |client| client.read_keymap_layer(layer, rows, cols))?)
+            .run(move |client| client.read_keymap(layers, rows, cols))?;
+        let layer_len = (rows as usize * cols as usize).max(1);
+        Ok(keys.chunks(layer_len).map(<[KeyAction]>::to_vec).collect())
     }
 
     pub(crate) fn encoder(&self, layer: u8, idx: u8) -> Result<EncoderAction> {
@@ -517,7 +519,8 @@ pub(crate) mod testing {
                 let start = at.layer as usize * layer_len
                     + at.start_row as usize * cols
                     + at.start_col as usize;
-                let end = (start + 3).min((at.layer as usize + 1) * layer_len);
+                // As the firmware pages: on across layers, to the keymap's end.
+                let end = (start + 3).min(stored.keymap.len());
                 let actions = stored.keymap[start..end].to_vec();
                 ok(header, GetKeymapBulkResponse { actions })
             }

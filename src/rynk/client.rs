@@ -657,29 +657,34 @@ impl<T: RynkTransport> RynkClient<T> {
         }
     }
 
-    /// Every key of `layer`, row by row, in as few pages as the board sends.
-    pub(crate) fn read_keymap_layer(
+    /// Every key of the first `layers` layers, row by row and layer after
+    /// layer, in as few pages as the board sends. A page runs on across rows
+    /// and layers to the end of the board's keymap, whatever layer it started
+    /// in, so the keymap is read in one pass.
+    pub(crate) fn read_keymap(
         &mut self,
-        layer: u8,
+        layers: u8,
         rows: u8,
         cols: u8,
     ) -> Result<Vec<KeyAction>, RynkClientError> {
-        let total = rows as usize * cols as usize;
+        let layer_len = rows as usize * cols as usize;
+        let total = layers as usize * layer_len;
         let mut actions = Vec::with_capacity(total);
         while actions.len() < total {
             let at = actions.len();
             let request = GetKeymapBulkRequest {
-                layer,
-                start_row: (at / cols as usize) as u8,
+                layer: (at / layer_len) as u8,
+                start_row: (at % layer_len / cols as usize) as u8,
                 start_col: (at % cols as usize) as u8,
             };
             let page = self.request::<command::GetKeymapBulk>(&request)?.actions;
-            if page.is_empty() || at + page.len() > total {
+            if page.is_empty() {
                 return Err(RynkClientError::BulkProtocol {
                     cmd: command::GetKeymapBulk::CMD.raw(),
                 });
             }
-            actions.extend(page);
+            // Past the last layer read, the page holds the board's next ones.
+            actions.extend(page.into_iter().take(total - at));
         }
         Ok(actions)
     }
@@ -1041,9 +1046,43 @@ mod tests {
         client.request::<SetAgents>(&[1, 2, 3]).unwrap();
     }
 
+    /// Phenom's keymap, as it pages it: 16 layers of 10x8 keys, 255 keys a
+    /// page whatever layer the page starts in.
+    #[test]
+    fn a_keymap_page_runs_on_across_layers() {
+        let keys: Vec<KeyAction> = (0..16 * 80)
+            .map(|i| KeyAction::Single(Action::User((i % 251) as u8)))
+            .collect();
+        let stored = keys.clone();
+        let pages = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = pages.clone();
+        let board = FakeBoard::new(move |header, payload| {
+            if let Some(reply) = handshake(header, 4096) {
+                return vec![reply];
+            }
+            assert_eq!(header.cmd, Cmd::GetKeymapBulk);
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let request: GetKeymapBulkRequest = postcard::from_bytes(payload).unwrap();
+            let at = request.layer as usize * 80
+                + request.start_row as usize * 8
+                + request.start_col as usize;
+            let actions = stored[at..stored.len().min(at + 255)].to_vec();
+            vec![ok(header, GetKeymapBulkResponse { actions })]
+        });
+        let (mut client, _) = RynkClient::connect(board.transport(), quick()).unwrap();
+
+        assert_eq!(client.read_keymap(16, 10, 8).unwrap(), keys);
+        assert_eq!(
+            pages.load(std::sync::atomic::Ordering::SeqCst),
+            6,
+            "1280 keys in pages of 255"
+        );
+    }
+
     #[test]
     fn keymap_pages_are_read_in_order() {
-        let keys: Vec<KeyAction> = (0..15u8)
+        // Two 3x5 layers.
+        let keys: Vec<KeyAction> = (0..30u8)
             .map(|i| KeyAction::Single(Action::User(i)))
             .collect();
         let stored = keys.clone();
@@ -1052,9 +1091,12 @@ mod tests {
                 return vec![reply];
             }
             match header.cmd {
+                // As the firmware pages: on across layers, to the keymap's end.
                 Cmd::GetKeymapBulk => {
                     let request: GetKeymapBulkRequest = postcard::from_bytes(payload).unwrap();
-                    let at = request.start_row as usize * 5 + request.start_col as usize;
+                    let at = request.layer as usize * 15
+                        + request.start_row as usize * 5
+                        + request.start_col as usize;
                     let actions = stored[at..stored.len().min(at + 4)].to_vec();
                     vec![ok(header, GetKeymapBulkResponse { actions })]
                 }
@@ -1062,7 +1104,9 @@ mod tests {
             }
         });
         let (mut client, _) = RynkClient::connect(board.transport(), quick()).unwrap();
-        assert_eq!(client.read_keymap_layer(1, 3, 5).unwrap(), keys);
+        assert_eq!(client.read_keymap(2, 3, 5).unwrap(), keys);
+        // The page from key 12 runs into layer 1, which this read leaves out.
+        assert_eq!(client.read_keymap(1, 3, 5).unwrap(), keys[..15]);
     }
 
     #[test]

@@ -86,10 +86,10 @@ impl EntropyApp {
             vec![vec![crate::keyboard::KeyBinding::default(); layout.keys.len()]; layer_count];
 
         progress("Reading keymap…")?;
-        for layer in 0..layer_count {
-            let actions = session
-                .keymap_layer(layer as u8)
-                .map_err(failed(language, "Keymap read"))?;
+        let keymap = session
+            .keymap(layer_count as u8)
+            .map_err(failed(language, "Keymap read"))?;
+        for (layer, actions) in keymap.iter().enumerate() {
             for (index, key) in layout.keys.iter().enumerate() {
                 let at = key.row as usize * layout.cols + key.col as usize;
                 if let Some(&action) = actions.get(at) {
