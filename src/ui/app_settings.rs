@@ -691,7 +691,10 @@ impl EntropyApp {
             tooltip,
             metrics.settings_control_width(),
             |ui| {
-                if linux_vial_udev_rules_installed() {
+                if super::device_scan::udev_rule_covers(
+                    self.device_manager.devices(),
+                    linux_udev_access(),
+                ) {
                     draw_app_settings_value(
                         ui,
                         metrics,
@@ -784,8 +787,18 @@ fn draw_app_settings_value(
     );
 }
 
+/// What the installed udev rule lets the local session open.
 #[cfg(target_os = "linux")]
-pub(super) fn linux_vial_udev_rules_installed() -> bool {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct UdevAccess {
+    /// Vial boards' hidraw nodes, on USB and over kernel Bluetooth HID.
+    pub(super) vial: bool,
+    /// Rynk boards' USB devices.
+    pub(super) rynk: bool,
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn linux_udev_access() -> UdevAccess {
     const RULE_PATHS: [&str; 4] = [
         "/etc/udev/rules.d/59-vial.rules",
         "/run/udev/rules.d/59-vial.rules",
@@ -793,28 +806,44 @@ pub(super) fn linux_vial_udev_rules_installed() -> bool {
         "/lib/udev/rules.d/59-vial.rules",
     ];
 
-    RULE_PATHS.iter().any(|path| {
-        std::fs::read_to_string(path)
-            .map(|contents| vial_udev_rule_is_current(&contents))
-            .unwrap_or(false)
-    })
+    RULE_PATHS
+        .iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .fold(UdevAccess::default(), |access, contents| {
+            let found = udev_rule_access(&contents);
+            UdevAccess {
+                vial: access.vial || found.vial,
+                rynk: access.rynk || found.rynk,
+            }
+        })
 }
 
 #[cfg(target_os = "linux")]
-fn vial_udev_rule_is_current(contents: &str) -> bool {
-    const VERSION_MARKER: &str = "# Entropy keyboard access v3";
+fn udev_rule_access(contents: &str) -> UdevAccess {
+    // A v2 rule already has both hidraw lines, so a Vial user who installed it
+    // is not asked again; only Rynk boards need what v3 adds.
+    const VIAL_VERSION_MARKERS: [&str; 2] = [
+        "# Entropy Vial hidraw access v2",
+        "# Entropy keyboard access v3",
+    ];
+    const RYNK_VERSION_MARKER: &str = "# Entropy keyboard access v3";
     const USB_RULE_MARKER: &str = r#"ATTRS{serial}=="*vial:f64c2b3c*""#;
     const ERGOHAVEN_BLUETOOTH_RULE_MARKER: &str = r#"KERNELS=="0005:E126:*""#;
     // Rynk boards are claimed through usbfs, so their rule grants the USB
     // device itself rather than a hidraw node.
     const RYNK_USB_RULE_MARKER: &str = r#"ATTR{serial}=="rynk:*""#;
 
-    contents.contains(VERSION_MARKER)
-        && contents.contains(USB_RULE_MARKER)
-        && contents.contains(ERGOHAVEN_BLUETOOTH_RULE_MARKER)
-        && contents.contains(RYNK_USB_RULE_MARKER)
-        && contents.contains("SUBSYSTEM==\"hidraw\"")
-        && contents.contains(r#"ENV{DEVTYPE}=="usb_device""#)
+    UdevAccess {
+        vial: VIAL_VERSION_MARKERS
+            .iter()
+            .any(|marker| contents.contains(marker))
+            && contents.contains(USB_RULE_MARKER)
+            && contents.contains(ERGOHAVEN_BLUETOOTH_RULE_MARKER)
+            && contents.contains("SUBSYSTEM==\"hidraw\""),
+        rynk: contents.contains(RYNK_VERSION_MARKER)
+            && contents.contains(RYNK_USB_RULE_MARKER)
+            && contents.contains(r#"ENV{DEVTYPE}=="usb_device""#),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -839,7 +868,7 @@ fn command_output_summary(primary: &[u8], fallback: &[u8]) -> String {
 
 #[cfg(all(test, target_os = "linux"))]
 mod linux_udev_tests {
-    use super::vial_udev_rule_is_current;
+    use super::{udev_rule_access, UdevAccess};
 
     const OLD_RULE: &str = r#"KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{serial}=="*vial:f64c2b3c*", MODE="0660", GROUP="1000", TAG+="uaccess""#;
     const VIAL_ONLY_RULE: &str = r#"# Entropy Vial hidraw access v2
@@ -852,17 +881,29 @@ SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="e126", ATTR{seria
 
     #[test]
     fn old_usb_only_rule_requires_upgrade() {
-        assert!(!vial_udev_rule_is_current(OLD_RULE));
+        assert_eq!(udev_rule_access(OLD_RULE), UdevAccess::default());
     }
 
     #[test]
-    fn rule_without_rynk_boards_requires_upgrade() {
-        assert!(!vial_udev_rule_is_current(VIAL_ONLY_RULE));
+    fn a_v2_rule_still_reaches_vial_boards_but_not_rynk_ones() {
+        assert_eq!(
+            udev_rule_access(VIAL_ONLY_RULE),
+            UdevAccess {
+                vial: true,
+                rynk: false
+            }
+        );
     }
 
     #[test]
     fn current_rule_covers_usb_ergohaven_bluetooth_and_rynk() {
-        assert!(vial_udev_rule_is_current(CURRENT_RULE));
+        assert_eq!(
+            udev_rule_access(CURRENT_RULE),
+            UdevAccess {
+                vial: true,
+                rynk: true
+            }
+        );
     }
 
     #[test]
@@ -878,6 +919,12 @@ SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="e126", ATTR{seria
     fn packaged_udev_rule_is_accepted() {
         let packaged = include_str!("../../packaging/linux/59-vial.rules");
 
-        assert!(vial_udev_rule_is_current(packaged));
+        assert_eq!(
+            udev_rule_access(packaged),
+            UdevAccess {
+                vial: true,
+                rynk: true
+            }
+        );
     }
 }

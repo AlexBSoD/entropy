@@ -8,6 +8,44 @@ fn should_wait_for_manual_device_selection(status_msg: &str) -> bool {
         || status_msg.starts_with("Connect failed:")
 }
 
+/// A device reached over BlueZ's D-Bus, which no udev rule gates: Vial's GATT
+/// service, or a Rynk board over Bluetooth.
+#[cfg(target_os = "linux")]
+fn reachable_without_udev_rule(device: &Device) -> bool {
+    device.uses_bluez_gatt_transport()
+        || (device.firmware == FirmwareProtocol::Rynk && device.is_bluetooth_transport())
+}
+
+/// A Rynk board on USB, which only the rule's usb_device line opens.
+#[cfg(target_os = "linux")]
+fn needs_rynk_udev_rule(device: &Device) -> bool {
+    device.firmware == FirmwareProtocol::Rynk && !reachable_without_udev_rule(device)
+}
+
+/// Whether the installed rule opens every listed board that needs one. A rule
+/// from before Rynk still opens Vial boards, so it is enough until a Rynk board
+/// shows up on USB.
+#[cfg(target_os = "linux")]
+pub(super) fn udev_rule_covers(
+    devices: &[Device],
+    access: super::app_settings_ui::UdevAccess,
+) -> bool {
+    access.vial && (access.rynk || !devices.iter().any(needs_rynk_udev_rule))
+}
+
+/// Whether to ask for the rule instead of connecting: it does not cover the
+/// list, and either a Rynk board on USB waits for it or nothing on the list
+/// can be reached without one.
+#[cfg(target_os = "linux")]
+pub(super) fn udev_rule_missing(
+    devices: &[Device],
+    access: super::app_settings_ui::UdevAccess,
+) -> bool {
+    !udev_rule_covers(devices, access)
+        && (devices.iter().any(needs_rynk_udev_rule)
+            || !devices.iter().any(reachable_without_udev_rule))
+}
+
 fn should_auto_connect_only_device(device_count: usize) -> bool {
     device_count == 1
 }
@@ -367,12 +405,10 @@ impl EntropyApp {
         if self.selected_device.is_none()
             && self.layout.is_none()
             && !was_loading
-            && !super::app_settings_ui::linux_vial_udev_rules_installed()
-            && !self
-                .device_manager
-                .devices()
-                .iter()
-                .any(Device::uses_bluez_gatt_transport)
+            && udev_rule_missing(
+                self.device_manager.devices(),
+                super::app_settings_ui::linux_udev_access(),
+            )
         {
             self.retain_connected_qmk_hid_host_bridges();
             return;
@@ -424,7 +460,97 @@ impl EntropyApp {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use super::super::app_settings_ui::UdevAccess;
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bluetooth_boards_reached_over_dbus_need_no_udev_rule() {
+        let mut rynk = scan_test_device("rynk");
+        rynk.firmware = FirmwareProtocol::Rynk;
+        rynk.path = "usb:3-1".into();
+        assert!(
+            !reachable_without_udev_rule(&rynk),
+            "a Rynk board on USB is claimed through usbfs"
+        );
+        rynk.path = "ble:E0:2A:4F:10:22:33".into();
+        rynk.bus_type = "Bluetooth".into();
+        assert!(reachable_without_udev_rule(&rynk));
+
+        let mut vial = scan_test_device("vial");
+        vial.bus_type = "Bluetooth".into();
+        assert!(
+            !reachable_without_udev_rule(&vial),
+            "a Vial board over kernel HID opens hidraw"
+        );
+        vial.path = "bluez-gatt:/org/bluez/hci0/dev_E0_2A_4F_10_22_33/service0020".into();
+        assert!(reachable_without_udev_rule(&vial));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn rynk_on_usb() -> Device {
+        let mut rynk = scan_test_device("rynk");
+        rynk.firmware = FirmwareProtocol::Rynk;
+        rynk.path = "usb:3-1".into();
+        rynk
+    }
+
+    #[cfg(target_os = "linux")]
+    const V2: UdevAccess = UdevAccess {
+        vial: true,
+        rynk: false,
+    };
+
+    #[cfg(target_os = "linux")]
+    const V3: UdevAccess = UdevAccess {
+        vial: true,
+        rynk: true,
+    };
+
+    #[cfg(target_os = "linux")]
+    const NO_RULE: UdevAccess = UdevAccess {
+        vial: false,
+        rynk: false,
+    };
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_v2_rule_with_vial_boards_only_asks_for_nothing() {
+        let vial = [scan_test_device("vial")];
+        assert!(udev_rule_covers(&vial, V2));
+        assert!(
+            !udev_rule_missing(&vial, V2),
+            "Vial on USB connects with v2"
+        );
+        assert!(!udev_rule_missing(&[], V2), "an empty list shows no card");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_rynk_board_on_usb_asks_a_v2_rule_for_the_update() {
+        let boards = [scan_test_device("vial"), rynk_on_usb()];
+        assert!(!udev_rule_covers(&boards, V2));
+        assert!(udev_rule_missing(&boards, V2));
+        assert!(udev_rule_missing(&boards[1..], V2));
+        assert!(udev_rule_covers(&boards, V3));
+        assert!(!udev_rule_missing(&boards, V3));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn without_a_rule_only_boards_off_udev_connect() {
+        let vial = [scan_test_device("vial")];
+        assert!(udev_rule_missing(&vial, NO_RULE));
+        assert!(udev_rule_missing(&[], NO_RULE));
+        assert!(udev_rule_missing(&[rynk_on_usb()], NO_RULE));
+
+        let mut rynk_ble = rynk_on_usb();
+        rynk_ble.path = "ble:E0:2A:4F:10:22:33".into();
+        rynk_ble.bus_type = "Bluetooth".into();
+        assert!(!udev_rule_missing(&[rynk_ble], NO_RULE));
+        assert!(!udev_rule_covers(&vial, NO_RULE));
+    }
 
     fn scan_test_device(name: &str) -> Device {
         Device {

@@ -1817,13 +1817,10 @@ impl eframe::App for EntropyApp {
                     return;
                 }
                 #[cfg(target_os = "linux")]
-                if !super::app_settings_ui::linux_vial_udev_rules_installed()
-                    && !self
-                        .device_manager
-                        .devices()
-                        .iter()
-                        .any(Device::uses_bluez_gatt_transport)
-                {
+                if super::device_scan::udev_rule_missing(
+                    self.device_manager.devices(),
+                    super::app_settings_ui::linux_udev_access(),
+                ) {
                     let empty_rect = egui::Rect::from_center_size(
                         rect.center(),
                         egui::vec2(rect.width().min(520.0), 210.0),
