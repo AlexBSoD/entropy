@@ -2242,67 +2242,48 @@ impl EntropyApp {
         if self.current_device_is_likely_rmk() {
             skipped.push(tr("entlayout.firmware_dynamic_sections_rmk"));
         } else {
-            if entmacro_count(&bundle.data.macros) > 0 && self.keycode_picker.macro_count > 0 {
-                imported.push(tr("entlayout.macros"));
-            } else {
-                skipped.push(crate::i18n::tr_catalog_format(
-                    lang,
-                    "entlayout.not_available",
-                    &[("section", crate::i18n::tr_catalog(lang, "entlayout.macros"))],
-                ));
-            }
-
-            if !bundle.data.combos.entries.is_empty() && !self.combo_entries.is_empty() {
-                imported.push(tr("entlayout.combos"));
-            } else {
-                skipped.push(crate::i18n::tr_catalog_format(
-                    lang,
-                    "entlayout.not_available",
-                    &[("section", crate::i18n::tr_catalog(lang, "entlayout.combos"))],
-                ));
-            }
-
-            if !bundle.data.tap_dance.entries.is_empty()
-                && !self.keycode_picker.tap_dance_entries.is_empty()
-            {
-                imported.push(tr("entlayout.tap_dance"));
-            } else {
-                skipped.push(crate::i18n::tr_catalog_format(
-                    lang,
-                    "entlayout.not_available",
-                    &[(
-                        "section",
-                        crate::i18n::tr_catalog(lang, "entlayout.tap_dance"),
-                    )],
-                ));
-            }
-
-            if !bundle.data.key_overrides.entries.is_empty()
-                && !self.key_override_entries.is_empty()
-            {
-                imported.push(tr("entlayout.key_overrides"));
-            } else {
-                skipped.push(crate::i18n::tr_catalog_format(
-                    lang,
-                    "entlayout.not_available",
-                    &[(
-                        "section",
-                        crate::i18n::tr_catalog(lang, "entlayout.key_overrides"),
-                    )],
-                ));
-            }
-
-            if !bundle.data.alt_repeat.entries.is_empty() && !self.alt_repeat_entries.is_empty() {
-                imported.push(tr("entlayout.alt_repeat"));
-            } else {
-                skipped.push(crate::i18n::tr_catalog_format(
-                    lang,
-                    "entlayout.not_available",
-                    &[(
-                        "section",
-                        crate::i18n::tr_catalog(lang, "entlayout.alt_repeat"),
-                    )],
-                ));
+            // A section the file leaves empty is neither imported nor skipped:
+            // there is nothing in it to lose.
+            let sections = [
+                (
+                    "entlayout.macros",
+                    entmacro_count(&bundle.data.macros) > 0,
+                    self.keycode_picker.macro_count > 0,
+                ),
+                (
+                    "entlayout.combos",
+                    !bundle.data.combos.entries.is_empty(),
+                    !self.combo_entries.is_empty(),
+                ),
+                (
+                    "entlayout.tap_dance",
+                    !bundle.data.tap_dance.entries.is_empty(),
+                    !self.keycode_picker.tap_dance_entries.is_empty(),
+                ),
+                (
+                    "entlayout.key_overrides",
+                    !bundle.data.key_overrides.entries.is_empty(),
+                    !self.key_override_entries.is_empty(),
+                ),
+                (
+                    "entlayout.alt_repeat",
+                    !bundle.data.alt_repeat.entries.is_empty(),
+                    !self.alt_repeat_entries.is_empty(),
+                ),
+            ];
+            for (section, in_file, on_board) in sections {
+                if !in_file {
+                    continue;
+                }
+                if on_board {
+                    imported.push(tr(section));
+                } else {
+                    skipped.push(crate::i18n::tr_catalog_format(
+                        lang,
+                        "entlayout.not_available",
+                        &[("section", crate::i18n::tr_catalog(lang, section))],
+                    ));
+                }
             }
         }
 
@@ -4303,6 +4284,51 @@ mod tests {
             app.app_settings.language,
             "entlayout.layout_options_exact_only"
         )));
+    }
+
+    #[test]
+    fn the_import_report_skips_only_sections_with_entries() {
+        let (mut bundle, target) = offset_alternative_backup();
+        let mut app = EntropyApp::new_inert_for_test();
+        app.layout = Some(target);
+        let mapping = app.entlayout_import_mapping(&bundle).unwrap();
+        let lang = app.app_settings.language;
+        let not_available = |section| {
+            crate::i18n::tr_catalog_format(
+                lang,
+                "entlayout.not_available",
+                &[("section", crate::i18n::tr_catalog(lang, section))],
+            )
+        };
+        let report = |bundle: &EntLayoutFile| {
+            app.entlayout_import_report(
+                bundle,
+                Path::new("unused-backup.entlayout"),
+                &[],
+                &mapping,
+                &EntPortableSettingsImportReport::default(),
+            )
+        };
+
+        // The board has none of these sections, and the file none either.
+        let empty = report(&bundle);
+        for section in [
+            "entlayout.macros",
+            "entlayout.combos",
+            "entlayout.tap_dance",
+            "entlayout.key_overrides",
+            "entlayout.alt_repeat",
+        ] {
+            assert!(!empty.contains(&not_available(section)), "{empty}");
+        }
+        // An entry the board cannot take is still reported.
+        bundle.data.alt_repeat.entries.push(EntAltRepeatEntry {
+            keycode: 4,
+            alt_keycode: 5,
+            allowed_mods: 0,
+            options: 0,
+        });
+        assert!(report(&bundle).contains(&not_available("entlayout.alt_repeat")));
     }
 
     #[test]
