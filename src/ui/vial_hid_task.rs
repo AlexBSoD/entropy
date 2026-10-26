@@ -251,7 +251,7 @@ enum VialHidOutcome {
 
 #[cfg(not(target_arch = "wasm32"))]
 struct VialHidTaskResult {
-    hid_device: Option<crate::hid::HidDevice>,
+    hid_device: Option<crate::device_session::DeviceSession>,
     operation: VialHidOperation,
     outcome: Result<VialHidOutcome, String>,
     disconnected: bool,
@@ -277,7 +277,7 @@ pub(super) enum VialHidTaskStart {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn run_vial_hid_operation_with_progress(
-    hid: &crate::hid::HidDevice,
+    hid: &crate::device_session::DeviceSession,
     operation: VialHidOperation,
     progress: &std::sync::atomic::AtomicU32,
     cancel: &std::sync::atomic::AtomicBool,
@@ -324,14 +324,9 @@ fn run_vial_hid_operation_with_progress(
             col,
             binding,
             ..
-        } => match binding {
-            crate::keyboard::KeyBinding::Vial(keycode) => hid
-                .set_keycode(layer as u8, row, col, keycode)
-                .map(|()| VialHidOutcome::KeyWritten),
-            crate::keyboard::KeyBinding::Rmk(action) => hid
-                .set_rmk_key_action(layer as u8, row, col, action)
-                .map(|()| VialHidOutcome::KeyWritten),
-        },
+        } => hid
+            .set_key_binding(layer as u8, row, col, binding)
+            .map(|()| VialHidOutcome::KeyWritten),
         VialHidOperation::EncoderWrite {
             layer,
             encoder_index,
@@ -352,6 +347,7 @@ fn run_vial_hid_operation_with_progress(
             fallback,
             scale,
         } => hid
+            .require_vial()?
             .upload_standby_background(&path, fallback, scale, progress, cancel)
             .map(|result| match result {
                 Some(upload) => VialHidOutcome::BackgroundUploaded(upload),
@@ -360,24 +356,27 @@ fn run_vial_hid_operation_with_progress(
                 },
             }),
         VialHidOperation::BackgroundClear => {
-            hid.clear_standby_background()?;
+            hid.require_vial()?.clear_standby_background()?;
             Ok(VialHidOutcome::BackgroundCleared)
         }
         VialHidOperation::BackgroundSpeed { percent, .. } => {
-            hid.set_standby_background_speed(percent)?;
+            hid.require_vial()?.set_standby_background_speed(percent)?;
             Ok(VialHidOutcome::BackgroundSpeedSet)
         }
         VialHidOperation::StartupImageUpload { path, fallback } => hid
+            .require_vial()?
             .upload_startup_image(&path, fallback, progress)
             .map(VialHidOutcome::StartupImageUploaded),
         VialHidOperation::StartupImageClear => {
-            hid.clear_startup_image()?;
+            hid.require_vial()?.clear_startup_image()?;
             Ok(VialHidOutcome::StartupImageCleared)
         }
         VialHidOperation::PictogramLoad { .. } => hid
+            .require_vial()?
             .load_pictograms(progress)
             .map(VialHidOutcome::PictogramsLoaded),
         VialHidOperation::PictogramUpload { library } => hid
+            .require_vial()?
             .upload_pictograms(library, progress)
             .map(VialHidOutcome::PictogramsUploaded),
         VialHidOperation::PictogramSlotUpload {
@@ -385,10 +384,11 @@ fn run_vial_hid_operation_with_progress(
             kind,
             slot,
         } => hid
+            .require_vial()?
             .upload_pictogram_slot(library, kind, slot, progress)
             .map(VialHidOutcome::PictogramsUploaded),
         VialHidOperation::Deferred(request) => {
-            super::device_deferred_load::run_deferred_load(hid, &request)
+            super::device_deferred_load::run_deferred_load(hid.require_vial()?, &request)
                 .map(VialHidOutcome::Deferred)
         }
     }
@@ -396,7 +396,7 @@ fn run_vial_hid_operation_with_progress(
 
 #[cfg(test)]
 fn run_vial_hid_operation(
-    hid: &crate::hid::HidDevice,
+    hid: &crate::device_session::DeviceSession,
     operation: VialHidOperation,
 ) -> anyhow::Result<VialHidOutcome> {
     let progress = std::sync::atomic::AtomicU32::new(0);
@@ -542,7 +542,7 @@ impl EntropyApp {
         ctx: &egui::Context,
         operation: VialHidOperation,
         run: impl FnOnce(
-                &crate::hid::HidDevice,
+                &crate::device_session::DeviceSession,
                 VialHidOperation,
                 &std::sync::atomic::AtomicU32,
                 &std::sync::atomic::AtomicBool,
@@ -1357,7 +1357,7 @@ mod repeat_lifecycle_tests {
         assert!(app.device_manager.devices().is_empty());
         assert!(matches!(app.update_check, UpdateCheckState::Idle));
         let (hid, recorder) = crate::hid::HidDevice::test_device();
-        app.hid_device = Some(hid);
+        app.hid_device = Some(hid.into());
         app.app_settings.language = crate::i18n::Language::Russian;
         app.display_settings.supported = true;
         app.display_settings.clock_settings_supported = true;
@@ -1614,6 +1614,7 @@ mod repeat_lifecycle_tests {
                     else {
                         panic!("wrong operation")
                     };
+                    let hid = hid.require_vial().unwrap();
                     hid.upload_standby_background_with_cache(
                         &path,
                         fallback,
@@ -1811,6 +1812,7 @@ mod tests {
     fn protocol_neutral_operations_send_the_same_vial_requests() {
         use rmk_types::action::{Action, KeyAction};
         let (hid, recorder) = crate::hid::HidDevice::test_device();
+        let hid = crate::device_session::DeviceSession::from(hid);
         crate::golden_frames::fake_rmk_keyboard(&recorder);
         let key_write = |binding| VialHidOperation::KeyWrite {
             layer: 1,
@@ -1867,6 +1869,7 @@ mod tests {
         // starts on an unlocked board, but gates normal commands while pending.
         for unlocked in [0, 1] {
             let (hid, recorder) = crate::hid::HidDevice::test_device();
+            let hid = crate::device_session::DeviceSession::from(hid);
             let mut status = [0xFF; 32];
             status[..4].copy_from_slice(&[unlocked, 1, 0, 0]);
             recorder.respond_with([status]);
@@ -1925,6 +1928,7 @@ mod tests {
     #[test]
     fn unlock_start_uses_status_then_start_commands() {
         let (hid, recorder) = crate::hid::HidDevice::test_device();
+        let hid = crate::device_session::DeviceSession::from(hid);
 
         let outcome = run_vial_hid_operation(&hid, VialHidOperation::UnlockStart).unwrap();
 
@@ -1943,6 +1947,7 @@ mod tests {
     #[test]
     fn matrix_poll_uses_via_switch_matrix_command() {
         let (hid, recorder) = crate::hid::HidDevice::test_device();
+        let hid = crate::device_session::DeviceSession::from(hid);
 
         let outcome = run_vial_hid_operation(
             &hid,
@@ -1968,7 +1973,7 @@ mod tests {
             let ctx = egui::Context::default();
             let mut app = EntropyApp::new_inert_for_test();
             let (hid, recorder) = crate::hid::HidDevice::test_device();
-            app.hid_device = Some(hid);
+            app.hid_device = Some(hid.into());
             app.firmware = FirmwareProtocol::Vial;
             app.layout = Some(single_key_layout(0x0004));
             app.vial_unlocked = Some(true);
@@ -2003,6 +2008,7 @@ mod tests {
     #[test]
     fn unlock_poll_and_lock_use_vial_commands() {
         let (hid, recorder) = crate::hid::HidDevice::test_device();
+        let hid = crate::device_session::DeviceSession::from(hid);
 
         let _ = run_vial_hid_operation(&hid, VialHidOperation::UnlockPoll).unwrap();
         let _ = run_vial_hid_operation(&hid, VialHidOperation::Lock).unwrap();
@@ -2045,6 +2051,7 @@ mod tests {
     #[test]
     fn still_pending_unlock_remains_pending_after_confirmation() {
         let (hid, recorder) = crate::hid::HidDevice::test_device();
+        let hid = crate::device_session::DeviceSession::from(hid);
         let mut poll = [0u8; 32];
         poll[..3].copy_from_slice(&[1, 1, 0]);
         let mut status = [0xFFu8; 32];
@@ -2085,6 +2092,7 @@ mod tests {
     #[test]
     fn battery_refresh_uses_the_existing_vial_transport() {
         let (hid, recorder) = crate::hid::HidDevice::test_device();
+        let hid = crate::device_session::DeviceSession::from(hid);
 
         let outcome = run_vial_hid_operation(&hid, VialHidOperation::BatteryRefresh).unwrap();
 
@@ -2121,6 +2129,7 @@ mod tests {
     #[test]
     fn key_and_encoder_writes_use_the_serialized_vial_transport() {
         let (hid, recorder) = crate::hid::HidDevice::test_device();
+        let hid = crate::device_session::DeviceSession::from(hid);
 
         let key_outcome = run_vial_hid_operation(
             &hid,
@@ -2165,7 +2174,7 @@ mod tests {
         let (hid, recorder) = crate::hid::HidDevice::test_device();
         let mut macros = vec![Vec::new(); 32];
         macros[0] = vec![b'x'; 30];
-        app.hid_device = Some(hid);
+        app.hid_device = Some(hid.into());
         app.keycode_picker.macro_texts = macros;
         app.keycode_picker.mark_macros_dirty();
 
@@ -2196,7 +2205,7 @@ mod tests {
             1,
             crate::hid::TestHidFault::Timeout,
         )));
-        app.hid_device = Some(hid);
+        app.hid_device = Some(hid.into());
         app.keycode_picker.macro_texts = vec![Vec::new(); 32];
         app.keycode_picker.mark_macros_dirty();
         let failed_revision = app.keycode_picker.macro_edit_revision;
@@ -2221,7 +2230,7 @@ mod tests {
         let creation_context = eframe::CreationContext::_new_kittest(ctx.clone());
         let mut app = EntropyApp::new(&creation_context);
         let (hid, _) = crate::hid::HidDevice::test_device();
-        app.hid_device = Some(hid);
+        app.hid_device = Some(hid.into());
         app.keycode_picker.macro_texts = vec![Vec::new(); 32];
         app.keycode_picker.mark_macros_dirty();
         let failed_revision = app.keycode_picker.macro_edit_revision;
@@ -2245,7 +2254,7 @@ mod tests {
         let creation_context = eframe::CreationContext::_new_kittest(ctx.clone());
         let mut app = EntropyApp::new(&creation_context);
         let (hid, recorder) = crate::hid::HidDevice::test_device();
-        app.hid_device = Some(hid);
+        app.hid_device = Some(hid.into());
         app.layout = Some(single_key_layout(0x0004));
 
         assert!(app.assign_keycode(&ctx, 0, 0, 0));
@@ -2285,7 +2294,7 @@ mod tests {
             key_idx: 0,
             old_binding: 0.into(),
         });
-        app.hid_device = Some(hid);
+        app.hid_device = Some(hid.into());
 
         assert_eq!(
             app.start_vial_hid_operation(
@@ -2345,7 +2354,7 @@ mod tests {
         layout.encoder_layers.push(Vec::new());
         app.layout = Some(layout);
         app.deferred_device_load = DeferredDeviceLoadState::staged((*context).clone());
-        app.hid_device = Some(hid);
+        app.hid_device = Some(hid.into());
 
         assert_eq!(
             app.start_vial_hid_operation(
@@ -2426,7 +2435,7 @@ mod tests {
             supported: true,
             ..LayerLedSettingsState::default()
         };
-        app.hid_device = Some(hid);
+        app.hid_device = Some(hid.into());
 
         assert_eq!(
             app.start_vial_hid_operation(
@@ -2512,7 +2521,7 @@ mod tests {
         let creation_context = eframe::CreationContext::_new_kittest(ctx.clone());
         let mut app = EntropyApp::new(&creation_context);
         let (hid, _recorder) = crate::hid::HidDevice::test_device();
-        app.hid_device = Some(hid);
+        app.hid_device = Some(hid.into());
         app.layout = Some(single_key_layout(0x0004));
 
         assert!(app.assign_keycode(&ctx, 0, 0, 0x0005));

@@ -790,7 +790,7 @@ fn fixture() -> (EntropyApp, crate::hid::TestHidRecorder, String) {
         _ => None,
     });
     app.shared_hid_output = hid.shared_output();
-    app.hid_device = Some(hid);
+    app.hid_device = Some(hid.into());
     let key = app.application_layout_device_key().unwrap();
     let mut settings = DeviceApplicationLayouts::default();
     let application = settings.create_for_application(&DetectedApplication {

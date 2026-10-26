@@ -58,7 +58,7 @@ pub(super) struct ComboWriteTask {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) struct ComboWriteResult {
-    pub(super) hid_device: Option<crate::hid::HidDevice>,
+    pub(super) hid_device: Option<crate::device_session::DeviceSession>,
     pub(super) index: usize,
     pub(super) entry: ComboEntry,
     pub(super) revision: u64,

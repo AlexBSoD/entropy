@@ -86,7 +86,7 @@ fn import_into_rmk_keyboard_sends_the_same_vial_requests() {
     let mut target = rmk_k04();
     let (hid, recorder) = crate::hid::HidDevice::test_device();
     crate::golden_frames::fake_rmk_keyboard(&recorder);
-    target.hid_device = Some(hid);
+    target.hid_device = Some(hid.into());
     let (failures, _, _) = target.apply_entlayout(&bundle).unwrap();
     assert!(failures.is_empty(), "{failures:?}");
     crate::golden_frames::assert_vial_frames("import_rmk_k04", &recorder.requests());

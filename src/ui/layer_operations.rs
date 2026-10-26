@@ -434,7 +434,7 @@ struct LayerWriteFallback {
 
 #[cfg(not(target_arch = "wasm32"))]
 struct LayerWriteResult {
-    hid_device: Option<crate::hid::HidDevice>,
+    hid_device: Option<crate::device_session::DeviceSession>,
     context: LayerWriteContext,
     progress: LayerWriteProgress,
 }
@@ -1234,23 +1234,16 @@ impl EntropyApp {
             let mut progress = run_layer_writes(
                 &key_changes,
                 &encoder_changes,
-                |row, col, binding| match binding {
-                    crate::keyboard::KeyBinding::Vial(keycode) => {
-                        match hid_device.set_keycode(layer_u8, row, col, keycode) {
-                            Ok(()) => KeyWriteOutcome::Saved,
-                            Err(error) => match crate::hid::keycode_writeback_readback(&error) {
-                                Some(readback) => KeyWriteOutcome::Mismatch {
-                                    readback: readback.into(),
-                                    error: error.to_string(),
-                                },
-                                None => KeyWriteOutcome::Failed(error.to_string()),
-                            },
-                        }
-                    }
-                    crate::keyboard::KeyBinding::Rmk(action) => hid_device
-                        .set_rmk_key_action(layer_u8, row, col, action)
-                        .map(|()| KeyWriteOutcome::Saved)
-                        .unwrap_or_else(|error| KeyWriteOutcome::Failed(error.to_string())),
+                |row, col, binding| match hid_device.set_key_binding(layer_u8, row, col, binding) {
+                    Ok(()) => KeyWriteOutcome::Saved,
+                    // Only a VIA keycode write reports what the keyboard holds instead.
+                    Err(error) => match crate::hid::keycode_writeback_readback(&error) {
+                        Some(readback) => KeyWriteOutcome::Mismatch {
+                            readback: readback.into(),
+                            error: error.to_string(),
+                        },
+                        None => KeyWriteOutcome::Failed(error.to_string()),
+                    },
                 },
                 |device_idx, direction, keycode| {
                     hid_device
@@ -1670,7 +1663,7 @@ mod tests {
             }
             _ => None,
         });
-        app.hid_device = Some(hid);
+        app.hid_device = Some(hid.into());
         (app, recorder, ctx)
     }
 

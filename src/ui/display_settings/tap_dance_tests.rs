@@ -207,7 +207,7 @@ fn tap_dance_timeout_clears_connection_instead_of_retaining_a_busy_choose() {
         0,
         crate::hid::TestHidFault::Timeout,
     )));
-    app.hid_device = Some(hid);
+    app.hid_device = Some(hid.into());
     app.start_pictogram_load(&ctx);
     finish(&mut app, &ctx);
     assert!(!app.vial_hid_task_blocks_user_action());
@@ -238,7 +238,7 @@ fn tap_dance_stale_deferred_result_cannot_overwrite_successor_or_leave_choose_bu
     app.deferred_device_load
         .set_section_status(DeferredLoadSection::TapDance, DeferredLoadStatus::Loaded);
     let (successor_hid, _) = crate::hid::HidDevice::test_device();
-    app.hid_device = Some(successor_hid);
+    app.hid_device = Some(successor_hid.into());
     app.display_settings.pictograms.editor_name = "Successor draft".into();
     finish(&mut app, &ctx);
     assert_eq!(

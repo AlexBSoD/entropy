@@ -467,7 +467,7 @@ mod tests {
             firmware: FirmwareProtocol::Vial,
         });
         let (hid, _recorder) = crate::hid::HidDevice::test_device();
-        app.hid_device = Some(hid);
+        app.hid_device = Some(hid.into());
         app.device_display_names
             .insert(macropad.display_name_cache_key(), macropad.name.clone());
         let old_generation = app.connection_generation;

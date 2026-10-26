@@ -1254,7 +1254,7 @@ mod tests {
         let creation_context = eframe::CreationContext::_new_kittest(ctx.clone());
         let mut app = EntropyApp::new(&creation_context);
         let (hid_device, recorder) = crate::hid::HidDevice::test_device();
-        app.hid_device = Some(hid_device);
+        app.hid_device = Some(hid_device.into());
         app.exit_after_hid_write = true;
         app.touchpad_settings.scroll_sens = 12;
         app.debounce_touchpad_setting_write(&ctx, "Scroll sensitivity".to_owned(), 122, 8, 12);

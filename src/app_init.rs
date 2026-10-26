@@ -400,7 +400,7 @@ impl EntropyApp {
         match crate::hid::HidDevice::open_fresh_for(dev) {
             Ok(hid) => {
                 self.shared_hid_output = hid.shared_output();
-                self.hid_device = Some(hid);
+                self.hid_device = Some(hid.into());
             }
             Err(e) => {
                 self.hid_device = None;

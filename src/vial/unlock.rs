@@ -471,7 +471,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = EntropyApp::new_inert_for_test();
         let (hid, recorder) = crate::hid::HidDevice::test_device();
-        app.hid_device = Some(hid);
+        app.hid_device = Some(hid.into());
         app.firmware = FirmwareProtocol::Vial;
         app.unlock_open = true;
         app.pending_layout_indicator_open_after_unlock = true;
@@ -508,7 +508,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = EntropyApp::new_inert_for_test();
         let (hid, recorder) = crate::hid::HidDevice::test_device();
-        app.hid_device = Some(hid);
+        app.hid_device = Some(hid.into());
         app.firmware = FirmwareProtocol::Vial;
         app.unlock_open = true;
 
@@ -529,7 +529,7 @@ mod tests {
             let ctx = egui::Context::default();
             let mut app = EntropyApp::new_inert_for_test();
             let (hid, recorder) = crate::hid::HidDevice::test_device();
-            app.hid_device = Some(hid);
+            app.hid_device = Some(hid.into());
             app.firmware = FirmwareProtocol::Vial;
             app.vial_unlocked = Some(false);
             app.settings_tab = tab;
@@ -568,7 +568,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = EntropyApp::new_inert_for_test();
         let (hid, _) = crate::hid::HidDevice::test_device();
-        app.hid_device = Some(hid);
+        app.hid_device = Some(hid.into());
         app.firmware = FirmwareProtocol::Vial;
         app.unlock_open = true;
 

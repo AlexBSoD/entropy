@@ -2129,7 +2129,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = staged_app();
         let (hid, recorder) = crate::hid::HidDevice::test_device();
-        app.hid_device = Some(hid);
+        app.hid_device = Some(hid.into());
         // This test covers queue order rather than the separate initial-idle policy.
         app.deferred_device_load
             .allow_background_layer_now_for_test();

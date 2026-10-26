@@ -5419,7 +5419,7 @@ pub struct EntropyApp {
     pub(crate) device_scan_state: DeviceScanState,
     /// Persistent open HID device for real-time writes (Vial)
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) hid_device: Option<crate::hid::HidDevice>,
+    pub(crate) hid_device: Option<crate::device_session::DeviceSession>,
     /// Non-owning output path into the persistent HID owner. Live host data
     /// uses it without opening a competing Windows Bluetooth handle.
     #[cfg(not(target_arch = "wasm32"))]

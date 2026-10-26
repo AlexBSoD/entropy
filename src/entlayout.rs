@@ -1026,6 +1026,7 @@ impl EntropyApp {
                 .hid_device
                 .as_ref()
                 .context("No active keyboard connection")?
+                .require_vial()?
                 .probe_application_layout_protocol()
                 .context("Application layout capability is unconfirmed; export refused")?;
             let info = self.device_about_info.as_mut().unwrap();
@@ -1046,6 +1047,7 @@ impl EntropyApp {
             .hid_device
             .as_ref()
             .context("No active keyboard connection")?
+            .require_vial()?
             .load_pictograms(&std::sync::atomic::AtomicU32::new(0));
         match result {
             Ok(library) => {
@@ -1976,7 +1978,8 @@ impl EntropyApp {
             let hid = self
                 .hid_device
                 .as_ref()
-                .context("No active keyboard connection")?;
+                .context("No active keyboard connection")?
+                .require_vial()?;
             let progress = std::sync::atomic::AtomicU32::new(0);
             let mut library = if self.display_settings.pictograms.loaded {
                 self.display_settings.pictograms.library.clone()
@@ -2526,19 +2529,7 @@ impl EntropyApp {
                         continue;
                     }
                     let key = &layout.keys[target_key_idx];
-                    match binding {
-                        crate::keyboard::KeyBinding::Vial(keycode) => {
-                            hid.set_keycode(target_layer_idx as u8, key.row, key.col, keycode)?;
-                        }
-                        crate::keyboard::KeyBinding::Rmk(action) => {
-                            hid.set_rmk_key_action(
-                                target_layer_idx as u8,
-                                key.row,
-                                key.col,
-                                action,
-                            )?;
-                        }
-                    }
+                    hid.set_key_binding(target_layer_idx as u8, key.row, key.col, binding)?;
                 }
             }
             Ok(())
@@ -4172,7 +4163,7 @@ mod tests {
         let bundle: EntLayoutFile = serde_json::from_str(&json).unwrap();
         let mut target = module_app();
         let (hid, recorder) = crate::hid::HidDevice::test_device();
-        target.hid_device = Some(hid);
+        target.hid_device = Some(hid.into());
         let (_, _, report) = target.apply_entlayout(&bundle).unwrap();
         assert_eq!(report.imported, 4);
         assert_eq!(target.module_settings.values, source.module_settings.values);

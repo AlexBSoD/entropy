@@ -1456,7 +1456,7 @@ impl EntropyApp {
                     .hid_device
                     .as_ref()
                     .and_then(crate::hid::HidDevice::shared_output);
-                self.hid_device = r.hid_device;
+                self.hid_device = r.hid_device.map(Into::into);
                 self.supported_qmk_settings = r.supported_qmk_settings;
                 self.deferred_device_load = r.deferred_load;
 
@@ -1569,7 +1569,7 @@ pub(super) trait LayerNameStore {
 /// setting ids the firmware advertised during connect.
 #[cfg(not(target_arch = "wasm32"))]
 struct HidLayerNameStore<'a> {
-    dev: &'a crate::hid::HidDevice,
+    dev: &'a crate::device_session::DeviceSession,
     supported: &'a [u16],
 }
 
@@ -1721,7 +1721,7 @@ mod qa_followup_reconnect {
             0,
             crate::hid::TestHidFault::Disconnect,
         )));
-        app.hid_device = Some(hid);
+        app.hid_device = Some(hid.into());
         let p = &mut app.display_settings.pictograms;
         p.loaded = true;
         p.supported = Some(true);
@@ -1789,7 +1789,7 @@ mod qa_followup_reconnect {
             if r[..2]==[0xfe,0x0b] {Some(Ok([0;32]))}
             else if r[..2]==[0xfe,0x0a] {Some(Ok([0xff;32]))} else {None}
         });
-        app.hid_device=Some(hid);
+        app.hid_device=Some(hid.into());
         let request=super::super::vial_hid_task::LayerNameWrite {
             device:device("a"),device_key:"reconnect-name".into(),layout_id:"default".into(),
             generation:app.connection_generation,layer:1,name:"Mutated".into(),
@@ -1824,7 +1824,7 @@ mod qa_followup_reconnect {
         let confirmed = PictogramLibrary::default();
         let (hid, recorder) = crate::hid::HidDevice::test_device();
         recorder.respond_with(test_pictogram_read_responses(&confirmed));
-        app.hid_device = Some(hid);
+        app.hid_device = Some(hid.into());
         assert!(matches!(
             app.start_vial_hid_operation(
                 &ctx,

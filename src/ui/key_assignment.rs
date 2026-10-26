@@ -890,7 +890,7 @@ mod tests {
         let creation_context = eframe::CreationContext::_new_kittest(ctx.clone());
         let mut app = EntropyApp::new(&creation_context);
         let (hid_device, recorder) = crate::hid::HidDevice::test_device();
-        app.hid_device = Some(hid_device);
+        app.hid_device = Some(hid_device.into());
         app.key_override_entries = vec![KeyOverrideEntry::default()];
         app.key_override_pick_target = Some(KeyOverridePickField::Trigger);
         app.keycode_picker.result = Some(0x2204.into());
@@ -1205,7 +1205,7 @@ mod tests {
         let mut app = EntropyApp::new(&creation_context);
         app.layout = Some(test_layout(&[0x0004, 0x0005], &[]));
         let (hid_device, _recorder) = crate::hid::HidDevice::test_device();
-        app.hid_device = Some(hid_device);
+        app.hid_device = Some(hid_device.into());
 
         // First assignment takes the HID handle for its write task.
         app.request_middle_click_key_assignment(&ctx, 0);

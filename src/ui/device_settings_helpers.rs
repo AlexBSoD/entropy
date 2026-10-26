@@ -2049,8 +2049,15 @@ impl EntropyApp {
         if !bridge.uses_shared_output() || !qmk_bridge_matches_device(bridge, previous) {
             return false;
         }
-        let Some(hid) = self.hid_device.take() else {
+        let Some(session) = self.hid_device.take() else {
             return false;
+        };
+        let hid = match session.into_vial() {
+            Ok(hid) => hid,
+            Err(session) => {
+                self.hid_device = Some(*session);
+                return false;
+            }
         };
         match bridge.adopt_selected_hid(hid) {
             Ok(()) => {
@@ -2058,7 +2065,7 @@ impl EntropyApp {
                 true
             }
             Err(hid) => {
-                self.hid_device = Some(hid);
+                self.hid_device = Some(hid.into());
                 false
             }
         }
@@ -3051,7 +3058,7 @@ mod tests {
         app.layout = Some(layout);
         app.app_settings.layout_sync_enabled = true;
         app.shared_hid_output = hid.shared_output();
-        app.hid_device = Some(hid);
+        app.hid_device = Some(hid.into());
 
         app.sync_qmk_hid_host_bridges();
 

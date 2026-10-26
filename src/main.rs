@@ -7,6 +7,8 @@ mod app_discovery;
 pub(crate) mod app_icon;
 mod application_layouts;
 mod device;
+#[cfg(not(target_arch = "wasm32"))]
+mod device_session;
 mod diagnostics;
 mod firmware;
 mod firmware_builtin_icons;

@@ -853,7 +853,7 @@ mod tests {
             }))
             .unwrap(),
         );
-        app.hid_device = Some(hid_device);
+        app.hid_device = Some(hid_device.into());
         app.vial_unlocked = Some(false);
         let entry = crate::keycode_picker::TapDanceEntry {
             on_tap: 0x0004.into(),
@@ -891,7 +891,7 @@ mod tests {
         let creation_context = eframe::CreationContext::_new_kittest(ctx.clone());
         let mut app = EntropyApp::new(&creation_context);
         let (hid_device, recorder) = crate::hid::HidDevice::test_device();
-        app.hid_device = Some(hid_device);
+        app.hid_device = Some(hid_device.into());
         app.queue_touchpad_setting_write("Sniper sensitivity".to_owned(), 121, 1, 1, 2);
         assert!(app.settings_write_task.is_some());
 
@@ -1020,7 +1020,7 @@ mod tests {
         let creation_context = eframe::CreationContext::_new_kittest(ctx.clone());
         let mut app = EntropyApp::new(&creation_context);
         let (hid_device, recorder) = crate::hid::HidDevice::test_device();
-        app.hid_device = Some(hid_device);
+        app.hid_device = Some(hid_device.into());
         app.combo_entries = vec![combo([0x0004, 0x0005, 0, 0], 0x0006)];
         app.combo_synced_entries = vec![ComboEntry::default()];
         app.combo_dirty = true;
@@ -1189,7 +1189,7 @@ mod tests {
         let creation_context = eframe::CreationContext::_new_kittest(ctx.clone());
         let mut app = EntropyApp::new(&creation_context);
         let (hid_device, _recorder) = crate::hid::HidDevice::test_device();
-        app.hid_device = Some(hid_device);
+        app.hid_device = Some(hid_device.into());
         app.combo_entries = vec![combo([0x0004, 0x0005, 0, 0], 0x0006)];
         app.combo_synced_entries = vec![ComboEntry::default()];
         app.combo_dirty = true;
@@ -1216,7 +1216,7 @@ mod tests {
         let creation_context = eframe::CreationContext::_new_kittest(ctx.clone());
         let mut app = EntropyApp::new(&creation_context);
         let (hid_device, _recorder) = crate::hid::HidDevice::test_device();
-        app.hid_device = Some(hid_device);
+        app.hid_device = Some(hid_device.into());
         app.layout = Some(KeyboardLayout {
             name: "Test".into(),
             rows: 1,
@@ -1275,7 +1275,7 @@ mod tests {
         let mut app = EntropyApp::new(&creation_context);
         let (hid_device, recorder) =
             crate::hid::HidDevice::test_device_with_fault_after_requests(Some((2, fault)));
-        app.hid_device = Some(hid_device);
+        app.hid_device = Some(hid_device.into());
         app.combo_entries = vec![combo([0x0004, 0x0005, 0, 0], 0x0006)];
         app.combo_synced_entries = vec![ComboEntry::default()];
         app.combo_dirty = true;
@@ -1358,7 +1358,7 @@ mod tests {
         let (hid_device, _recorder) = crate::hid::HidDevice::test_device();
         let first = combo([0x0004, 0x0005, 0, 0], 0x0006);
         let second = combo([0x0007, 0x0008, 0, 0], 0x0009);
-        app.hid_device = Some(hid_device);
+        app.hid_device = Some(hid_device.into());
         app.combo_entries = vec![first.clone(), second];
         app.combo_synced_entries = vec![ComboEntry::default(), ComboEntry::default()];
         app.combo_dirty = true;
