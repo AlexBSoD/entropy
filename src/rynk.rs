@@ -7,6 +7,7 @@
 
 pub(crate) mod client;
 pub(crate) mod dynamic;
+pub(crate) mod entlayout;
 pub(crate) mod keycode;
 pub(crate) mod link;
 pub(crate) mod macros;
