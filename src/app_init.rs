@@ -155,6 +155,7 @@ impl EntropyApp {
             application_categories_selected_id: None,
             application_categories_name: String::new(),
             pending_device_connect: None,
+            remembered_device: None,
             #[cfg(not(target_arch = "wasm32"))]
             headless: false,
             firmware: FirmwareProtocol::Vial,

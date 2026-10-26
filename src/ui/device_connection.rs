@@ -363,7 +363,7 @@ impl EntropyApp {
                     });
                     if let Some(idx) = selected_device {
                         self.main_menu_tab = MainMenuTab::Keyboard;
-                        self.start_connect(idx);
+                        self.connect_picked_device(idx);
                     }
                 });
             });
