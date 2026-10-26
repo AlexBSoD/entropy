@@ -674,6 +674,15 @@ mod tests {
         assert_eq!(names, ["blocked.entlayout", "k04.entlayout"]);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn connect_and_full_load_send_the_same_vial_requests() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (mut app, session, recorder) = scripted_export_app(|_| None);
+        export_entlayout(&mut app, 0, &session, deadline()).unwrap();
+        crate::golden_frames::assert_vial_frames("connect_macropad", &recorder.requests());
+    }
+
     /// A scripted Vial keyboard: a two-key, two-layer definition, one macro,
     /// one combo and one tap dance. `fail` makes chosen requests fail on the
     /// wire the way a timeout or unplug would.

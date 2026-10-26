@@ -1808,6 +1808,60 @@ mod tests {
     }
 
     #[test]
+    fn protocol_neutral_operations_send_the_same_vial_requests() {
+        use rmk_types::action::{Action, KeyAction};
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        crate::golden_frames::fake_rmk_keyboard(&recorder);
+        let key_write = |binding| VialHidOperation::KeyWrite {
+            layer: 1,
+            key_index: 0,
+            row: 2,
+            col: 3,
+            old_binding: KeyBinding::Vial(0),
+            binding,
+            is_undo: false,
+        };
+        let operations = [
+            VialHidOperation::LayerNameWrite(LayerNameWrite {
+                device: crate::device::test_usb_device("3-3", 5, 0x0071),
+                device_key: String::new(),
+                layout_id: String::new(),
+                generation: 0,
+                layer: 1,
+                name: "Nav".into(),
+            }),
+            VialHidOperation::UnlockStart,
+            VialHidOperation::UnlockPoll,
+            VialHidOperation::Lock,
+            VialHidOperation::Matrix {
+                rows: 2,
+                cols: 3,
+                remember_ever_pressed: false,
+            },
+            VialHidOperation::BatteryRefresh,
+            key_write(KeyBinding::Vial(0x04)),
+            key_write(KeyBinding::Rmk(KeyAction::Single(Action::User(0x90)))),
+            VialHidOperation::EncoderWrite {
+                layer: 0,
+                encoder_visual_index: 1,
+                encoder_index: 0,
+                direction: 1,
+                old_keycode: 0,
+                keycode: 0x80,
+                is_undo: false,
+            },
+            VialHidOperation::MacroWrite {
+                macros: vec![b"ab".to_vec(), Vec::new()],
+                revision: 1,
+            },
+        ];
+        for operation in operations {
+            run_vial_hid_operation(&hid, operation).unwrap();
+        }
+        crate::golden_frames::assert_vial_frames("hid_operations", &recorder.requests());
+    }
+
+    #[test]
     fn pending_unlock_is_not_ready_and_does_not_restart_physical_hold() {
         // The firmware keeps the unlocked bit set if another unlock sequence
         // starts on an unlocked board, but gates normal commands while pending.

@@ -4107,6 +4107,10 @@ mod macropad_tests;
 mod module_tests;
 
 #[cfg(test)]
+#[path = "entlayout_wire_golden_tests.rs"]
+mod wire_golden_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
