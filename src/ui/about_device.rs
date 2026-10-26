@@ -175,10 +175,14 @@ fn firmware_update_rows(
                 crate::i18n::Language::English => "checking GitHub Releases".to_owned(),
             },
             FirmwareUpdateCheckState::Ready { result, .. } => match result.relation {
-                VersionRelation::UpdateAvailable => match lang {
-                    crate::i18n::Language::Russian => "доступно обновление".to_owned(),
-                    crate::i18n::Language::English => "update available".to_owned(),
-                },
+                VersionRelation::UpdateAvailable => format!(
+                    "{}. {}",
+                    match lang {
+                        crate::i18n::Language::Russian => "доступно обновление",
+                        crate::i18n::Language::English => "update available",
+                    },
+                    backup_before_update(lang)
+                ),
                 VersionRelation::UpToDate => match lang {
                     crate::i18n::Language::Russian => "актуальная версия".to_owned(),
                     crate::i18n::Language::English => "up to date".to_owned(),
@@ -601,6 +605,19 @@ fn download_update_label(lang: crate::i18n::Language) -> &'static str {
     }
 }
 
+/// The new firmware can wipe the keyboard's storage (moving to Rynk does),
+/// so the layout comes back only from a file.
+fn backup_before_update(lang: crate::i18n::Language) -> &'static str {
+    match lang {
+        crate::i18n::Language::Russian => {
+            "Перед прошивкой экспортируйте раскладку (.entlayout): новая прошивка может очистить память клавиатуры"
+        }
+        crate::i18n::Language::English => {
+            "Export your layout (.entlayout) before flashing: the new firmware may clear the keyboard's storage"
+        }
+    }
+}
+
 fn changelog_label(lang: crate::i18n::Language) -> &'static str {
     match lang {
         crate::i18n::Language::Russian => "Changelog",
@@ -770,6 +787,7 @@ impl EntropyApp {
                                 button_size,
                                 true,
                             )
+                            .on_hover_text(backup_before_update(lang))
                             .clicked()
                                 && !crate::app::open_url_in_browser(&result.asset.url)
                             {
@@ -992,6 +1010,39 @@ mod tests {
                     .firmware_update_target
                     .is_none());
             }
+        }
+    }
+
+    #[test]
+    fn an_available_firmware_update_asks_for_a_layout_backup() {
+        let target = FirmwareReleaseTarget {
+            current_version: "1.2.0".to_owned(),
+            asset_prefix: "k04".to_owned(),
+        };
+        let state = |relation| FirmwareUpdateCheckState::Ready {
+            target: target.clone(),
+            result: crate::app::FirmwareUpdateCheckResult {
+                latest_version: "1.3.0".to_owned(),
+                release_url: "https://github.com/ergohaven/rmk/releases/tag/1.3.0".to_owned(),
+                asset: crate::app::UpdateAsset {
+                    name: "k04.zip".to_owned(),
+                    url: "https://github.com/ergohaven/rmk/releases/download/1.3.0/k04.zip"
+                        .to_owned(),
+                },
+                relation,
+            },
+        };
+        for lang in [
+            crate::i18n::Language::English,
+            crate::i18n::Language::Russian,
+        ] {
+            let status = |relation| {
+                firmware_update_rows(lang, &target, &state(relation))[1]
+                    .value
+                    .clone()
+            };
+            assert!(status(VersionRelation::UpdateAvailable).ends_with(backup_before_update(lang)));
+            assert!(!status(VersionRelation::UpToDate).contains(".entlayout"));
         }
     }
 
