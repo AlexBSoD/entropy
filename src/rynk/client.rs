@@ -564,85 +564,137 @@ impl<T: RynkTransport> RynkClient<T> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod testing {
+    //! A fake board for tests of the client and of what drives it.
+
     use std::collections::VecDeque;
+    use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
     use super::*;
-    use rmk_types_rynk::action::Action;
-    use rmk_types_rynk::protocol::rynk::GetKeymapBulkResponse;
 
-    type Handler = Box<dyn FnMut(RynkHeader, &[u8]) -> Vec<Vec<u8>>>;
+    type Handler = Box<dyn FnMut(RynkHeader, &[u8]) -> Vec<Vec<u8>> + Send>;
 
-    /// A board in a box: decodes each frame the client sends and queues the
-    /// frames its handler answers with, cut into `chunk`-byte reads.
-    struct FakeBoard {
+    struct State {
         handler: Handler,
         pending: VecDeque<u8>,
         chunk: usize,
         sent: Vec<RynkHeader>,
+        dropped: usize,
     }
 
+    /// A board in a box: decodes each frame a transport sends and queues the
+    /// frames its handler answers with, read back `chunk` bytes at a time.
+    /// Clones share the board.
+    #[derive(Clone)]
+    pub(crate) struct FakeBoard(Arc<(Mutex<State>, Condvar)>);
+
     impl FakeBoard {
-        fn new(handler: impl FnMut(RynkHeader, &[u8]) -> Vec<Vec<u8>> + 'static) -> Self {
-            Self {
-                handler: Box::new(handler),
-                pending: VecDeque::new(),
-                chunk: usize::MAX,
-                sent: Vec::new(),
-            }
+        pub(crate) fn new(
+            handler: impl FnMut(RynkHeader, &[u8]) -> Vec<Vec<u8>> + Send + 'static,
+        ) -> Self {
+            Self(Arc::new((
+                Mutex::new(State {
+                    handler: Box::new(handler),
+                    pending: VecDeque::new(),
+                    chunk: usize::MAX,
+                    sent: Vec::new(),
+                    dropped: 0,
+                }),
+                Condvar::new(),
+            )))
         }
 
         /// Replies in 32-byte HID reports, zero-padded like `RynkHidService`.
-        fn hid_reports(mut self) -> Self {
-            self.chunk = 32;
+        pub(crate) fn hid_reports(self) -> Self {
+            self.state().chunk = 32;
             self
+        }
+
+        /// A transport to the board; dropping it is letting the board go.
+        pub(crate) fn transport(&self) -> FakeTransport {
+            FakeTransport(self.clone())
+        }
+
+        /// Bytes the board sends unasked: topics, or what a session left behind.
+        pub(crate) fn push(&self, bytes: &[u8]) {
+            self.state().pending.extend(bytes);
+            self.0 .1.notify_all();
+        }
+
+        /// Headers of every frame received, in order.
+        pub(crate) fn sent(&self) -> Vec<RynkHeader> {
+            self.state().sent.clone()
+        }
+
+        /// Transports dropped so far.
+        pub(crate) fn dropped(&self) -> usize {
+            self.state().dropped
+        }
+
+        fn state(&self) -> MutexGuard<'_, State> {
+            self.0 .0.lock().unwrap_or_else(|error| error.into_inner())
         }
     }
 
-    impl RynkTransport for &mut FakeBoard {
+    pub(crate) struct FakeTransport(FakeBoard);
+
+    impl RynkTransport for FakeTransport {
         fn send(&mut self, frame: &[u8]) -> io::Result<()> {
             let mut buf = frame.to_vec();
             let mut deframer = Deframer::new();
-            let tail = deframer.tail(&mut buf);
-            let n = tail.len();
+            let n = deframer.tail(&mut buf).len();
             deframer.commit(n);
             let len = deframer.next(&mut buf).expect("one whole frame");
             let header = RynkHeader::parse(buf.first_chunk().unwrap());
-            self.sent.push(header);
-            for mut reply in (self.handler)(header, &buf[RYNK_HEADER_SIZE..len]) {
-                if self.chunk != usize::MAX {
-                    reply.resize(reply.len().div_ceil(self.chunk) * self.chunk, 0);
+            let mut state = self.0.state();
+            state.sent.push(header);
+            for mut reply in (state.handler)(header, &buf[RYNK_HEADER_SIZE..len]) {
+                if state.chunk != usize::MAX {
+                    reply.resize(reply.len().div_ceil(state.chunk) * state.chunk, 0);
                 }
-                self.pending.extend(reply);
+                state.pending.extend(reply);
             }
+            drop(state);
+            self.0 .0 .1.notify_all();
             Ok(())
         }
 
-        fn recv(&mut self, buf: &mut [u8], _timeout: Duration) -> io::Result<usize> {
-            let n = buf.len().min(self.chunk).min(self.pending.len());
-            for (slot, byte) in buf.iter_mut().zip(self.pending.drain(..n)) {
+        fn recv(&mut self, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
+            let (lock, ready) = &*self.0 .0;
+            let state = lock.lock().unwrap_or_else(|error| error.into_inner());
+            let (mut state, _) = ready
+                .wait_timeout_while(state, timeout, |state| state.pending.is_empty())
+                .unwrap_or_else(|error| error.into_inner());
+            let n = buf.len().min(state.chunk).min(state.pending.len());
+            for (slot, byte) in buf.iter_mut().zip(state.pending.drain(..n)) {
                 *slot = byte;
             }
             Ok(n)
         }
     }
 
-    fn frame<T: Serialize>(cmd: Cmd, seq: u8, value: &T) -> Vec<u8> {
+    impl Drop for FakeTransport {
+        fn drop(&mut self) {
+            self.0.state().dropped += 1;
+        }
+    }
+
+    pub(crate) fn frame<T: Serialize>(cmd: Cmd, seq: u8, value: &T) -> Vec<u8> {
         let mut buf = vec![0; 8192];
         let len = encode_frame(&mut buf, RynkHeader { cmd, seq }, value).unwrap();
         buf.truncate(len);
         buf
     }
 
-    fn ok<T: Serialize>(header: RynkHeader, value: T) -> Vec<u8> {
+    pub(crate) fn ok<T: Serialize>(header: RynkHeader, value: T) -> Vec<u8> {
         frame(header.cmd, header.seq, &Ok::<T, RynkError>(value))
     }
 
-    fn err(header: RynkHeader, error: RynkError) -> Vec<u8> {
+    pub(crate) fn err(header: RynkHeader, error: RynkError) -> Vec<u8> {
         frame(header.cmd, header.seq, &Err::<(), RynkError>(error))
     }
 
-    fn quick() -> RynkTimeouts {
+    pub(crate) fn quick() -> RynkTimeouts {
         RynkTimeouts {
             reply: Duration::from_millis(30),
             idle: Duration::from_millis(30),
@@ -650,7 +702,7 @@ mod tests {
         }
     }
 
-    fn capabilities(max_payload_size: u16) -> DeviceCapabilities {
+    pub(crate) fn capabilities(max_payload_size: u16) -> DeviceCapabilities {
         DeviceCapabilities {
             max_payload_size,
             num_layers: 2,
@@ -660,7 +712,7 @@ mod tests {
         }
     }
 
-    fn info(revision: u16) -> ErgohavenInfo {
+    pub(crate) fn info(revision: u16) -> ErgohavenInfo {
         ErgohavenInfo {
             revision,
             firmware: rmk_types_rynk::protocol::rynk::FirmwareVersion {
@@ -675,9 +727,10 @@ mod tests {
     }
 
     /// A definition longer than two `GetBoardDefinition` pages.
-    const DEFINITION: &[u8] = &[0x5D; 600];
+    pub(crate) const DEFINITION: &[u8] = &[0x5D; 600];
 
-    fn handshake(header: RynkHeader, max_payload_size: u16) -> Option<Vec<u8>> {
+    /// The handshake replies of a board of the current revision.
+    pub(crate) fn handshake(header: RynkHeader, max_payload_size: u16) -> Option<Vec<u8>> {
         match header.cmd {
             Cmd::GetVersion => Some(ok(header, ProtocolVersion::CURRENT)),
             Cmd::GetErgohavenInfo => Some(ok(header, info(ERGOHAVEN_RYNK_REVISION))),
@@ -685,19 +738,27 @@ mod tests {
             _ => None,
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::*;
+    use super::*;
+    use rmk_types_rynk::action::Action;
+    use rmk_types_rynk::protocol::rynk::GetKeymapBulkResponse;
 
     #[test]
     fn connect_checks_the_version_and_takes_the_payload_size() {
-        let mut board = FakeBoard::new(|header, _| vec![handshake(header, 4000).unwrap()]);
-        let (client, board) = RynkClient::connect(&mut board, quick()).unwrap();
+        let board = FakeBoard::new(|header, _| vec![handshake(header, 4000).unwrap()]);
+        let (client, board) = RynkClient::connect(board.transport(), quick()).unwrap();
         assert_eq!(client.max_payload, 4000);
         assert_eq!(board.capabilities.num_cols, 5);
         assert_eq!(board.info, info(ERGOHAVEN_RYNK_REVISION));
 
-        let mut old =
+        let old =
             FakeBoard::new(|header, _| vec![ok(header, ProtocolVersion { major: 0, minor: 1 })]);
         assert!(matches!(
-            RynkClient::connect(&mut old, quick()),
+            RynkClient::connect(old.transport(), quick()),
             Err(RynkClientError::VersionMismatch {
                 board: ProtocolVersion { major: 0, minor: 1 },
                 ..
@@ -707,7 +768,7 @@ mod tests {
 
     #[test]
     fn replies_match_by_seq_through_reports_topics_and_stale_frames() {
-        let mut board = FakeBoard::new(|header, _| {
+        let board = FakeBoard::new(|header, _| {
             if let Some(reply) = handshake(header, 512) {
                 return vec![reply];
             }
@@ -719,13 +780,13 @@ mod tests {
             vec![frame(Cmd::LayerChange, 0, &3u8), stale, ok(header, 2u8)]
         })
         .hid_reports();
-        let (mut client, _) = RynkClient::connect(&mut board, quick()).unwrap();
+        let (mut client, _) = RynkClient::connect(board.transport(), quick()).unwrap();
         assert_eq!(client.request::<command::GetCurrentLayer>(&()).unwrap(), 2);
     }
 
     #[test]
     fn board_errors_and_bad_replies_are_told_apart() {
-        let mut board = FakeBoard::new(|header, _| {
+        let board = FakeBoard::new(|header, _| {
             let reply = match header.cmd.raw() {
                 0x0801 => err(header, RynkError::UnknownCmd),
                 0x0802 => err(header, RynkError::Locked),
@@ -737,7 +798,7 @@ mod tests {
             };
             vec![reply]
         });
-        let mut client = RynkClient::new(&mut board, quick());
+        let mut client = RynkClient::new(board.transport(), quick());
         assert!(matches!(
             client.request::<command::GetCurrentLayer>(&()),
             Err(RynkClientError::Device {
@@ -771,8 +832,8 @@ mod tests {
 
     #[test]
     fn requests_past_the_board_frame_are_refused_before_sending() {
-        let mut board = FakeBoard::new(|header, _| vec![handshake(header, 64).unwrap()]);
-        let (mut client, _) = RynkClient::connect(&mut board, quick()).unwrap();
+        let board = FakeBoard::new(|header, _| vec![handshake(header, 64).unwrap()]);
+        let (mut client, _) = RynkClient::connect(board.transport(), quick()).unwrap();
         let ops = vec![MacroOp::Char(b'a'); 40];
         assert!(matches!(
             client.write_macro(0, &ops),
@@ -783,7 +844,7 @@ mod tests {
             })
         ));
         drop(client);
-        assert_eq!(board.sent.len(), 4, "only the handshake went out");
+        assert_eq!(board.sent().len(), 4, "only the handshake went out");
     }
 
     /// Endpoints declared outside the client, as the ergohaven vendor table and
@@ -796,12 +857,12 @@ mod tests {
             type Request = [u8; 3];
             type Response = ();
         }
-        let mut board = FakeBoard::new(|header, payload| {
+        let board = FakeBoard::new(|header, payload| {
             assert_eq!(header.cmd.raw(), 0x7EF0);
             assert_eq!(payload, [1, 2, 3]);
             vec![ok(header, ())]
         });
-        let mut client = RynkClient::new(&mut board, quick());
+        let mut client = RynkClient::new(board.transport(), quick());
         client.request::<SetAgents>(&[1, 2, 3]).unwrap();
     }
 
@@ -811,7 +872,7 @@ mod tests {
             .map(|i| KeyAction::Single(Action::User(i)))
             .collect();
         let stored = keys.clone();
-        let mut board = FakeBoard::new(move |header, payload| {
+        let board = FakeBoard::new(move |header, payload| {
             if let Some(reply) = handshake(header, 40) {
                 return vec![reply];
             }
@@ -825,13 +886,13 @@ mod tests {
                 _ => vec![],
             }
         });
-        let (mut client, _) = RynkClient::connect(&mut board, quick()).unwrap();
+        let (mut client, _) = RynkClient::connect(board.transport(), quick()).unwrap();
         assert_eq!(client.read_keymap_layer(1, 3, 5).unwrap(), keys);
     }
 
     #[test]
     fn read_only_sessions_send_reads_and_refuse_everything_else() {
-        let mut board = FakeBoard::new(|header, _| {
+        let board = FakeBoard::new(|header, _| {
             vec![match header.cmd {
                 Cmd::GetVersion => ok(header, ProtocolVersion::CURRENT),
                 Cmd::GetCapabilities => ok(header, capabilities(512)),
@@ -841,7 +902,7 @@ mod tests {
             }]
         });
         let session = ReadOnlyRynkSession::default();
-        let mut client = RynkClient::test_read_only(&mut board, quick(), session.clone());
+        let mut client = RynkClient::test_read_only(board.transport(), quick(), session.clone());
         client.request::<command::GetVersion>(&()).unwrap();
         client.max_payload = client
             .request::<command::GetCapabilities>(&())
@@ -897,7 +958,7 @@ mod tests {
             );
         }
         drop(client);
-        let sent: Vec<u16> = board.sent.iter().map(|header| header.cmd.raw()).collect();
+        let sent: Vec<u16> = board.sent().iter().map(|header| header.cmd.raw()).collect();
         assert_eq!(sent, [0x0001, 0x0002, 0x0101, 0x0201, 0x0802]);
         assert_eq!(
             session.refused_requests(),
@@ -910,25 +971,25 @@ mod tests {
     fn connect_refuses_another_revision_before_decoding_the_rest() {
         let next = ERGOHAVEN_RYNK_REVISION + 1;
         // A later revision may have reshaped the info: here it grew a field.
-        let mut later = FakeBoard::new(move |header, _| {
+        let later = FakeBoard::new(move |header, _| {
             vec![match header.cmd {
                 Cmd::GetErgohavenInfo => ok(header, (next, [0xAAu8; 9], "more")),
                 _ => handshake(header, 512).unwrap(),
             }]
         });
         assert!(matches!(
-            RynkClient::connect(&mut later, quick()),
+            RynkClient::connect(later.transport(), quick()),
             Err(RynkClientError::RevisionMismatch { board: Some(board), .. }) if board == next
         ));
         // Plain RMK firmware has no ergohaven table.
-        let mut plain = FakeBoard::new(|header, _| {
+        let plain = FakeBoard::new(|header, _| {
             vec![match header.cmd {
                 Cmd::GetErgohavenInfo => err(header, RynkError::UnknownCmd),
                 _ => handshake(header, 512).unwrap(),
             }]
         });
         assert!(matches!(
-            RynkClient::connect(&mut plain, quick()),
+            RynkClient::connect(plain.transport(), quick()),
             Err(RynkClientError::RevisionMismatch { board: None, .. })
         ));
         drop(plain);
@@ -952,8 +1013,8 @@ mod tests {
                 vec![ok(header, chunk)]
             }
         };
-        let mut board = FakeBoard::new(serve(DEFINITION, None));
-        let (mut client, info) = RynkClient::connect(&mut board, quick()).unwrap();
+        let board = FakeBoard::new(serve(DEFINITION, None));
+        let (mut client, info) = RynkClient::connect(board.transport(), quick()).unwrap();
         let hash = info.info.definition_hash;
         assert_eq!(client.read_board_definition(hash).unwrap(), DEFINITION);
         assert!(matches!(
@@ -962,15 +1023,15 @@ mod tests {
         ));
         drop(client);
         let pages = board
-            .sent
+            .sent()
             .iter()
             .filter(|h| h.cmd == Cmd::GetBoardDefinition)
             .count();
         assert_eq!(pages, 6, "three 244-byte pages per read");
 
         // A board that claims more than it sends.
-        let mut short = FakeBoard::new(serve(DEFINITION, Some(700)));
-        let (mut client, _) = RynkClient::connect(&mut short, quick()).unwrap();
+        let short = FakeBoard::new(serve(DEFINITION, Some(700)));
+        let (mut client, _) = RynkClient::connect(short.transport(), quick()).unwrap();
         assert!(matches!(
             client.read_board_definition(hash),
             Err(RynkClientError::BulkProtocol { cmd: 0x7E02 })
@@ -979,37 +1040,40 @@ mod tests {
 
     #[test]
     fn layout_options_read_and_write() {
-        let stored = std::rc::Rc::new(std::cell::Cell::new(5u32));
+        let stored = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(5));
         let cell = stored.clone();
-        let mut board = FakeBoard::new(move |header, payload| {
+        let board = FakeBoard::new(move |header, payload| {
             if let Some(reply) = handshake(header, 512) {
                 return vec![reply];
             }
             vec![match header.cmd {
-                Cmd::GetLayoutOption => ok(header, cell.get()),
+                Cmd::GetLayoutOption => ok(header, cell.load(std::sync::atomic::Ordering::Relaxed)),
                 Cmd::SetLayoutOption => {
-                    cell.set(postcard::from_bytes(payload).unwrap());
+                    cell.store(
+                        postcard::from_bytes(payload).unwrap(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     ok(header, ())
                 }
                 _ => return vec![],
             }]
         });
-        let (mut client, _) = RynkClient::connect(&mut board, quick()).unwrap();
+        let (mut client, _) = RynkClient::connect(board.transport(), quick()).unwrap();
         assert_eq!(client.layout_options().unwrap(), 5);
         client.set_layout_options(0x1_0002).unwrap();
         assert_eq!(client.layout_options().unwrap(), 0x1_0002);
-        assert_eq!(stored.get(), 0x1_0002);
+        assert_eq!(stored.load(std::sync::atomic::Ordering::Relaxed), 0x1_0002);
     }
 
     #[test]
     fn connect_drains_the_link() {
-        let mut board = FakeBoard::new(|header, _| {
+        let board = FakeBoard::new(|header, _| {
             vec![handshake(header, 512).unwrap_or_else(|| ok(header, 7u8))]
         });
         // Left over from an earlier session: a reply and half a frame.
         let stale = frame(Cmd::GetCurrentLayer, 9, &Ok::<u8, RynkError>(1));
-        board.pending.extend(stale.iter().chain(&stale[..3]));
-        let (mut client, _) = RynkClient::connect(&mut board, quick()).unwrap();
+        board.push(&[&stale[..], &stale[..3]].concat());
+        let (mut client, _) = RynkClient::connect(board.transport(), quick()).unwrap();
         assert!(!client.deframer.has_pending());
         assert_eq!(client.next_frame(), None);
         assert_eq!(client.request::<command::GetCurrentLayer>(&()).unwrap(), 7);
