@@ -122,6 +122,8 @@ impl EntropyApp {
             qmk_hid_hosts: std::collections::HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             rynk_hosts: std::collections::HashMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            rynk_host_opens: std::collections::HashMap::new(),
             application_layout_editor_active: false,
             #[cfg(not(target_arch = "wasm32"))]
             application_discovery: Default::default(),

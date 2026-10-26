@@ -150,10 +150,28 @@ pub(crate) struct AppSettings {
     pub(crate) text_expansion_rules: Vec<crate::text_expander::TextExpansionRule>,
     #[serde(default = "default_layout_sync_enabled")]
     pub(crate) layout_sync_enabled: bool,
+    /// Rynk boards whose host data keeps going while they are not selected,
+    /// across restarts and replugs: each one selected before.
+    #[serde(default)]
+    pub(crate) rynk_host_boards: Vec<RynkHostBoard>,
     #[serde(default)]
     pub(crate) typing_trainer: TypingTrainerSettings,
     #[serde(default)]
     pub(crate) typing_trainer_history: Vec<TypingTrainerRunRecord>,
+}
+
+/// A Rynk board and the host data its bridge sent when it was last selected.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RynkHostBoard {
+    pub(crate) identity: crate::device::DeviceIdentity,
+    #[serde(default)]
+    pub(crate) time: bool,
+    #[serde(default)]
+    pub(crate) volume: bool,
+    #[serde(default)]
+    pub(crate) layout: bool,
+    #[serde(default)]
+    pub(crate) media: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -277,6 +295,7 @@ impl Default for AppSettings {
             text_expander_rule_files: Vec::new(),
             text_expansion_rules: Vec::new(),
             layout_sync_enabled: default_layout_sync_enabled(),
+            rynk_host_boards: Vec::new(),
             typing_trainer: TypingTrainerSettings::default(),
             typing_trainer_history: Vec::new(),
         }
@@ -5505,6 +5524,10 @@ pub struct EntropyApp {
     /// Host-data bridges of Rynk boards, posting on their links.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) rynk_hosts: std::collections::HashMap<String, crate::qmk_hid_host::RynkHostBridge>,
+    /// Links being opened for remembered Rynk boards that have no bridge yet.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) rynk_host_opens:
+        std::collections::HashMap<String, crate::qmk_hid_host::RynkHostOpen>,
     /// True while the normal keyboard canvas edits the selected application
     /// layout instead of writing the permanent Vial keymap.
     pub(crate) application_layout_editor_active: bool,

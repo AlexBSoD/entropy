@@ -220,6 +220,10 @@ impl EntropyApp {
             // work. After an unplug that work can remain pending until a scan
             // observes the missing endpoint and advances connection_generation.
             self.poll_device_scan(ctx);
+            if !self.rynk_host_opens.is_empty() {
+                // A remembered Rynk board's link opened, or its retry is due.
+                self.sync_rynk_host_bridges();
+            }
             self.maybe_start_bluetooth_reconnect_scan(ctx);
 
             // A worker temporarily borrows the handle; it is still the same

@@ -235,6 +235,9 @@ impl EntropyApp {
                 },
                 Err(error) => log::warn!("{error}; preserving the previous device list"),
             }
+            // A Rynk board selected before gets its bridge back once it is
+            // found, whether it is selected now or not.
+            self.sync_rynk_host_bridges();
         }
     }
 

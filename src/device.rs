@@ -26,7 +26,7 @@ pub(crate) fn product_display_name(vendor_id: u16, product_id: u16, reported: &s
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DeviceIdentity {
     vendor_id: u16,
     product_id: u16,

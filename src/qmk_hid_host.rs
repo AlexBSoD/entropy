@@ -1087,7 +1087,7 @@ impl ApplicationLayoutOwnerState {
 mod wake_identity;
 
 pub(crate) mod rynk_bridge;
-pub(crate) use rynk_bridge::RynkHostBridge;
+pub(crate) use rynk_bridge::{RynkHostBridge, RynkHostOpen};
 
 // Stateless across workers/reconnects: semantic identity, not a transition counter.
 #[derive(Default)]

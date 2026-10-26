@@ -4,12 +4,16 @@
 //! until it restarts, which ends the link and with it the bridge. The bridge
 //! shares the desktop service and its wakes with the Vial bridges.
 
+use std::io;
+use std::sync::mpsc;
+
 use rmk_types_rynk::protocol::rynk::ergohaven::{
     caps, HostDataUpdate, SetHostData, HOST_DATA_TEXT_MAX_LEN,
 };
 
 use super::*;
-use crate::rynk::link::RynkLink;
+use crate::rynk::client::RynkClientError;
+use crate::rynk::link::{PhysicalId, RynkLink};
 
 /// One post slot per kind: only the latest value of a kind waits to be sent.
 const SLOT_TIME: u16 = 0;
@@ -102,6 +106,89 @@ impl Drop for RynkHostBridge {
         self.stop.store(true, Ordering::Relaxed);
         self.wake.wake();
         self.thread.take();
+    }
+}
+
+/// A board's link on its way, opened off the UI thread.
+pub(crate) type LinkOpening = mpsc::Receiver<Result<Arc<RynkLink>, RynkClientError>>;
+
+/// Opens the link of the board `id` names, for a bridge nobody selected. A
+/// Bluetooth board that is away is not paged: the open fails NotConnected.
+pub(crate) fn open_link(id: PhysicalId) -> LinkOpening {
+    let (sender, opening) = mpsc::channel();
+    let spawned = thread::Builder::new()
+        .name("rynk-host-open".into())
+        .spawn(move || {
+            let opened = match crate::rynk::transport::connected(&id) {
+                Ok(true) => RynkLink::open(&id),
+                Ok(false) => Err(io::Error::from(io::ErrorKind::NotConnected).into()),
+                Err(error) => Err(error.into()),
+            };
+            let _ = sender.send(opened);
+        });
+    if let Err(error) = spawned {
+        log::warn!("Rynk host-data link was not opened: {error}");
+    }
+    opening
+}
+
+/// How often a board that is away is looked for: asking opens nothing.
+const AWAY_RECHECK: Duration = Duration::from_secs(5);
+const OPEN_RETRY_FIRST: Duration = Duration::from_secs(2);
+const OPEN_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// The link of a remembered board that has no bridge yet: an open on its way,
+/// or when to try again after the last one failed.
+pub(crate) struct RynkHostOpen {
+    opening: Option<LinkOpening>,
+    retry_at: Instant,
+    failures: u32,
+}
+
+impl RynkHostOpen {
+    pub(crate) fn new(now: Instant) -> Self {
+        Self {
+            opening: None,
+            retry_at: now,
+            failures: 0,
+        }
+    }
+
+    /// Starts an open unless one is on its way or the last failure still
+    /// holds the next one back.
+    pub(crate) fn start_if_due(&mut self, now: Instant, open: impl FnOnce() -> LinkOpening) {
+        if self.opening.is_none() && now >= self.retry_at {
+            self.opening = Some(open());
+        }
+    }
+
+    /// The link once its open finished; a failed open sets when to retry.
+    pub(crate) fn poll(&mut self, now: Instant) -> Option<Arc<RynkLink>> {
+        let opened = match self.opening.as_ref()?.try_recv() {
+            Ok(opened) => opened,
+            Err(mpsc::TryRecvError::Empty) => return None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err(io::Error::other("the open stopped").into())
+            }
+        };
+        self.opening = None;
+        let error = match opened {
+            Ok(link) => return Some(link),
+            Err(error) => error,
+        };
+        let away = matches!(&error, RynkClientError::Transport(error)
+            if error.kind() == io::ErrorKind::NotConnected);
+        self.retry_at = now
+            + if away {
+                AWAY_RECHECK
+            } else {
+                log::warn!("Rynk host-data link was not opened: {error}");
+                self.failures += 1;
+                OPEN_RETRY_FIRST
+                    .saturating_mul(1 << (self.failures - 1).min(5))
+                    .min(OPEN_RETRY_MAX)
+            };
+        None
     }
 }
 

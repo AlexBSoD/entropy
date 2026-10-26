@@ -57,6 +57,7 @@ struct BluezDevice {
     name: String,
     modalias: String,
     paired: bool,
+    connected: bool,
     uuids: Vec<String>,
 }
 
@@ -89,6 +90,7 @@ fn devices(objects: &ManagedObjects) -> Vec<BluezDevice> {
                     .unwrap_or_default(),
                 modalias: property_string(properties, "Modalias").unwrap_or_default(),
                 paired: property_bool(properties, "Paired").unwrap_or(false),
+                connected: property_bool(properties, "Connected").unwrap_or(false),
                 uuids: property_strings(properties, "UUIDs"),
             })
         })
@@ -233,6 +235,20 @@ pub(crate) fn owns(id: &PhysicalId) -> bool {
 pub(crate) fn scan() -> io::Result<Vec<FoundBoard>> {
     let objects = managed_objects(&scan_connection()?).map_err(io_error)?;
     Ok(rynk_boards(&devices(&objects)))
+}
+
+/// Whether BlueZ is connected to the board now. Asking pages nothing, while
+/// opening a bonded board that is away would.
+pub(crate) fn connected(id: &PhysicalId) -> io::Result<bool> {
+    let objects = managed_objects(&scan_connection()?).map_err(io_error)?;
+    Ok(is_connected(&devices(&objects), id))
+}
+
+fn is_connected(devices: &[BluezDevice], id: &PhysicalId) -> bool {
+    let address = id.0.strip_prefix(PREFIX).unwrap_or_default();
+    devices
+        .iter()
+        .any(|device| device.connected && device.address.eq_ignore_ascii_case(address))
 }
 
 pub(crate) fn open(id: &PhysicalId) -> io::Result<BleTransport> {
@@ -486,6 +502,7 @@ mod tests {
             name: "K:04".into(),
             modalias: "usb:vE126p0074d0001".into(),
             paired,
+            connected: false,
             uuids: vec![
                 "00001812-0000-1000-8000-00805f9b34fb".into(),
                 uuid(RYNK_SERVICE_UUID).to_uppercase(),
@@ -515,6 +532,17 @@ mod tests {
         assert_eq!((board.vendor_id, board.product_id), (0xE126, 0x0074));
         assert_eq!(board.serial.as_deref(), Some(ADDRESS));
         assert!(board.bluetooth);
+    }
+
+    #[test]
+    fn a_bonded_board_away_is_listed_but_not_connected() {
+        let mut board = rynk_device(true);
+        let id = PhysicalId(format!("ble:{}", ADDRESS.to_lowercase()));
+        assert_eq!(rynk_boards(&[board.clone()]).len(), 1);
+        assert!(!is_connected(&[board.clone()], &id));
+
+        board.connected = true;
+        assert!(is_connected(&[board], &id));
     }
 
     fn gatt(

@@ -71,6 +71,17 @@ pub(crate) fn is_bluetooth(id: &PhysicalId) -> bool {
     false
 }
 
+/// Whether the board `id` names can be opened without paging it: a bonded
+/// Bluetooth board is listed while it is away, and opening it would connect.
+pub(crate) fn connected(id: &PhysicalId) -> io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    if ble_linux::owns(id) {
+        return ble_linux::connected(id);
+    }
+    let _ = id;
+    Ok(true)
+}
+
 /// Opens the board `id` names and claims its interface.
 pub(crate) fn open(id: &PhysicalId) -> io::Result<BoxedTransport> {
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
