@@ -980,6 +980,95 @@ mod tests {
         await_condition(|| REGISTRY.try_lock().is_ok_and(|r| r.entries.is_empty()));
     }
 
+    /// Holds gated IPC workers from exiting. It opens however the test ends,
+    /// so a failed assertion cannot leave them to time out the tests after it.
+    struct ExitGate(Arc<AtomicBool>);
+
+    impl ExitGate {
+        fn closed() -> Self {
+            Self(Arc::new(AtomicBool::new(false)))
+        }
+
+        fn flag(&self) -> Option<Arc<AtomicBool>> {
+            Some(self.0.clone())
+        }
+
+        fn open(&self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    impl Drop for ExitGate {
+        fn drop(&mut self) {
+            self.open();
+        }
+    }
+
+    /// Fills the admission budget with failed startups whose workers `gate`
+    /// holds, and returns how many startups that took. A startup can also
+    /// fail before it takes a slot, when its deadline runs out while capacity
+    /// is busy: it holds nothing, so startups go on until every slot is held.
+    fn hold_failed_startups(gate: &ExitGate, first_timeout: Duration) -> usize {
+        let held = || {
+            REGISTRY
+                .lock()
+                .unwrap()
+                .entries
+                .iter()
+                .filter(|entry| !entry.slot.worker_joined.load(Ordering::Acquire))
+                .count()
+        };
+        let mut attempts = 0;
+        while held() < MAX_UNSETTLED_HELPERS {
+            assert!(
+                attempts < 20,
+                "failed startups never took the admission slots"
+            );
+            let timeout = if attempts == 0 {
+                first_timeout
+            } else {
+                Duration::from_millis(80)
+            };
+            assert!(HidProxy::start(
+                &device(&format!("failed-{attempts}")),
+                spec("startup-silence", gate.flag(), None),
+                timeout,
+            )
+            .is_err());
+            attempts += 1;
+        }
+        await_condition(|| {
+            let registry = REGISTRY.lock().unwrap();
+            registry.entries.len() == MAX_UNSETTLED_HELPERS
+                && registry
+                    .entries
+                    .iter()
+                    .all(|entry| entry.slot.reaped.load(Ordering::Acquire))
+        });
+        attempts
+    }
+
+    /// With every slot held by unreclaimed work, a fresh startup is refused
+    /// and takes no slot of its own.
+    fn assert_admission_stays_closed() {
+        for index in 0..12 {
+            let fresh_target = device(&format!("failed-retry-{index}"));
+            assert!(HidProxy::start(
+                &fresh_target,
+                spec("echo", None, None),
+                Duration::from_millis(30),
+            )
+            .is_err());
+            let registry = REGISTRY.lock().unwrap();
+            assert_eq!(registry.entries.len(), MAX_UNSETTLED_HELPERS);
+            assert_eq!(registry.unsettled_count(), MAX_UNSETTLED_HELPERS);
+            assert!(registry.entries.iter().all(|entry| {
+                !entry.slot.established.load(Ordering::Acquire)
+                    && !entry.slot.worker_joined.load(Ordering::Acquire)
+            }));
+        }
+    }
+
     fn serial_test() -> MutexGuard<'static, ()> {
         let guard = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         empty_registry();
@@ -1446,43 +1535,29 @@ mod tests {
     #[test]
     fn real_helper_failed_startups_cannot_accumulate_unreclaimed_workers() {
         let _guard = serial_test();
-        let gate = Arc::new(AtomicBool::new(false));
-        for name in ["failed-A", "failed-B"] {
-            assert!(HidProxy::start(
-                &device(name),
-                spec("startup-silence", Some(gate.clone()), None),
-                Duration::from_millis(80),
-            )
-            .is_err());
-        }
-        await_condition(|| {
-            let registry = REGISTRY.lock().unwrap();
-            registry
-                .entries
-                .iter()
-                .all(|entry| entry.slot.reaped.load(Ordering::Acquire))
-        });
-        for index in 0..12 {
-            let fresh_target = device(&format!("failed-retry-{index}"));
-            assert!(HidProxy::start(
-                &fresh_target,
-                spec("echo", None, None),
-                Duration::from_millis(30),
-            )
-            .is_err());
-            let registry = REGISTRY.lock().unwrap();
-            assert_eq!(registry.entries.len(), MAX_UNSETTLED_HELPERS);
-            assert_eq!(registry.unsettled_count(), MAX_UNSETTLED_HELPERS);
-            assert!(registry.entries.iter().all(|entry| {
-                !entry.slot.established.load(Ordering::Acquire)
-                    && !entry.slot.worker_joined.load(Ordering::Acquire)
-            }));
-        }
-        gate.store(true, Ordering::Release);
+        let gate = ExitGate::closed();
+        hold_failed_startups(&gate, Duration::from_millis(80));
+        assert_admission_stays_closed();
+        gate.open();
         empty_registry();
         let recovered = start("echo", "recovered");
         assert_eq!(recovered.usb_send(&[34]).unwrap()[0], 34);
         drop(recovered);
+        empty_registry();
+    }
+
+    #[test]
+    fn real_helper_a_startup_that_fails_before_its_slot_holds_none() {
+        let _guard = serial_test();
+        let gate = ExitGate::closed();
+        // The first startup's deadline is gone before admission: it fails
+        // without a slot, and two more startups are needed to hold both.
+        assert_eq!(
+            hold_failed_startups(&gate, Duration::ZERO),
+            MAX_UNSETTLED_HELPERS + 1
+        );
+        assert_admission_stays_closed();
+        gate.open();
         empty_registry();
     }
 
@@ -1513,10 +1588,10 @@ mod tests {
     #[test]
     fn real_helper_budget_retains_reaped_child_until_io_worker_exits() {
         let _guard = serial_test();
-        let gate = Arc::new(AtomicBool::new(false));
+        let gate = ExitGate::closed();
         let a = HidProxy::start(
             &device("A"),
-            spec("echo", Some(gate.clone()), None),
+            spec("echo", gate.flag(), None),
             Duration::from_secs(3),
         )
         .unwrap();
@@ -1527,7 +1602,7 @@ mod tests {
         let b = start("echo", "B");
         let c = HidProxy::start(
             &device("C"),
-            spec("echo", Some(gate.clone()), None),
+            spec("echo", gate.flag(), None),
             Duration::from_secs(3),
         )
         .unwrap();
@@ -1548,7 +1623,7 @@ mod tests {
             assert_eq!(registry.unsettled_count(), MAX_UNSETTLED_HELPERS);
         }
         assert_eq!(b.usb_send(&[19]).unwrap()[0], 19);
-        gate.store(true, Ordering::Release);
+        gate.open();
         drop(b);
         empty_registry();
         drop(start("echo", "A"));
