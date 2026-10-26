@@ -102,6 +102,9 @@ impl DeviceSession {
         match binding {
             KeyBinding::Vial(keycode) => self.set_keycode(layer, row, col, keycode),
             KeyBinding::Rmk(action) => self.set_rmk_key_action(layer, row, col, action),
+            KeyBinding::Rynk(_) => {
+                anyhow::bail!("Rynk key action cannot be written to a Vial board")
+            }
         }
     }
 

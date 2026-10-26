@@ -40,7 +40,8 @@ impl EntropyApp {
                                         crate::keycode::normalize_output_symbol_keycode(value),
                                     )
                                 }
-                                crate::keyboard::KeyBinding::Rmk(_) => binding,
+                                crate::keyboard::KeyBinding::Rmk(_)
+                                | crate::keyboard::KeyBinding::Rynk(_) => binding,
                             };
                         }
                     }

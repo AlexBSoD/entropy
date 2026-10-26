@@ -427,6 +427,19 @@ pub(crate) fn key_binding_label_with_macro_names(
             }
             "RMK\nAction".to_owned()
         }
+        crate::keyboard::KeyBinding::Rynk(action) => {
+            match crate::rynk::native_v1::v1_label_action(action) {
+                Some(action) => key_binding_label_with_macro_names(
+                    action.into(),
+                    custom,
+                    layer_names,
+                    macro_names,
+                    tap_dance_names,
+                    key_legend_layout,
+                ),
+                None => "RMK\nAction".to_owned(),
+            }
+        }
     }
 }
 
@@ -448,6 +461,10 @@ pub(crate) fn key_binding_printable_output(
                 return crate::keycode::printable_output(parts.tap_value(), key_output_layout);
             }
             rmk_action_printable_output(action, key_output_layout)
+        }
+        crate::keyboard::KeyBinding::Rynk(action) => {
+            crate::rynk::native_v1::v1_label_action(action)
+                .and_then(|action| key_binding_printable_output(action.into(), key_output_layout))
         }
     }
 }
@@ -518,6 +535,19 @@ pub(crate) fn key_binding_tooltip_with_macro_names(
                 );
             }
             format!("Native RMK key action: {action:?}")
+        }
+        crate::keyboard::KeyBinding::Rynk(action) => {
+            match crate::rynk::native_v1::v1_label_action(action) {
+                Some(action) => key_binding_tooltip_with_macro_names(
+                    action.into(),
+                    custom,
+                    layer_names,
+                    macro_names,
+                    macro_descriptions,
+                    tap_dance_names,
+                ),
+                None => format!("Native RMK key action: {action:?}"),
+            }
         }
     }
 }

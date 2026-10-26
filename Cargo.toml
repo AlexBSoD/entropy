@@ -51,6 +51,8 @@ ab_glyph = "0.2"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 postcard = "1"
 rmk-types = { git = "https://github.com/ergohaven/rmk.git", rev = "99cdcd542600eb1a439675455997fe7cf3928600", default-features = false }
+# Rynk boards: the ergohaven Rynk firmware revision, moves with every firmware sync.
+rmk-types-rynk = { package = "rmk-types", git = "https://github.com/AlexBSoD/rmk.git", rev = "13bc492e4f0f39bb440d14e4ef8fe5d99afa4708", default-features = false, features = ["host", "ergohaven"] }
 semver = "1"
 url = "2"
 

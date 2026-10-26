@@ -1446,6 +1446,12 @@ impl KeycodePicker {
                 self.selected_tab = KeycodeTab::UniversalSymbols
             }
             crate::keyboard::KeyBinding::Rmk(_) => self.selected_tab = KeycodeTab::Basic,
+            crate::keyboard::KeyBinding::Rynk(action) => {
+                match crate::rynk::native_v1::v1_label_action(action) {
+                    Some(action) => self.select_tab_for_binding(action.into()),
+                    None => self.selected_tab = KeycodeTab::Basic,
+                }
+            }
         }
     }
 

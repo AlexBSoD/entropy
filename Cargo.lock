@@ -1378,6 +1378,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "embedded-io"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef1a6892d9eef45c8fa6b9e0086428a2cca8491aca8f787c534a3d6d0bcb3ced"
+
+[[package]]
+name = "embedded-io"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
+
+[[package]]
 name = "emojis"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1532,7 +1544,8 @@ dependencies = [
  "postcard",
  "raw-window-handle",
  "rfd",
- "rmk-types",
+ "rmk-types 0.2.2",
+ "rmk-types 0.4.0",
  "semver",
  "serde",
  "serde_json",
@@ -1651,7 +1664,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
- "miniz_oxide",
+ "miniz_oxide 0.8.9",
 ]
 
 [[package]]
@@ -2870,6 +2883,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "miniz_oxide"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
+dependencies = [
+ "adler2",
+]
+
+[[package]]
 name = "moxcms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3600,7 +3622,7 @@ dependencies = [
  "crc32fast",
  "fdeflate",
  "flate2",
- "miniz_oxide",
+ "miniz_oxide 0.8.9",
 ]
 
 [[package]]
@@ -3613,7 +3635,7 @@ dependencies = [
  "crc32fast",
  "fdeflate",
  "flate2",
- "miniz_oxide",
+ "miniz_oxide 0.8.9",
 ]
 
 [[package]]
@@ -3667,6 +3689,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6764c3b5dd454e283a30e6dfe78e9b31096d9e32036b5d1eaac7a6119ccb9a24"
 dependencies = [
  "cobs",
+ "embedded-io 0.4.0",
+ "embedded-io 0.6.1",
  "heapless 0.7.17",
  "postcard-derive",
  "serde",
@@ -4004,6 +4028,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rmk-config"
+version = "0.8.0"
+source = "git+https://github.com/AlexBSoD/rmk.git?rev=13bc492e4f0f39bb440d14e4ef8fe5d99afa4708#13bc492e4f0f39bb440d14e4ef8fe5d99afa4708"
+dependencies = [
+ "config",
+ "miniz_oxide 0.9.1",
+ "once_cell",
+ "paste",
+ "pest",
+ "pest_derive",
+ "postcard",
+ "serde",
+ "serde-inline-default",
+ "toml 1.1.2+spec-1.1.0",
+]
+
+[[package]]
 name = "rmk-types"
 version = "0.2.2"
 source = "git+https://github.com/ergohaven/rmk.git?rev=99cdcd542600eb1a439675455997fe7cf3928600#99cdcd542600eb1a439675455997fe7cf3928600"
@@ -4011,7 +4052,22 @@ dependencies = [
  "bitfield-struct",
  "heapless 0.9.3",
  "postcard",
- "rmk-config",
+ "rmk-config 0.6.1",
+ "serde",
+ "strum",
+ "toml 1.1.2+spec-1.1.0",
+]
+
+[[package]]
+name = "rmk-types"
+version = "0.4.0"
+source = "git+https://github.com/AlexBSoD/rmk.git?rev=13bc492e4f0f39bb440d14e4ef8fe5d99afa4708#13bc492e4f0f39bb440d14e4ef8fe5d99afa4708"
+dependencies = [
+ "bitfield-struct",
+ "cobs",
+ "heapless 0.9.3",
+ "postcard",
+ "rmk-config 0.8.0",
  "serde",
  "strum",
  "toml 1.1.2+spec-1.1.0",

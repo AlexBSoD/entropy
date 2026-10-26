@@ -347,6 +347,9 @@ fn mirrored_layer_snapshot_with_mapping(
             crate::keyboard::KeyBinding::Rmk(action) => {
                 crate::rmk_native::toggle_handed_key_action(action).into()
             }
+            crate::keyboard::KeyBinding::Rynk(action) => crate::keyboard::KeyBinding::Rynk(
+                crate::rynk::keycode::toggle_handed_key_action(action),
+            ),
         })
         .collect();
     Ok(LayerSnapshot {

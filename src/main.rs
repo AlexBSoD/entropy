@@ -33,6 +33,9 @@ mod popup_state;
 #[cfg(not(target_arch = "wasm32"))]
 mod qmk_hid_host;
 mod rmk_native;
+// Key labels use it today; the Rynk connect path wires in the rest.
+#[allow(dead_code)]
+mod rynk;
 mod smart_input;
 mod text_expander;
 mod ui_style;

@@ -7,6 +7,7 @@ use crate::firmware::FirmwareProtocol;
 pub enum KeyBinding {
     Vial(u16),
     Rmk(rmk_types::action::KeyAction),
+    Rynk(rmk_types_rynk::action::KeyAction),
 }
 
 impl Default for KeyBinding {
@@ -31,13 +32,13 @@ impl KeyBinding {
     pub fn vial_keycode(self) -> u16 {
         match self {
             Self::Vial(value) => value,
-            Self::Rmk(_) => 0,
+            Self::Rmk(_) | Self::Rynk(_) => 0,
         }
     }
 
     pub fn rmk_action(self) -> Option<rmk_types::action::KeyAction> {
         match self {
-            Self::Vial(_) => None,
+            Self::Vial(_) | Self::Rynk(_) => None,
             Self::Rmk(action) => Some(action),
         }
     }
@@ -46,6 +47,7 @@ impl KeyBinding {
         match self {
             Self::Vial(value) => value == 0,
             Self::Rmk(action) => matches!(action, rmk_types::action::KeyAction::No),
+            Self::Rynk(action) => matches!(action, rmk_types_rynk::action::KeyAction::No),
         }
     }
 
