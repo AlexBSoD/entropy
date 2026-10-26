@@ -30,6 +30,17 @@ fn unique_reconnect_device_index(devices: &[Device], identity: &DeviceIdentity) 
 }
 
 impl EntropyApp {
+    /// Connects the board the user picked, and remembers it to connect it
+    /// again whenever it comes back.
+    pub(super) fn connect_picked_device(&mut self, device_idx: usize) {
+        self.remembered_device = self
+            .device_manager
+            .devices()
+            .get(device_idx)
+            .map(Device::stable_identity);
+        self.start_connect(device_idx);
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn maybe_start_bluetooth_reconnect_scan(&mut self, ctx: &egui::Context) {
         let Some(next_attempt_at) = (match &self.connect_state {
@@ -336,6 +347,18 @@ impl EntropyApp {
             return;
         }
 
+        // The board picked last comes back on its own, however many others
+        // are listed. It has been opened before, so no udev gate applies.
+        if self.selected_device.is_none() && self.layout.is_none() && !was_loading {
+            let remembered = self.remembered_device.as_ref().and_then(|identity| {
+                unique_reconnect_device_index(self.device_manager.devices(), identity)
+            });
+            if let Some(index) = remembered {
+                self.start_connect(index);
+                return;
+            }
+        }
+
         #[cfg(target_os = "linux")]
         if self.selected_device.is_none()
             && self.layout.is_none()
@@ -500,6 +523,47 @@ mod tests {
 
         assert_eq!(requests.try_recv().unwrap().0.path, device.path);
         assert!(matches!(app.connect_state, ConnectState::Loading { .. }));
+    }
+
+    #[test]
+    fn the_board_picked_last_is_connected_again_among_several() {
+        let mut app = EntropyApp::new_inert_for_test();
+        let (launch_tx, requests) = mpsc::channel();
+        app.test_connect_requests = Some(launch_tx);
+        let phenom = scan_test_device("Phenom");
+        let qube = scan_test_device("Qube");
+        let mut mini = scan_test_device("Mini");
+        mini.bus_type = "Bluetooth".to_owned();
+        app.device_manager
+            .replace_devices(vec![phenom.clone(), qube.clone(), mini.clone()]);
+        // A connect that ended with its board gone.
+        let unplugged = |app: &mut EntropyApp| {
+            app.connect_state = ConnectState::Idle;
+            app.selected_device = None;
+        };
+
+        app.connect_picked_device(1);
+        assert_eq!(requests.try_recv().unwrap().0.name, "Qube");
+        unplugged(&mut app);
+        app.apply_device_scan_result(vec![phenom.clone(), mini.clone()]);
+        assert!(requests.try_recv().is_err(), "another board was connected");
+
+        let mut replugged = qube.clone();
+        replugged.path = format!("{}-replugged", qube.path);
+        replugged.instance_token = "replugged-instance".to_owned();
+        app.apply_device_scan_result(vec![phenom.clone(), replugged.clone(), mini.clone()]);
+        let (connected, _) = requests
+            .try_recv()
+            .expect("the picked board was not connected again");
+        assert_eq!(connected.path, replugged.path);
+
+        // Picking another board replaces the one remembered.
+        unplugged(&mut app);
+        app.connect_picked_device(0);
+        assert_eq!(requests.try_recv().unwrap().0.name, "Phenom");
+        unplugged(&mut app);
+        app.apply_device_scan_result(vec![phenom, replugged, mini]);
+        assert_eq!(requests.try_recv().unwrap().0.name, "Phenom");
     }
 
     #[test]
