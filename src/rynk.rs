@@ -8,6 +8,7 @@
 pub(crate) mod client;
 pub(crate) mod dynamic;
 pub(crate) mod keycode;
+pub(crate) mod link;
 pub(crate) mod macros;
 pub(crate) mod native_v1;
 pub(crate) mod read_only;
