@@ -57,6 +57,10 @@ semver = "1"
 url = "2"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Blocks on nusb's hotplug stream in the Rynk board watcher.
+futures-lite = "2"
+# Rynk boards over USB: the vendor bulk interface, claimed without libusb.
+nusb = "0.2"
 rfd = "0.15"
 tempfile = "3"
 ureq = { version = "2", features = ["json"] }
@@ -83,7 +87,6 @@ tray-icon = "0.22"
 [target.'cfg(target_os = "linux")'.dependencies]
 async-channel = "2"
 dbus = { version = "0.9", features = ["vendored"] }
-futures-lite = "2"
 hidapi = { version = "2.6", default-features = false, features = ["linux-native-basic-udev"] }
 kdotool = { version = "0.3", default-features = false }
 libc = "0.2"

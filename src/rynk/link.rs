@@ -16,6 +16,7 @@ use rmk_types_rynk::protocol::rynk::command::Endpoint;
 use rmk_types_rynk::protocol::rynk::Cmd;
 
 use super::client::{RynkBoard, RynkClient, RynkClientError, RynkTimeouts, RynkTransport};
+use super::transport;
 
 /// How long a post may wait behind other requests before it goes first. Kept
 /// well under the firmware's host-data TTL.
@@ -125,6 +126,12 @@ fn is_busy(error: &RynkClientError) -> bool {
 }
 
 impl RynkLink {
+    /// The link of the board `id` names, opened through its bus if nobody
+    /// holds it yet.
+    pub(crate) fn open(id: &PhysicalId) -> Result<Arc<Self>, RynkClientError> {
+        Self::acquire(id.clone(), RynkTimeouts::default(), || transport::open(id))
+    }
+
     /// The link of `id`: the live one if anyone holds it, otherwise a new one
     /// from `open`. A claim that is busy is retried for a short while.
     pub(crate) fn acquire(
