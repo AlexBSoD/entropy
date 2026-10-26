@@ -60,8 +60,15 @@ impl EntropyApp {
         let mut layout = KeyboardLayout::from_vial_json(&json)
             .map_err(|error| format!("Layout parse failed: {error}"))?;
         layout.firmware = FirmwareProtocol::Rynk;
-        // The host-data bridges still speak Vial; a Rynk board gets none yet.
-        layout.live_features = Default::default();
+        // The definition names the host data the screen shows; the firmware
+        // says which of it SetHostData takes. The volume it shows nowhere.
+        let takes = |cap| info.caps & cap != 0;
+        let live = &mut layout.live_features;
+        live.extended_host_protocol = false;
+        live.time &= takes(caps::HOST_TIME);
+        live.volume = false;
+        live.layout &= takes(caps::HOST_KEYBOARD_LAYOUT);
+        live.media &= takes(caps::HOST_MEDIA);
         use_device_name_for_unnamed_layout(&mut layout, &dev.name);
         if (layout.rows, layout.cols)
             != (

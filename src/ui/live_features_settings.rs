@@ -8,7 +8,10 @@ impl EntropyApp {
         let selected = self
             .selected_device
             .and_then(|idx| self.device_manager.devices().get(idx))?;
-        if selected.firmware != FirmwareProtocol::Vial {
+        if !matches!(
+            selected.firmware,
+            FirmwareProtocol::Vial | FirmwareProtocol::Rynk
+        ) {
             return None;
         }
 

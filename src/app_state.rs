@@ -5502,6 +5502,9 @@ pub struct EntropyApp {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) qmk_hid_hosts:
         std::collections::HashMap<String, crate::qmk_hid_host::QmkHidHostBridge>,
+    /// Host-data bridges of Rynk boards, posting on their links.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) rynk_hosts: std::collections::HashMap<String, crate::qmk_hid_host::RynkHostBridge>,
     /// True while the normal keyboard canvas edits the selected application
     /// layout instead of writing the permanent Vial keymap.
     pub(crate) application_layout_editor_active: bool,
