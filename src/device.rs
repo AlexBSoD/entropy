@@ -641,7 +641,10 @@ impl DeviceManager {
             merge_bluez_vial_devices(&mut devices, bluez_devices);
         }
 
-        devices.extend(rynk_devices(crate::rynk::transport::scan()));
+        let rynk = rynk_devices(crate::rynk::transport::scan());
+        #[cfg(target_os = "linux")]
+        drop_vial_twins_of_rynk_boards(&mut devices, &rynk);
+        devices.extend(rynk);
         Ok(devices)
     }
 
@@ -730,6 +733,23 @@ fn merge_bluez_vial_devices(devices: &mut Vec<Device>, bluez_devices: Vec<Device
         }
         devices.push(bluez_device);
     }
+}
+
+/// A Rynk board over Bluetooth also shows HID endpoints a Vial scan may take
+/// for its own, and the board speaks no Vial on any of them: its Rynk entry
+/// is the only one listed.
+#[cfg(target_os = "linux")]
+fn drop_vial_twins_of_rynk_boards(devices: &mut Vec<Device>, rynk: &[Device]) {
+    let addresses: Vec<String> = rynk
+        .iter()
+        .filter(|board| board.is_bluetooth_transport())
+        .map(|board| normalized_bluetooth_identity(&board.serial_number))
+        .filter(|address| !address.is_empty())
+        .collect();
+    devices.retain(|device| {
+        !device.is_bluetooth_transport()
+            || !addresses.contains(&normalized_bluetooth_identity(&device.serial_number))
+    });
 }
 
 #[cfg(test)]
@@ -1094,6 +1114,41 @@ mod tests {
         assert_eq!(
             normalized_bluetooth_identity("AA:BB:CC:DD:EE:FF"),
             normalized_bluetooth_identity("aa-bb-cc-dd-ee-ff")
+        );
+    }
+
+    /// K:04 Mini on Rynk over Bluetooth: its Rynk-over-HID service passes for
+    /// a Vial one, so the board was listed twice.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_rynk_board_over_bluetooth_is_listed_once() {
+        let mut rynk = test_device("Bluetooth", "ble:C6:57:73:4E:6B:51");
+        rynk.serial_number = "C6:57:73:4E:6B:51".to_owned();
+        rynk.firmware = FirmwareProtocol::Rynk;
+        let mut gatt_twin = test_device(
+            "Bluetooth",
+            "bluez-gatt:/org/bluez/hci0/dev_C6_57_73_4E_6B_51/service0033",
+        );
+        gatt_twin.serial_number = "C6:57:73:4E:6B:51".to_owned();
+        let mut hidraw_twin = test_device("Bluetooth", "/dev/hidraw2");
+        hidraw_twin.serial_number = "c6:57:73:4e:6b:51".to_owned();
+        let mut other = test_device(
+            "Bluetooth",
+            "bluez-gatt:/org/bluez/hci0/dev_C6_9E_29_C4_F4_C7/service002a",
+        );
+        other.serial_number = "C6:9E:29:C4:F4:C7".to_owned();
+        let usb = test_device("Usb", "/dev/hidraw0");
+        let mut devices = vec![gatt_twin, hidraw_twin, other, usb];
+
+        drop_vial_twins_of_rynk_boards(&mut devices, std::slice::from_ref(&rynk));
+
+        let paths: Vec<&str> = devices.iter().map(|device| device.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "bluez-gatt:/org/bluez/hci0/dev_C6_9E_29_C4_F4_C7/service002a",
+                "/dev/hidraw0",
+            ]
         );
     }
 
