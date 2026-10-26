@@ -12,6 +12,8 @@ use super::link::{BoxedTransport, PhysicalId};
 
 #[cfg(target_os = "linux")]
 pub(crate) mod ble_linux;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod hid_reports;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub(crate) mod usb;
 
@@ -53,6 +55,10 @@ pub(crate) fn scan_usb() -> io::Result<Vec<FoundBoard>> {
 
 /// Whether `id` names a board reached over Bluetooth.
 pub(crate) fn is_bluetooth(id: &PhysicalId) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    if hid_reports::owns(id) {
+        return true;
+    }
     #[cfg(target_os = "linux")]
     if ble_linux::owns(id) {
         return true;
@@ -70,6 +76,10 @@ pub(crate) fn open(id: &PhysicalId) -> io::Result<BoxedTransport> {
     #[cfg(target_os = "linux")]
     if ble_linux::owns(id) {
         return ble_linux::open(id).map(|transport| Box::new(transport) as BoxedTransport);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if hid_reports::owns(id) {
+        return hid_reports::open(id).map(|transport| Box::new(transport) as BoxedTransport);
     }
     Err(io::Error::new(
         io::ErrorKind::NotFound,

@@ -610,6 +610,45 @@ fn device_info_matches(info: &hidapi::DeviceInfo, device: &crate::device::Device
         && device.permits_hid_target(&device_from_info(info))
 }
 
+/// The usage page and usage of a Rynk board's vendor report, which the OS HID
+/// stack lists for a board paired over Bluetooth.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn is_rynk_report(info: &hidapi::DeviceInfo) -> bool {
+    info.usage_page() == 0xFF14 && info.usage() == 0x61
+}
+
+/// A Rynk report endpoint as its helper opens it: the endpoint's own path, so
+/// the helper checks the same identity a Vial helper does.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn rynk_report_device(info: &hidapi::DeviceInfo) -> crate::device::Device {
+    crate::device::Device {
+        firmware: crate::firmware::FirmwareProtocol::Rynk,
+        ..device_from_info(info)
+    }
+}
+
+/// A Rynk board's report endpoint, held by a helper as a Vial endpoint is.
+/// Reports carry the link's bytes; the protocol stays with the caller.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct RawReportChannel(HidProxy);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl RawReportChannel {
+    pub(crate) fn open(device: &crate::device::Device) -> Result<Self> {
+        Ok(Self(HidProxy::open(device)?))
+    }
+
+    /// One output report of at most 32 bytes; the helper pads it.
+    pub(crate) fn write(&self, data: &[u8]) -> Result<()> {
+        self.0.write_output_report(data)
+    }
+
+    /// One input report, empty when none came within `timeout`.
+    pub(crate) fn read(&self, timeout: Duration) -> Result<Vec<u8>> {
+        self.0.read_raw_report(timeout)
+    }
+}
+
 fn device_from_info(info: &hidapi::DeviceInfo) -> crate::device::Device {
     let path = info.path().to_string_lossy().into_owned();
     crate::device::Device {
@@ -684,6 +723,36 @@ impl HidDevice {
 
     pub fn open_fresh_for(device: &crate::device::Device) -> Result<Self> {
         Self::open_proxy_for(device)
+    }
+
+    /// A Rynk board's report endpoint, opened by its helper only as listed now
+    /// and claimed from the UI process, as a Vial endpoint is.
+    fn open_rynk_reports_in_helper(device: &crate::device::Device) -> Result<hidapi::HidDevice> {
+        let open = || -> Result<hidapi::HidDevice> {
+            #[cfg(target_os = "macos")]
+            let _hid_lock = macos_hid_operation_lock();
+            let api = hidapi::HidApi::new().context("Failed to init hidapi")?;
+            let info = api
+                .device_list()
+                .find(|info| is_rynk_report(info) && info.path().to_string_lossy() == device.path)
+                .context("HID device disconnected before it opened")?;
+            let listed = device_from_info(info);
+            if !device.permits_hid_target(&listed) {
+                bail!("HID device disconnected or endpoint identity changed during open");
+            }
+            claim_open_target(&listed)?;
+            info.open_device(&api)
+                .context("Failed to open the Rynk HID endpoint")
+        };
+        #[cfg(target_os = "macos")]
+        return with_macos_bluetooth_hid_access(
+            device.is_bluetooth_transport(),
+            crate::smart_input::input_monitoring_access_granted,
+            crate::smart_input::request_input_monitoring_access,
+            open,
+        );
+        #[cfg(not(target_os = "macos"))]
+        open()
     }
 
     // Called only by the helper on its main thread, never by the UI process.

@@ -601,6 +601,13 @@ impl DeviceManager {
                     vial_interface, info.path().to_string_lossy()
                 );
             }
+            // A Rynk board paired over Bluetooth; Linux reaches it over GATT.
+            #[cfg(not(target_os = "linux"))]
+            if crate::hid::is_rynk_report(info) {
+                let mut device = crate::hid::rynk_report_device(info);
+                device.path = crate::rynk::transport::hid_reports::id(&device.path).0;
+                devices.push(device);
+            }
             // Filter: Vial usage page 0xFF60, usage 0x61
             if info.usage_page() == 0xFF60 && info.usage() == 0x61 {
                 let path = info.path().to_string_lossy().to_string();
