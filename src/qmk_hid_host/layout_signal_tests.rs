@@ -170,7 +170,12 @@ fn kde_and_ibus_signals_become_layout_events_until_a_bus_goes_away() {
                     .await;
             let ibus = layout_signal_stream(ibus_client.inner(), IBUS_INTERFACE, IBUS_PATH).await;
             assert!(kde.is_some() && ibus.is_some());
-            watch_layout_signals(kde, ibus, &events).await;
+            let streams = LayoutSignalStreams {
+                kde,
+                ibus,
+                ibus_started: None,
+            };
+            watch_layout_signals(streams, &events).await;
         });
         finished_tx.send(()).unwrap();
     });
@@ -225,4 +230,107 @@ fn kde_and_ibus_signals_become_layout_events_until_a_bus_goes_away() {
     finished_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("the watcher outlived its bus");
+}
+
+#[test]
+fn an_ibus_that_runs_unfollowed_keeps_the_lane_polling() {
+    let (kde_client, _kde) = p2p_pair();
+    let (ibus_client, _ibus) = p2p_pair();
+    let (bus_client, _bus) = p2p_pair();
+    futures_lite::future::block_on(async {
+        let kde =
+            || layout_signal_stream(kde_client.inner(), KDE_LAYOUT_INTERFACE, KDE_LAYOUT_PATH);
+        let ibus = || async {
+            layout_signal_stream(ibus_client.inner(), IBUS_INTERFACE, IBUS_PATH)
+                .await
+                .unwrap()
+        };
+        let absent = || async {
+            IbusSignal::Absent {
+                started: layout_signal_stream(bus_client.inner(), "org.freedesktop.DBus", "/")
+                    .await
+                    .unwrap(),
+            }
+        };
+
+        // IBus runs but its engine signal is not subscribed to: its switches
+        // would go unannounced, so KDE alone is not followed.
+        assert!(followed_layout_signals(kde().await, IbusSignal::Unreached, false).is_none());
+        // No IBus runs: KDE announces every switch, and IBus starting is watched.
+        let followed = followed_layout_signals(kde().await, absent().await, false)
+            .expect("KDE alone announces every switch");
+        assert!(followed.kde.is_some() && followed.ibus.is_none());
+        assert!(followed.ibus_started.is_some());
+        // GNOME announces through IBus only.
+        let gnome = followed_layout_signals(None, IbusSignal::Subscribed(ibus().await), true)
+            .expect("IBus announces GNOME's switches");
+        assert!(gnome.ibus.is_some() && gnome.ibus_started.is_none());
+        assert!(followed_layout_signals(None, absent().await, true).is_none());
+        assert!(
+            followed_layout_signals(None, IbusSignal::Subscribed(ibus().await), false).is_none()
+        );
+    });
+
+    // `ibus address` failing names no daemon; a refused connection is one's.
+    assert!(ibus_is_absent(&zbus::Error::Address(
+        "ibus terminated with code: 1".into()
+    )));
+    let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+    let refused = zbus::Error::InputOutput(Arc::new(refused));
+    assert!(!ibus_is_absent(&refused));
+}
+
+#[test]
+fn ibus_starting_ends_a_kde_only_watch_while_kde_stays() {
+    let shared = Arc::new(DesktopShared::default());
+    let events = LayoutEvents {
+        shared: Arc::downgrade(&shared),
+    };
+    let (kde_client, kde) = p2p_pair();
+    let (bus_client, bus) = p2p_pair();
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        futures_lite::future::block_on(async {
+            let kde =
+                layout_signal_stream(kde_client.inner(), KDE_LAYOUT_INTERFACE, KDE_LAYOUT_PATH)
+                    .await;
+            // A peer plays the bus: its signal stands for IBus taking its name.
+            let started =
+                layout_signal_stream(bus_client.inner(), "org.freedesktop.DBus", "/").await;
+            let streams = LayoutSignalStreams {
+                kde,
+                ibus: None,
+                ibus_started: started,
+            };
+            watch_layout_signals(streams, &events).await;
+        });
+        finished_tx.send(()).unwrap();
+    });
+
+    await_state(&shared, "following", |state| state.layout_following);
+    clear_announcements(&shared);
+    kde.emit_signal(
+        None::<&str>,
+        KDE_LAYOUT_PATH,
+        KDE_LAYOUT_INTERFACE,
+        "layoutChanged",
+        &(1u32,),
+    )
+    .unwrap();
+    await_state(&shared, "a KDE switch", |state| state.layout_due);
+
+    // IBus starts: the watch ends with KDE still there, so that the next
+    // setup follows IBus's engine signal too.
+    bus.emit_signal(
+        None::<&str>,
+        "/",
+        "org.freedesktop.DBus",
+        "NameOwnerChanged",
+        &(IBUS_DESTINATION, "", ":1.7"),
+    )
+    .unwrap();
+    finished_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("IBus starting did not end the watch");
+    drop(kde);
 }
