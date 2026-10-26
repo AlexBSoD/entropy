@@ -437,15 +437,15 @@ fn select_hid_vial_endpoints(
             })
             .collect();
 
-        let vial_report_id = characteristics
+        let report_map = characteristics
             .iter()
             .find(|characteristic| {
                 characteristic.service == *service
                     && uuid_matches(&characteristic.uuid, REPORT_MAP_CHARACTERISTIC_UUID)
             })
-            .and_then(|characteristic| {
-                crate::hid::vial_report_id_from_hid_descriptor(&characteristic.value)
-            });
+            .map(|characteristic| characteristic.value.as_slice())
+            .filter(|value| !value.is_empty());
+        let vial_report_id = report_map.and_then(crate::hid::vial_report_id_from_hid_descriptor);
         let report_reference = |characteristic: &CharacteristicSummary| {
             descriptors
                 .iter()
@@ -476,10 +476,11 @@ fn select_hid_vial_endpoints(
                         })
                 }),
             )
-        } else if reports.len() == 2 {
+        } else if reports.len() == 2 && report_map.is_none() {
             // Backward-compatible fallback for older BlueZ/RMK combinations
             // that expose a dedicated Vial HID service but do not cache its
-            // Report Map or Report Reference values.
+            // Report Map or Report Reference values. A cached map without the
+            // Vial usage is another two-report service, such as Rynk's.
             (
                 reports.iter().find(|characteristic| {
                     characteristic
@@ -1324,6 +1325,44 @@ mod tests {
                 output_write_types: vec![GattWriteType::Request, GattWriteType::Command],
                 transport: VialGattTransport::Hid,
             }]
+        );
+    }
+
+    /// K:04 Mini on Rynk: a second HID service of two reports carries Rynk
+    /// (usage page 0xFF14), and BlueZ has its Report Map.
+    #[test]
+    fn a_cached_report_map_without_vial_is_not_a_vial_service() {
+        let services = HashMap::from([("/service0033".to_owned(), "/device".to_owned())]);
+        let mut report_map =
+            characteristic("/service0033/char0036", "/service0033", "2a4b", &["read"]);
+        report_map.value = vec![
+            0x06, 0x14, 0xFF, 0x09, 0x61, 0xA1, 0x01, 0x09, 0x62, 0x15, 0x00, 0x26, 0xFF, 0x00,
+            0x75, 0x08, 0x95, 0x20, 0x81, 0x02, 0x09, 0x63, 0x15, 0x00, 0x91, 0x02, 0xC0,
+        ];
+        let mut characteristics = vec![
+            characteristic(
+                "/service0033/char003c",
+                "/service0033",
+                "2a4d",
+                &["read", "notify"],
+            ),
+            characteristic(
+                "/service0033/char0040",
+                "/service0033",
+                "2a4d",
+                &["read", "write-without-response", "write"],
+            ),
+        ];
+
+        // Without the map, two reports still read as a Vial service.
+        assert_eq!(
+            select_hid_vial_endpoints(&services, &characteristics, &[]).len(),
+            1
+        );
+        characteristics.push(report_map);
+        assert_eq!(
+            select_hid_vial_endpoints(&services, &characteristics, &[]),
+            []
         );
     }
 
