@@ -577,6 +577,7 @@ not_on_vial = "Прошивка этой клавиатуры не примет 
 
 [rynk_client]
 transport = "связь с клавиатурой потеряна: {error}"
+not_connected = "нет связи с {board} по Bluetooth: включите клавиатуру или поднесите её ближе"
 timeout = "клавиатура не ответила (команда {cmd})"
 device = "клавиатура отклонила команду {cmd}: {reason}"
 reason_malformed = "запрос не разобран"

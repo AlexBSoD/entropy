@@ -185,7 +185,16 @@ impl RynkClientError {
         let cmd = |cmd: &u16| format!("{cmd:#06x}");
         let version = |version: &ProtocolVersion| format!("{}.{}", version.major, version.minor);
         match self {
-            Self::Transport(error) => tr("rynk_client.transport", &[("error", &error.to_string())]),
+            Self::Transport(error) => {
+                #[cfg(target_os = "linux")]
+                if let Some(away) = error
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<super::transport::NotConnected>())
+                {
+                    return tr("rynk_client.not_connected", &[("board", &away.board)]);
+                }
+                tr("rynk_client.transport", &[("error", &error.to_string())])
+            }
             Self::Timeout { cmd: sent } => tr("rynk_client.timeout", &[("cmd", &cmd(sent))]),
             Self::Device { cmd: sent, error } => {
                 let reason = match error {
@@ -1601,5 +1610,33 @@ mod tests {
         assert!(update(&errors[6]).ends_with("update the firmware"));
         assert!(update(&errors[7]).ends_with("update Entropy"));
         assert!(update(&errors[8]).ends_with("update the firmware"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_board_bluetooth_does_not_reach_is_named_as_out_of_reach() {
+        let away = RynkClientError::Transport(io::Error::new(
+            io::ErrorKind::NotConnected,
+            super::super::transport::NotConnected {
+                board: "K:04 Mini".into(),
+            },
+        ));
+        let lost = RynkClientError::Transport(io::Error::other("gone"));
+        for language in [
+            crate::i18n::Language::English,
+            crate::i18n::Language::Russian,
+        ] {
+            let text = away.describe(language);
+            assert_eq!(
+                text,
+                crate::i18n::tr_catalog_format(
+                    language,
+                    "rynk_client.not_connected",
+                    &[("board", "K:04 Mini")]
+                )
+            );
+            assert!(text.contains("K:04 Mini") && !text.contains('{'), "{text}");
+            assert_ne!(text, lost.describe(language));
+        }
     }
 }

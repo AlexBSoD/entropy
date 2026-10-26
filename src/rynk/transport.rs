@@ -30,6 +30,24 @@ pub(crate) struct FoundBoard {
     pub(crate) bluetooth: bool,
 }
 
+/// A Bluetooth board the OS is not connected to: it is off or out of range,
+/// and opening it would only page it in vain.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct NotConnected {
+    pub(crate) board: String,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for NotConnected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} is not connected over Bluetooth", self.board)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for NotConnected {}
+
 /// The Rynk boards on every bus Entropy can reach.
 pub(crate) fn scan() -> io::Result<Vec<FoundBoard>> {
     let boards = scan_usb()?;

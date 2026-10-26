@@ -577,6 +577,7 @@ not_on_vial = "This keyboard's firmware cannot take a Rynk action as it is; noth
 
 [rynk_client]
 transport = "lost the link to the keyboard: {error}"
+not_connected = "{board} is not connected over Bluetooth: turn it on or bring it closer"
 timeout = "the keyboard did not answer (command {cmd})"
 device = "the keyboard refused command {cmd}: {reason}"
 reason_malformed = "the request does not decode"

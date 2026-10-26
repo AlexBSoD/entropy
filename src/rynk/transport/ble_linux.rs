@@ -9,7 +9,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use futures_lite::{future, StreamExt};
@@ -24,10 +24,9 @@ use super::super::client::RynkTransport;
 use super::super::link::PhysicalId;
 use super::FoundBoard;
 use crate::linux_ble::{
-    bluez_connection, characteristic_proxy, ensure_device_connected, interface_properties,
-    managed_objects, parse_bluez_modalias, property_bool, property_path, property_string,
-    property_strings, value_bytes, BLUEZ_DESTINATION, CHARACTERISTIC_INTERFACE, DEVICE_INTERFACE,
-    SERVICE_INTERFACE,
+    bluez_connection, characteristic_proxy, interface_properties, managed_objects,
+    parse_bluez_modalias, property_bool, property_path, property_string, property_strings,
+    value_bytes, BLUEZ_DESTINATION, CHARACTERISTIC_INTERFACE, DEVICE_INTERFACE, SERVICE_INTERFACE,
 };
 
 const PREFIX: &str = "ble:";
@@ -35,6 +34,8 @@ const PREFIX: &str = "ble:";
 const DEFAULT_MTU: u16 = 23;
 /// How long the listener may take to subscribe.
 const LISTEN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a board that just connected may take to show its services.
+const SERVICES_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A UUID as BlueZ spells it.
 fn uuid(value: u128) -> String {
@@ -58,6 +59,7 @@ struct BluezDevice {
     modalias: String,
     paired: bool,
     connected: bool,
+    services_resolved: bool,
     uuids: Vec<String>,
 }
 
@@ -91,6 +93,7 @@ fn devices(objects: &ManagedObjects) -> Vec<BluezDevice> {
                 modalias: property_string(properties, "Modalias").unwrap_or_default(),
                 paired: property_bool(properties, "Paired").unwrap_or(false),
                 connected: property_bool(properties, "Connected").unwrap_or(false),
+                services_resolved: property_bool(properties, "ServicesResolved").unwrap_or(false),
                 uuids: property_strings(properties, "UUIDs"),
             })
         })
@@ -129,14 +132,17 @@ fn characteristics(objects: &ManagedObjects) -> Vec<BluezCharacteristic> {
         .collect()
 }
 
-/// Paired boards that list the Rynk service. BlueZ keeps a bonded device's
-/// services while it is away, so a board is listed before it connects.
+/// Paired boards BlueZ is connected to that list the Rynk service. BlueZ keeps
+/// a bonded device's services while it is off or away, and connects to one
+/// that is on by itself, so only a connected board can be opened; a board
+/// still resolving its services is listed, as opening waits for them.
 fn rynk_boards(devices: &[BluezDevice]) -> Vec<FoundBoard> {
     let service = uuid(RYNK_SERVICE_UUID);
     devices
         .iter()
         .filter(|device| {
             device.paired
+                && device.connected
                 && device
                     .uuids
                     .iter()
@@ -251,6 +257,64 @@ fn is_connected(devices: &[BluezDevice], id: &PhysicalId) -> bool {
         .any(|device| device.connected && device.address.eq_ignore_ascii_case(address))
 }
 
+/// What opening a paired board takes, from what BlueZ says of it now.
+#[derive(Debug, PartialEq, Eq)]
+enum Opening {
+    /// BlueZ is not connected to it. It is not paged: a bonded board that is
+    /// on connects by itself, and one that is off or away only times out.
+    Away,
+    /// Just connected, its services not resolved yet.
+    AwaitServices,
+    Ready,
+}
+
+fn opening(device: &BluezDevice) -> Opening {
+    match (device.connected, device.services_resolved) {
+        (false, _) => Opening::Away,
+        (true, false) => Opening::AwaitServices,
+        (true, true) => Opening::Ready,
+    }
+}
+
+fn not_connected(device: &BluezDevice) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotConnected,
+        super::NotConnected {
+            board: device.name.clone(),
+        },
+    )
+}
+
+/// Waits for BlueZ to resolve the services of a board it just connected to.
+fn await_services(connection: &Connection, device: &BluezDevice) -> io::Result<()> {
+    let proxy = zbus::blocking::Proxy::new(
+        connection,
+        BLUEZ_DESTINATION,
+        device.path.as_str(),
+        DEVICE_INTERFACE,
+    )
+    .map_err(|error| io_error(error.into()))?;
+    let deadline = Instant::now() + SERVICES_TIMEOUT;
+    loop {
+        if !proxy.get_property::<bool>("Connected").unwrap_or(false) {
+            return Err(not_connected(device));
+        }
+        if proxy
+            .get_property::<bool>("ServicesResolved")
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "BlueZ did not resolve the board's services",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 pub(crate) fn open(id: &PhysicalId) -> io::Result<BleTransport> {
     let address = id.0.strip_prefix(PREFIX).unwrap_or_default();
     let connection = bluez_connection().map_err(io_error)?;
@@ -263,7 +327,11 @@ pub(crate) fn open(id: &PhysicalId) -> io::Result<BleTransport> {
                 format!("{} is not paired over Bluetooth", id.0),
             )
         })?;
-    ensure_device_connected(&connection, &device.path).map_err(io_error)?;
+    match opening(&device) {
+        Opening::Away => return Err(not_connected(&device)),
+        Opening::AwaitServices => await_services(&connection, &device)?,
+        Opening::Ready => {}
+    }
     // The services show once the connection resolved them.
     let objects = managed_objects(&connection).map_err(io_error)?;
     let endpoints = endpoints(
@@ -502,7 +570,8 @@ mod tests {
             name: "K:04".into(),
             modalias: "usb:vE126p0074d0001".into(),
             paired,
-            connected: false,
+            connected: true,
+            services_resolved: true,
             uuids: vec![
                 "00001812-0000-1000-8000-00805f9b34fb".into(),
                 uuid(RYNK_SERVICE_UUID).to_uppercase(),
@@ -535,14 +604,35 @@ mod tests {
     }
 
     #[test]
-    fn a_bonded_board_away_is_listed_but_not_connected() {
+    fn a_bonded_board_is_listed_only_while_bluez_is_connected_to_it() {
         let mut board = rynk_device(true);
         let id = PhysicalId(format!("ble:{}", ADDRESS.to_lowercase()));
         assert_eq!(rynk_boards(&[board.clone()]).len(), 1);
-        assert!(!is_connected(&[board.clone()], &id));
+        assert!(is_connected(&[board.clone()], &id));
 
-        board.connected = true;
-        assert!(is_connected(&[board], &id));
+        // Just switched on: connected, its services not resolved yet.
+        board.services_resolved = false;
+        assert_eq!(rynk_boards(&[board.clone()]).len(), 1);
+
+        // Off or away: bonded, its services kept, not connected.
+        board.connected = false;
+        assert!(rynk_boards(&[board.clone()]).is_empty());
+        assert!(!is_connected(&[board], &id));
+    }
+
+    #[test]
+    fn opening_a_board_waits_for_its_services_but_never_pages_it() {
+        let mut board = rynk_device(true);
+        assert_eq!(opening(&board), Opening::Ready);
+        board.services_resolved = false;
+        assert_eq!(opening(&board), Opening::AwaitServices);
+
+        // Off or away: opening fails at once, naming the board.
+        board.connected = false;
+        assert_eq!(opening(&board), Opening::Away);
+        let away = not_connected(&board);
+        assert_eq!(away.kind(), io::ErrorKind::NotConnected);
+        assert_eq!(away.to_string(), "K:04 is not connected over Bluetooth");
     }
 
     fn gatt(
