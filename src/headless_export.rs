@@ -327,19 +327,61 @@ impl ExportConnection {
     }
 }
 
+/// The read-only guards of both protocols an export may speak.
+#[derive(Clone, Default)]
+struct ReadOnlySessions {
+    hid: crate::hid::ReadOnlyHidSession,
+    rynk: crate::rynk::read_only::ReadOnlyRynkSession,
+}
+
+/// Before any HID handle or Rynk link exists: everything this process opens
+/// from here on refuses writes at the transport, whatever pipeline asks for
+/// them.
+fn enforce_read_only() -> ReadOnlySessions {
+    ReadOnlySessions {
+        hid: crate::hid::enforce_read_only_hid(),
+        rynk: crate::rynk::read_only::enforce_read_only_rynk(),
+    }
+}
+
+/// The section a failed Rynk read leaves out. A setting's id is not kept, so
+/// a failed layer name read counts as settings; it fails the connect anyway.
+fn rynk_section_of_read(cmd: u16) -> Option<&'static str> {
+    use rmk_types_rynk::protocol::rynk::Cmd;
+    match Cmd::from_raw(cmd) {
+        Cmd::GetKeyAction | Cmd::GetKeymapBulk => Some("Keymap"),
+        Cmd::GetLayoutOption => Some("LayoutOptions"),
+        Cmd::GetMacro => Some("Macros"),
+        Cmd::GetEncoderAction => Some("Encoders"),
+        Cmd::GetMorse | Cmd::GetMorseBulk => Some("TapDance"),
+        Cmd::GetCombo | Cmd::GetComboBulk => Some("Combos"),
+        Cmd::GetFork => Some("KeyOverrides"),
+        Cmd::GetSettingKeys | Cmd::GetSetting => Some("QmkSettings"),
+        _ => None,
+    }
+}
+
 /// Layers and sections the current snapshot lacks: not (yet) loaded, or
 /// read with a request that failed on the wire and was papered over.
-fn missing_sections(app: &EntropyApp, session: &crate::hid::ReadOnlyHidSession) -> Vec<String> {
+fn missing_sections(app: &EntropyApp, sessions: &ReadOnlySessions) -> Vec<String> {
     let mut missing: Vec<String> = app
         .entlayout_export_gaps()
         .into_iter()
         .map(|(name, _)| name)
         .collect();
-    for request in session.failed_reads() {
-        if let Some(section) = crate::hid::hid_protocol::entlayout_section_of_read(&request) {
-            if !missing.iter().any(|name| name == section) {
-                missing.push(section.to_owned());
-            }
+    let hid = sessions
+        .hid
+        .failed_reads()
+        .into_iter()
+        .filter_map(|request| crate::hid::hid_protocol::entlayout_section_of_read(&request));
+    let rynk = sessions
+        .rynk
+        .failed_reads()
+        .into_iter()
+        .filter_map(rynk_section_of_read);
+    for section in hid.chain(rynk) {
+        if !missing.iter().any(|name| name == section) {
+            missing.push(section.to_owned());
         }
     }
     missing
@@ -350,7 +392,7 @@ fn missing_sections(app: &EntropyApp, session: &crate::hid::ReadOnlyHidSession) 
 fn export_entlayout(
     app: &mut EntropyApp,
     device_idx: usize,
-    session: &crate::hid::ReadOnlyHidSession,
+    session: &ReadOnlySessions,
     deadline: Instant,
 ) -> Result<String, ExportError> {
     // A window-less context still carries the repaint requests and input
@@ -452,9 +494,7 @@ pub(crate) fn run_headless_export(request: HeadlessExportRequest) -> i32 {
     #[cfg(target_os = "macos")]
     crate::hid::initialize_macos_hid_on_main_thread();
 
-    // Before any HID handle exists: everything this process opens from here
-    // on refuses writes at the transport, whatever pipeline asks for them.
-    let session = crate::hid::enforce_read_only_hid();
+    let session = enforce_read_only();
     let mut app = EntropyApp::new_headless();
     let deadline = Instant::now() + request.timeout;
 
@@ -477,7 +517,7 @@ pub(crate) fn run_headless_export(request: HeadlessExportRequest) -> i32 {
     app.device_manager.replace_devices(devices);
 
     let exported = export_entlayout(&mut app, device_idx, &session, deadline);
-    let refused = session.refused_requests().len();
+    let refused = session.hid.refused_requests().len() + session.rynk.refused_requests().len();
     if refused > 0 {
         log::info!("Refused {refused} keyboard write(s) during the export");
     }
@@ -1072,13 +1112,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn scripted_export_app(
         fail: impl Fn(&[u8; 32]) -> Option<String> + Send + 'static,
-    ) -> (
-        EntropyApp,
-        crate::hid::ReadOnlyHidSession,
-        crate::hid::TestHidRecorder,
-    ) {
-        let session = crate::hid::ReadOnlyHidSession::default();
-        let (hid, recorder) = crate::hid::HidDevice::test_read_only_device(session.clone());
+    ) -> (EntropyApp, ReadOnlySessions, crate::hid::TestHidRecorder) {
+        let session = ReadOnlySessions::default();
+        let (hid, recorder) = crate::hid::HidDevice::test_read_only_device(session.hid.clone());
         scripted_keyboard(&recorder, fail);
         let mut device = crate::device::test_usb_device("3-3", 5, 0x0041);
         // A display macropad: its connect pauses the standby animation.
@@ -1136,10 +1172,11 @@ mod tests {
         // The connect did try to pause the standby animation; the transport
         // refused it before it reached the keyboard.
         assert!(session
+            .hid
             .refused_requests()
             .iter()
             .any(|request| request[..2] == [0xB6, 1]));
-        assert!(session.failed_reads().is_empty());
+        assert!(session.hid.failed_reads().is_empty());
 
         let bundle: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
@@ -1247,5 +1284,104 @@ mod tests {
             connection.step(&mut app, &ctx),
             Err(ExportError::Incomplete(vec!["TapDance".to_owned()]))
         );
+    }
+
+    /// The export's own guard switches every Rynk link of the process to
+    /// read-only for good, so the export runs in a child of this test.
+    #[test]
+    fn a_rynk_export_reads_the_board_without_a_single_write() {
+        use rmk_types_rynk::protocol::rynk::ergohaven::{caps, BatteryHalves};
+        use rmk_types_rynk::protocol::rynk::Cmd;
+
+        const CHILD_ENV: &str = "ENTROPY_TEST_RYNK_READ_ONLY_EXPORT";
+        const COMPLETION: &str = "ENTROPY_RYNK_READ_ONLY_EXPORT_COMPLETE";
+        let name = "a_rynk_export_reads_the_board_without_a_single_write";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let (_, module) = module_path!().split_once("::").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &format!("{module}::{name}"), "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                stdout.lines().any(|line| line == COMPLETION),
+                "the child must run the export: {stdout}"
+            );
+            return;
+        }
+
+        let session = enforce_read_only();
+        let mut stored = crate::rynk::session::testing::Stored::new(1, 2, 2);
+        let definition = serde_json::json!({
+            "name": "Rynk fixture",
+            "matrix": {"rows": 1, "cols": 2},
+            "layouts": {"keymap": [["0,0", "0,1"]]}
+        })
+        .to_string();
+        lzma_rs::xz_compress(&mut definition.as_bytes(), &mut stored.definition).unwrap();
+        // Layer 1 is unnamed on the board, so the connect names it, and the
+        // halves wake for a battery reading.
+        stored.settings.insert(200, b"Base\0".to_vec());
+        stored.settings.insert(201, b"\0".to_vec());
+        stored.caps = caps::BATTERY_HALVES;
+        stored.battery = Some(BatteryHalves {
+            mask: 0b11,
+            left: 50,
+            right: 60,
+        });
+        let (board, state) = crate::rynk::session::testing::board(stored);
+        let _held = crate::rynk::session::testing::link("headless-rynk", &board);
+        let mut app = EntropyApp::new_inert_for_test();
+        app.headless = true;
+        app.device_manager.replace_devices(vec![Device {
+            name: "Rynk fixture".into(),
+            vendor_id: 0xE126,
+            product_id: 0x0074,
+            manufacturer: "Ergohaven".into(),
+            serial_number: "rynk:010203".into(),
+            bus_type: "Usb".into(),
+            path: "headless-rynk".into(),
+            instance_token: String::new(),
+            firmware: FirmwareProtocol::Rynk,
+        }]);
+
+        let json = export_entlayout(
+            &mut app,
+            0,
+            &session,
+            Instant::now() + Duration::from_secs(20),
+        )
+        .unwrap();
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.writes(), [], "writes reached the board");
+        assert!(!state.received.contains(&Cmd::GetBatteryHalves));
+        let refused = session.rynk.refused_requests();
+        assert!(refused.contains(&Cmd::SetSetting.raw()), "{refused:04x?}");
+        assert!(session.rynk.failed_reads().is_empty());
+        let bundle: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(bundle["data"]["keymap"].is_array(), "{bundle}");
+        println!("{COMPLETION}");
+    }
+
+    #[test]
+    fn a_failed_rynk_read_names_its_section() {
+        use rmk_types_rynk::protocol::rynk::Cmd;
+
+        assert_eq!(
+            rynk_section_of_read(Cmd::GetSetting.raw()),
+            Some("QmkSettings")
+        );
+        assert_eq!(
+            rynk_section_of_read(Cmd::GetComboBulk.raw()),
+            Some("Combos")
+        );
+        assert_eq!(rynk_section_of_read(Cmd::GetLockStatus.raw()), None);
     }
 }
