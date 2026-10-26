@@ -324,7 +324,10 @@ impl Owner {
                     self.queue(event);
                     continue;
                 }
-                Err(true) => return,
+                Err(true) => {
+                    self.flush_posts();
+                    return;
+                }
                 Err(false) => {}
             }
             let Some(job) = self.next_job() else {
@@ -361,6 +364,19 @@ impl Owner {
         }
         let (key, _) = self.posts.pop_front()?;
         self.post_jobs.remove(&key)
+    }
+
+    /// Sends the posts still queued once the last holder let go, so what a
+    /// closing consumer posted last (clearing the media, say) still arrives.
+    fn flush_posts(&mut self) {
+        while let Some((key, _)) = self.posts.pop_front() {
+            let Some(job) = self.post_jobs.remove(&key) else {
+                continue;
+            };
+            if job(&mut self.client).is_err() {
+                return;
+            }
+        }
     }
 }
 
@@ -577,6 +593,46 @@ mod tests {
                 (Cmd::GetCurrentLayer, 0),
                 (Cmd::GetCurrentLayer, 0),
                 (Cmd::SetDefaultLayer, 7),
+            ]
+        );
+    }
+
+    #[test]
+    fn posts_queued_when_the_last_holder_lets_go_still_go_out() {
+        let (release, gate) = mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        let (holding, held) = mpsc::channel::<()>();
+        let holding = Mutex::new(holding);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let seen = log.clone();
+        let board = FakeBoard::new(move |header: RynkHeader, payload: &[u8]| {
+            if let Some(reply) = handshake(header, 512) {
+                return vec![reply];
+            }
+            let value = payload.first().copied().unwrap_or_default();
+            // The first post holds the owner until the link is let go.
+            if header.cmd == Cmd::SetDefaultLayer && value == 1 {
+                holding.lock().unwrap().send(()).unwrap();
+                gate.lock().unwrap().recv().unwrap();
+            }
+            seen.lock().unwrap().push((header.cmd, value));
+            vec![ok(header, ())]
+        });
+        let link = RynkLink::acquire(id("flush"), quick(), open(&board)).unwrap();
+        link.post::<command::SetDefaultLayer>(0, 1).unwrap();
+        held.recv_timeout(Duration::from_secs(3)).unwrap();
+        link.post::<command::SetDefaultLayer>(1, 2).unwrap();
+        link.post::<command::SetDefaultLayer>(2, 3).unwrap();
+        drop(link);
+        release.send(()).unwrap();
+
+        eventually("the board is let go", || board.dropped() == 1);
+        assert_eq!(
+            commands(&log),
+            [
+                (Cmd::SetDefaultLayer, 1),
+                (Cmd::SetDefaultLayer, 2),
+                (Cmd::SetDefaultLayer, 3),
             ]
         );
     }
