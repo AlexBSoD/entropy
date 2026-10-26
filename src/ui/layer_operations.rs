@@ -2685,7 +2685,9 @@ mod tests {
         let creation_context = eframe::CreationContext::_new_kittest(ctx.clone());
         let mut app = EntropyApp::new(&creation_context);
         let positions = [(0.0, 0.0), (1.0, 0.0)];
-        app.layout = Some(layout(&positions, &[0x04, 0x05], &[]));
+        let mut target = layout(&positions, &[0x04, 0x05], &[]);
+        target.firmware = FirmwareProtocol::Rynk;
+        app.layout = Some(target);
         let (board, state) = board(Stored::new(8, 8, 1));
         let session = crate::rynk::session::RynkSession::new(link("layer-paste", &board));
         app.hid_device = Some(session.into());

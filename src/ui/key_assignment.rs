@@ -247,16 +247,12 @@ impl EntropyApp {
         }
     }
 
-    /// Whether the connected board speaks Rynk.
+    /// Whether the editor holds a Rynk board's layout. Asked of the layout,
+    /// not the session, which a write takes away while it runs.
     pub(super) fn rynk_board_connected(&self) -> bool {
-        #[cfg(not(target_arch = "wasm32"))]
-        let connected = self
-            .hid_device
+        self.layout
             .as_ref()
-            .is_some_and(crate::device_session::DeviceSession::is_rynk);
-        #[cfg(target_arch = "wasm32")]
-        let connected = false;
-        connected
+            .is_some_and(|layout| layout.firmware == FirmwareProtocol::Rynk)
     }
 
     /// `binding` as the connected board takes it: on a Rynk board the native
@@ -1296,7 +1292,9 @@ mod tests {
         use crate::rynk::session::testing::{board, link, Stored};
         let creation_context = eframe::CreationContext::_new_kittest(ctx.clone());
         let mut app = EntropyApp::new(&creation_context);
-        app.layout = Some(test_layout(&[0x0004], &[]));
+        let mut layout = test_layout(&[0x0004, 0x0005], &[]);
+        layout.firmware = FirmwareProtocol::Rynk;
+        app.layout = Some(layout);
         let (board, state) = board(Stored::new(8, 8, 1));
         let session = crate::rynk::session::RynkSession::new(link(name, &board));
         app.hid_device = Some(session.into());
@@ -1388,5 +1386,29 @@ mod tests {
             app.keycode_picker.vial_quantum_pending_mt,
             Some(0x2000 | ((ModifierCombination::RCTRL.into_packed_bits() as u16) << 8))
         );
+    }
+
+    #[test]
+    fn a_pick_made_while_a_write_runs_still_goes_as_a_rynk_action() {
+        use rmk_types_rynk::action::{Action, KeyAction};
+        let ctx = egui::Context::default();
+        let (mut app, state) = rynk_app(&ctx, "picker-during-write");
+        // The first write takes the session until it returns.
+        assert!(app.assign_key_binding(&ctx, 0, 1, crate::keyboard::KeyBinding::Vial(0x0006)));
+        assert!(app.hid_write_task_active());
+        let user_id = crate::universal_symbols::USER_SYMBOL_START;
+        app.selected_key = Some((0, 0));
+        app.keycode_picker.result = Some(crate::universal_symbols::binding(user_id));
+
+        // The pick waits for the write, then goes as the board takes it.
+        app.apply_picker_results(&ctx);
+        finish_write(&mut app, &ctx);
+        app.apply_picker_results(&ctx);
+        finish_write(&mut app, &ctx);
+
+        let expected = KeyAction::Single(Action::User(user_id));
+        let held = app.layout.as_ref().unwrap().get_key_binding(0, 0);
+        assert_eq!(crate::rynk::keycode::binding_action(held), Ok(expected));
+        assert_eq!(state.lock().unwrap().keymap[0], expected);
     }
 }
