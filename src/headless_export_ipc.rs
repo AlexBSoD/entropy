@@ -1,10 +1,12 @@
 //! `--export-layout` while the GUI is running: the console process asks the
-//! running instance, which owns the keyboards, for the same full snapshot its
-//! Layout menu would save, and writes the file itself.
+//! running instance, which owns the keyboards, for the export, and writes the
+//! file itself.
 //!
 //! The channel is a Unix socket in the user's runtime directory. It carries a
-//! single command, so whatever reaches it can only read the keyboard: the GUI
-//! answers it from its existing connection and deferred-load pipeline.
+//! single command, and the GUI answers it by lending its connection, through a
+//! read-only view, to the same pipeline a standalone export runs: whatever the
+//! export asks for, only reads reach the keyboard, and nothing it loads
+//! reaches the GUI's own state.
 
 use super::*;
 use std::io::{BufRead, BufReader, Write};
@@ -15,6 +17,8 @@ use std::sync::mpsc;
 const PROTOCOL_VERSION: u32 = 1;
 /// A connected client has this long to send its request line.
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// The longest export the GUI runs, whatever timeout the console asks for.
+const MAX_EXPORT_TIME: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "command", rename_all = "kebab-case")]
@@ -22,6 +26,7 @@ enum Request {
     ExportLayout {
         version: u32,
         device: Option<String>,
+        timeout_ms: u64,
     },
 }
 
@@ -46,6 +51,7 @@ pub(crate) fn socket_path() -> Option<PathBuf> {
 /// One console request waiting for the GUI thread.
 pub(crate) struct ExportJob {
     device: Option<String>,
+    deadline: Instant,
     reply: mpsc::Sender<Reply>,
 }
 
@@ -101,9 +107,22 @@ fn serve(stream: UnixStream, jobs: &mpsc::Sender<ExportJob>, ctx: &egui::Context
             message: format!("request not read: {error}"),
         },
         Ok(_) => match serde_json::from_str::<Request>(&line) {
-            Ok(Request::ExportLayout { version, device }) if version == PROTOCOL_VERSION => {
+            Ok(Request::ExportLayout {
+                version,
+                device,
+                timeout_ms,
+            }) if version == PROTOCOL_VERSION => {
+                let deadline =
+                    Instant::now() + Duration::from_millis(timeout_ms).min(MAX_EXPORT_TIME);
                 let (reply, answer) = mpsc::channel();
-                if jobs.send(ExportJob { device, reply }).is_err() {
+                if jobs
+                    .send(ExportJob {
+                        device,
+                        deadline,
+                        reply,
+                    })
+                    .is_err()
+                {
                     return;
                 }
                 ctx.request_repaint();
@@ -139,6 +158,7 @@ pub(super) fn export_via_socket(path: &Path, request: &HeadlessExportRequest) ->
     let mut line = serde_json::to_string(&Request::ExportLayout {
         version: PROTOCOL_VERSION,
         device: request.device.clone(),
+        timeout_ms: request.timeout.as_millis().try_into().unwrap_or(u64::MAX),
     })
     .expect("export request serializes");
     line.push('\n');
@@ -184,10 +204,47 @@ pub(super) fn export_via_socket(path: &Path, request: &HeadlessExportRequest) ->
     })
 }
 
-/// A console export the GUI is loading for.
+/// Runs the standalone export over `hid`, the running instance's own
+/// connection, lent for the duration through a read-only view: every write
+/// is refused at the transport, failed reads are listed instead of exported,
+/// and what the export loads stays in its own app.
+pub(crate) fn export_lent_keyboard(
+    hid: &crate::hid::HidDevice,
+    device: Device,
+    deadline: Instant,
+) -> Reply {
+    let session = crate::hid::ReadOnlyHidSession::default();
+    let Some(view) = hid.read_only_view(session.clone()) else {
+        return Reply::Failed {
+            message: "This keyboard's connection cannot be lent to an export".to_owned(),
+        };
+    };
+    log::info!("Exporting layout of {} for the console", describe(&device));
+    let mut app = EntropyApp::new_headless();
+    app.device_manager.replace_devices(vec![device]);
+    app.connect_hid = Some(view);
+    let exported = export_entlayout(&mut app, 0, &session, deadline);
+    // A worker the export leaves behind must not reach the keyboard once the
+    // GUI has it back.
+    session.close();
+    let refused = session.refused_requests().len();
+    if refused > 0 {
+        log::info!("Refused {refused} keyboard write(s) during the console export");
+    }
+    match exported {
+        Ok(entlayout) => Reply::Exported { entlayout },
+        Err(ExportError::Incomplete(missing)) => Reply::Incomplete { missing },
+        Err(ExportError::Failed(message)) => Reply::Failed { message },
+    }
+}
+
+/// A console export waiting for the connection, or running on it.
 pub(crate) struct PendingConsoleExport {
     reply: mpsc::Sender<Reply>,
     generation: u64,
+    device: Device,
+    deadline: Instant,
+    started: bool,
 }
 
 impl EntropyApp {
@@ -215,10 +272,13 @@ impl EntropyApp {
                 return;
             };
             match self.accept_console_export(job.device.as_deref()) {
-                Ok(generation) => {
+                Ok(device) => {
                     self.pending_console_export = Some(PendingConsoleExport {
                         reply: job.reply,
-                        generation,
+                        generation: self.connection_generation,
+                        device,
+                        deadline: job.deadline,
+                        started: false,
                     })
                 }
                 Err(reply) => {
@@ -227,16 +287,12 @@ impl EntropyApp {
                 }
             }
         }
-        let Some(reply) = self.console_export_progress(ctx) else {
-            ctx.request_repaint_after(POLL_INTERVAL);
-            return;
-        };
-        if let Some(pending) = self.pending_console_export.take() {
-            let _ = pending.reply.send(reply);
+        if let Some(reply) = self.console_export_progress(ctx) {
+            self.finish_console_export(reply);
         }
     }
 
-    fn accept_console_export(&self, filter: Option<&str>) -> Result<u64, Reply> {
+    fn accept_console_export(&self, filter: Option<&str>) -> Result<Device, Reply> {
         let device = self
             .selected_device
             .and_then(|index| self.device_manager.devices().get(index))
@@ -253,51 +309,54 @@ impl EntropyApp {
                 ),
             });
         }
-        if self.deferred_full_layout_action.is_some() {
-            return Err(Reply::Failed {
-                message: "Entropy is finishing another layout action; retry later".to_owned(),
-            });
-        }
-        Ok(self.connection_generation)
+        Ok(device.clone())
     }
 
-    /// `None` while the snapshot is still loading.
+    /// Lends the connection to the export as soon as nothing else holds it;
+    /// `None` until then, and while the export runs.
     fn console_export_progress(&mut self, ctx: &egui::Context) -> Option<Reply> {
-        let generation = self.pending_console_export.as_ref()?.generation;
-        if generation != self.connection_generation
-            || !matches!(self.connect_state, ConnectState::Idle)
-        {
+        let connection_generation = self.connection_generation;
+        let connected = matches!(self.connect_state, ConnectState::Idle);
+        let pending = self.pending_console_export.as_ref()?;
+        if pending.generation != connection_generation || !connected {
             return Some(Reply::Failed {
                 message: "The keyboard connection was replaced during the export".to_owned(),
             });
         }
-        // A window hidden to the tray stops loading on its own; this export
-        // still needs every layer and section.
-        self.maybe_start_deferred_device_load(ctx, false);
-        let gaps = self.entlayout_export_gaps();
-        let failed: Vec<String> = gaps
-            .iter()
-            .filter(|(_, status)| matches!(status, DeferredLoadStatus::Failed(_)))
-            .map(|(name, _)| name.clone())
-            .collect();
-        if !failed.is_empty() {
-            return Some(Reply::Incomplete { missing: failed });
-        }
-        if !gaps.is_empty()
-            || !self.deferred_full_layout_action_ready(DeferredFullLayoutAction::ExportEntlayout)
-            || self.vial_hid_task_active()
-        {
+        if pending.started {
             return None;
         }
-        Some(match self.entlayout_export_json() {
-            Some(Ok(entlayout)) => Reply::Exported { entlayout },
-            Some(Err(error)) => Reply::Failed {
-                message: format!("{error:#}"),
-            },
-            None => Reply::Failed {
-                message: "No keyboard layout to export".to_owned(),
-            },
-        })
+        if Instant::now() >= pending.deadline {
+            return Some(Reply::Failed {
+                message: "The keyboard stayed busy until the export timed out".to_owned(),
+            });
+        }
+        let operation = vial_hid_task::VialHidOperation::ConsoleExport {
+            device: pending.device.clone(),
+            deadline: pending.deadline,
+        };
+        match self.start_vial_hid_operation(ctx, operation) {
+            vial_hid_task::VialHidTaskStart::Started => {
+                if let Some(pending) = self.pending_console_export.as_mut() {
+                    pending.started = true;
+                }
+                None
+            }
+            vial_hid_task::VialHidTaskStart::Busy => {
+                ctx.request_repaint_after(POLL_INTERVAL);
+                None
+            }
+            vial_hid_task::VialHidTaskStart::NoDevice => Some(Reply::NoDevice {
+                message: "The running Entropy has no keyboard connected".to_owned(),
+            }),
+        }
+    }
+
+    /// Hands the answer to the console waiting for it.
+    pub(crate) fn finish_console_export(&mut self, reply: Reply) {
+        if let Some(pending) = self.pending_console_export.take() {
+            let _ = pending.reply.send(reply);
+        }
     }
 }
 
@@ -312,7 +371,7 @@ mod tests {
         let server = ExportServer::start(&socket, egui::Context::default()).unwrap();
         for line in [
             r#"{"command":"set-keycode"}"#,
-            r#"{"command":"export-layout","version":2,"device":null}"#,
+            r#"{"command":"export-layout","version":2,"device":null,"timeout_ms":1000}"#,
         ] {
             let mut stream = UnixStream::connect(&socket).unwrap();
             stream.write_all(format!("{line}\n").as_bytes()).unwrap();

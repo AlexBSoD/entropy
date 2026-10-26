@@ -54,7 +54,8 @@ impl EntropyApp {
 
     /// The app without a window, for `--export-layout`. Reads the same
     /// settings as `new` (language, diagnostics) but starts none of the
-    /// desktop machinery: no text expander, no update check, no zoom.
+    /// desktop machinery: no text expander, no update check, no zoom, no
+    /// device scan of its own.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn new_headless() -> Self {
         let app_settings = load_app_settings();
@@ -62,7 +63,7 @@ impl EntropyApp {
         let mut app = Self::from_bootstrap(AppBootstrap {
             typing_trainer: TypingTrainerState::from_settings(app_settings.typing_trainer),
             app_settings,
-            device_manager: DeviceManager::new(),
+            device_manager: DeviceManager::empty(),
             text_expander_rules_signature: Vec::new(),
             last_single_instance_signal: String::new(),
             layer_names: Vec::new(),
@@ -78,7 +79,7 @@ impl EntropyApp {
         Self::from_bootstrap(AppBootstrap {
             typing_trainer: TypingTrainerState::from_settings(app_settings.typing_trainer),
             app_settings,
-            device_manager: DeviceManager::empty_for_test(),
+            device_manager: DeviceManager::empty(),
             text_expander_rules_signature: Vec::new(),
             last_single_instance_signal: String::new(),
             layer_names: Vec::new(),
@@ -353,8 +354,8 @@ impl EntropyApp {
             test_device_scan_requests: None,
             #[cfg(all(test, not(target_arch = "wasm32")))]
             test_connect_requests: None,
-            #[cfg(all(test, not(target_arch = "wasm32")))]
-            test_connect_hid: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            connect_hid: None,
             #[cfg(not(target_arch = "wasm32"))]
             device_scan_state: DeviceScanState::Idle,
         }

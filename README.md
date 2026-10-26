@@ -125,9 +125,9 @@ both the wait for a Bluetooth keyboard to be discovered and its loading.
 
 When Entropy is already running, it owns the keyboard, so on Linux and macOS
 the export asks that instance for the layout over a socket private to the
-user. The running Entropy answers from its own connection, with the same full
-snapshot and the same read-only rule, even while its window is in the
-background. On Windows, close the Entropy window first.
+user. The running Entropy lends its connection to the same read-only export,
+even while its window is in the background; its own writes wait until the
+export is done. On Windows, close the Entropy window first.
 
 The export is read-only: the HID transport refuses every command that would
 change the keyboard. It writes only a complete snapshot of one connection: if a

@@ -5411,10 +5411,11 @@ pub struct EntropyApp {
     #[cfg(all(test, not(target_arch = "wasm32")))]
     pub(crate) test_connect_requests:
         Option<mpsc::Sender<(Device, mpsc::Sender<ConnectTaskMessage>)>>,
-    /// Scripted HID handle for the next real connect worker, in place of
-    /// opening the device.
-    #[cfg(all(test, not(target_arch = "wasm32")))]
-    pub(crate) test_connect_hid: Option<crate::hid::HidDevice>,
+    /// An open transport the next connect uses in place of opening the
+    /// device: a scripted keyboard in tests, or the read-only view a running
+    /// instance lends to a console export.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) connect_hid: Option<crate::hid::HidDevice>,
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) device_scan_state: DeviceScanState,
     /// Persistent open HID device for real-time writes (Vial)
