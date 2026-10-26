@@ -108,6 +108,28 @@ impl DeviceSession {
         }
     }
 
+    /// Lands what the board staged for flash. Vial boards write as they go, so
+    /// for them there is nothing to wait for; `_progress` counts what is still
+    /// pending on boards that stage.
+    pub(crate) fn commit_writes(&self, _progress: &std::sync::atomic::AtomicU32) -> Result<()> {
+        match self {
+            Self::Vial(_) => Ok(()),
+        }
+    }
+
+    /// What a Rynk board can hold and its morse keys as read, to check an
+    /// import before it writes anything. `None` for Vial boards.
+    pub(crate) fn rynk_import_context(
+        &self,
+    ) -> Option<(
+        &rmk_types_rynk::protocol::rynk::DeviceCapabilities,
+        &[rmk_types_rynk::morse::Morse],
+    )> {
+        match self {
+            Self::Vial(_) => None,
+        }
+    }
+
     pub(crate) fn set_encoder(
         &self,
         layer: u8,

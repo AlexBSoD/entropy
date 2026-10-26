@@ -252,6 +252,145 @@ pub(crate) fn rynk_import_losses(
     losses
 }
 
+/// The import error for `losses`, one line each.
+pub(crate) fn describe_import_losses(
+    language: crate::i18n::Language,
+    losses: &[ImportLoss],
+) -> String {
+    let header = crate::i18n::tr_catalog(language, "entlayout.rynk_losses");
+    std::iter::once(header.to_owned())
+        .chain(losses.iter().map(|loss| describe_loss(language, loss)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn describe_loss(language: crate::i18n::Language, loss: &ImportLoss) -> String {
+    let tr = |key, vars: &[(&str, &str)]| crate::i18n::tr_catalog_format(language, key, vars);
+    let keycode = |keycode: u16| format!("{keycode:#06x}");
+    let at = |place: BindingPlace, detail: String| match place {
+        BindingPlace::Key { layer, key } => tr(
+            "rynk_import.key",
+            &[
+                ("layer", &layer.to_string()),
+                ("key", &key.to_string()),
+                ("detail", &detail),
+            ],
+        ),
+        BindingPlace::ComboOutput { index } => tr(
+            "rynk_import.combo_output",
+            &[("index", &index.to_string()), ("detail", &detail)],
+        ),
+        BindingPlace::TapDance { index, field } => tr(
+            "rynk_import.tap_dance_field",
+            &[
+                ("index", &index.to_string()),
+                ("field", &(field + 1).to_string()),
+                ("detail", &detail),
+            ],
+        ),
+    };
+    let binding = |error: &KeyBindingError| match error {
+        KeyBindingError::UnsupportedKeycode(code) => tr(
+            "rynk_import.unsupported_keycode",
+            &[("keycode", &keycode(*code))],
+        ),
+        KeyBindingError::NativeV1 => tr("rynk_import.native_v1", &[]),
+    };
+    let dynamic = |error: &DynamicError| match error {
+        DynamicError::Binding(error) => binding(error),
+        DynamicError::NotAnAction(action) => tr(
+            "rynk_import.not_an_action",
+            &[("action", &format!("{action:?}"))],
+        ),
+        DynamicError::TooManyComboKeys { max } => tr(
+            "rynk_import.too_many_combo_keys",
+            &[("max", &max.to_string())],
+        ),
+        DynamicError::TooManyMorsePatterns { max } => tr(
+            "rynk_import.too_many_patterns",
+            &[("max", &max.to_string())],
+        ),
+    };
+    let index = |index: &usize| index.to_string();
+    match loss {
+        ImportLoss::NativeV1 { place, loss } => at(
+            *place,
+            match loss {
+                NativeV1Loss::KeyboardAction(action) => tr(
+                    "rynk_import.removed_action",
+                    &[("action", &format!("{action:?}"))],
+                ),
+                NativeV1Loss::TapHoldProfile(_) => tr("rynk_import.tap_hold_profile", &[]),
+                NativeV1Loss::Unsupported => tr("rynk_import.unsupported_action", &[]),
+            },
+        ),
+        ImportLoss::Binding { place, error } => at(*place, binding(error)),
+        ImportLoss::Encoder {
+            layer,
+            encoder,
+            keycode: code,
+        } => tr(
+            "rynk_import.encoder",
+            &[
+                ("layer", &layer.to_string()),
+                ("encoder", &encoder.to_string()),
+                ("keycode", &keycode(*code)),
+            ],
+        ),
+        ImportLoss::Macro { index: slot, loss } => {
+            let detail = match loss {
+                MacroLoss::Byte(byte) => tr(
+                    "rynk_import.macro_byte",
+                    &[("byte", &format!("{byte:#04x}"))],
+                ),
+                MacroLoss::UnknownOp(kind) => tr(
+                    "rynk_import.macro_unknown_op",
+                    &[("kind", &format!("{kind:#04x}"))],
+                ),
+                MacroLoss::Truncated(_) => tr("rynk_import.macro_truncated", &[]),
+                MacroLoss::Keycode(code) => {
+                    tr("rynk_import.macro_keycode", &[("keycode", &keycode(*code))])
+                }
+                MacroLoss::Op(op) => tr("rynk_import.macro_op", &[("op", &format!("{op:?}"))]),
+            };
+            tr(
+                "rynk_import.macro",
+                &[("index", &index(slot)), ("detail", &detail)],
+            )
+        }
+        ImportLoss::MacroSlot { index: slot } => {
+            tr("rynk_import.macro_slot", &[("index", &index(slot))])
+        }
+        ImportLoss::MacroSpace { used, available } => tr(
+            "rynk_import.macro_space",
+            &[
+                ("used", &used.to_string()),
+                ("available", &available.to_string()),
+            ],
+        ),
+        ImportLoss::Combo { index: slot, error } => tr(
+            "rynk_import.combo",
+            &[("index", &index(slot)), ("detail", &dynamic(error))],
+        ),
+        ImportLoss::TapDance { index: slot, error } => tr(
+            "rynk_import.tap_dance",
+            &[("index", &index(slot)), ("detail", &dynamic(error))],
+        ),
+        ImportLoss::KeyOverride { index: slot, error } => tr(
+            "rynk_import.key_override",
+            &[("index", &index(slot)), ("detail", &dynamic(error))],
+        ),
+        ImportLoss::Slot { kind, index: slot } => tr(
+            match kind {
+                SlotKind::Combo => "rynk_import.combo_slot",
+                SlotKind::TapDance => "rynk_import.tap_dance_slot",
+                SlotKind::KeyOverride => "rynk_import.key_override_slot",
+            },
+            &[("index", &index(slot))],
+        ),
+    }
+}
+
 fn native_field_bytes(encoded: &str) -> Result<Vec<u8>> {
     BASE64_STANDARD
         .decode(encoded)
@@ -723,5 +862,103 @@ mod tests {
             }
         }
         assert!(failed.is_empty(), "losses in {failed:?}");
+    }
+
+    #[test]
+    fn every_loss_reads_in_both_languages() {
+        use crate::rynk::macros::MacroLoss;
+        use rmk_types_rynk::keyboard_macros::MacroOp;
+        let key = BindingPlace::Key { layer: 1, key: 2 };
+        let losses = [
+            ImportLoss::NativeV1 {
+                place: key,
+                loss: NativeV1Loss::KeyboardAction(rmk_types::action::KeyboardAction::OutputAuto),
+            },
+            ImportLoss::NativeV1 {
+                place: BindingPlace::TapDance { index: 0, field: 3 },
+                loss: NativeV1Loss::TapHoldProfile(Default::default()),
+            },
+            ImportLoss::NativeV1 {
+                place: BindingPlace::ComboOutput { index: 4 },
+                loss: NativeV1Loss::Unsupported,
+            },
+            ImportLoss::Binding {
+                place: key,
+                error: KeyBindingError::UnsupportedKeycode(0x7000),
+            },
+            ImportLoss::Binding {
+                place: key,
+                error: KeyBindingError::NativeV1,
+            },
+            ImportLoss::Encoder {
+                layer: 0,
+                encoder: 1,
+                keycode: 0x7827,
+            },
+            ImportLoss::Macro {
+                index: 3,
+                loss: MacroLoss::Byte(0xD0),
+            },
+            ImportLoss::Macro {
+                index: 3,
+                loss: MacroLoss::UnknownOp(9),
+            },
+            ImportLoss::Macro {
+                index: 3,
+                loss: MacroLoss::Truncated(vec![1]),
+            },
+            ImportLoss::Macro {
+                index: 3,
+                loss: MacroLoss::Keycode(0x4104),
+            },
+            ImportLoss::Macro {
+                index: 3,
+                loss: MacroLoss::Op(MacroOp::PauseForRelease),
+            },
+            ImportLoss::MacroSlot { index: 40 },
+            ImportLoss::MacroSpace {
+                used: 5000,
+                available: 4096,
+            },
+            ImportLoss::Combo {
+                index: 2,
+                error: DynamicError::TooManyComboKeys { max: 4 },
+            },
+            ImportLoss::TapDance {
+                index: 2,
+                error: DynamicError::TooManyMorsePatterns { max: 8 },
+            },
+            ImportLoss::TapDance {
+                index: 2,
+                error: DynamicError::NotAnAction(KeyAction::Morse(1)),
+            },
+            ImportLoss::KeyOverride {
+                index: 2,
+                error: DynamicError::Binding(KeyBindingError::UnsupportedKeycode(0x7800)),
+            },
+            ImportLoss::Slot {
+                kind: SlotKind::Combo,
+                index: 33,
+            },
+            ImportLoss::Slot {
+                kind: SlotKind::TapDance,
+                index: 33,
+            },
+            ImportLoss::Slot {
+                kind: SlotKind::KeyOverride,
+                index: 33,
+            },
+        ];
+        for language in [
+            crate::i18n::Language::English,
+            crate::i18n::Language::Russian,
+        ] {
+            let message = describe_import_losses(language, &losses);
+            assert_eq!(message.lines().count(), losses.len() + 1, "{message}");
+            assert!(
+                !message.contains('{') && !message.contains("rynk_import."),
+                "{message}"
+            );
+        }
     }
 }

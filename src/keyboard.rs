@@ -43,6 +43,13 @@ impl KeyBinding {
         }
     }
 
+    pub fn rynk_action(self) -> Option<rmk_types_rynk::action::KeyAction> {
+        match self {
+            Self::Rynk(action) => Some(action),
+            Self::Vial(_) | Self::Rmk(_) => None,
+        }
+    }
+
     pub fn is_no(self) -> bool {
         match self {
             Self::Vial(value) => value == 0,
