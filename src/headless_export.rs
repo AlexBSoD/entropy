@@ -1545,6 +1545,35 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn console_export_keeps_the_backup_when_a_section_read_fails() {
+        for bluetooth in [false, true] {
+            let _storage = crate::app::app_storage::ScopedTempConfig::new();
+            // A combo read fails while the keyboard stays connected: both the
+            // connect and the staged load fill in an empty combo and go on.
+            let (mut app, _, dir, socket, ctx) = running_instance_with(move |recorder| {
+                if bluetooth {
+                    recorder.set_bluetooth();
+                }
+                scripted_keyboard(recorder, |request| {
+                    (request[..3] == [0xFE, 0x0D, 0x03]).then(|| "HID timeout".to_owned())
+                });
+            });
+            let path = dir.path().join("backup.entlayout");
+            std::fs::write(&path, "previous backup").unwrap();
+
+            let code = console_export(&mut app, &ctx, &socket, export_to(&path, "export fixture"));
+
+            assert_eq!(code, Some(EXIT_INCOMPLETE), "bluetooth: {bluetooth}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "previous backup",
+                "bluetooth: {bluetooth}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn console_export_of_another_keyboard_reports_no_device() {
         let _storage = crate::app::app_storage::ScopedTempConfig::new();
         let (mut app, _, dir, socket, ctx) = running_instance();
