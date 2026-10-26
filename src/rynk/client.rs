@@ -14,7 +14,10 @@ use rmk_types_rynk::combo::Combo;
 use rmk_types_rynk::keyboard_macros::{Macro, MacroOp};
 use rmk_types_rynk::morse::Morse;
 use rmk_types_rynk::protocol::rynk::command::{self, Endpoint};
-use rmk_types_rynk::protocol::rynk::ergohaven::{self, ErgohavenInfo, ERGOHAVEN_RYNK_REVISION};
+use rmk_types_rynk::protocol::rynk::ergohaven::{
+    self, BatteryHalves, ErgohavenInfo, SetSettingRequest, SettingValue, WriteStatus,
+    ERGOHAVEN_RYNK_REVISION,
+};
 use rmk_types_rynk::protocol::rynk::{
     encode_frame, max_wire_size, Cmd, Deframer, DeviceCapabilities, GetComboBulkRequest,
     GetKeymapBulkRequest, GetMorseBulkRequest, ProtocolVersion, RynkError, RynkHeader,
@@ -106,6 +109,10 @@ pub(crate) enum RynkClientError {
         expected: u32,
         actual: u32,
     },
+    /// Staged writes failed to reach flash.
+    WriteFault,
+    /// Staged writes were still pending when the wait ran out.
+    WritesPending(WriteStatus),
     /// A bulk reply that cannot be right, such as an empty page short of the end.
     BulkProtocol {
         cmd: u16,
@@ -155,6 +162,12 @@ impl fmt::Display for RynkClientError {
             Self::DefinitionHash { expected, actual } => write!(
                 f,
                 "board definition hashes to {actual:#010x}, the board reported {expected:#010x}"
+            ),
+            Self::WriteFault => f.write_str("the board failed to store staged writes"),
+            Self::WritesPending(status) => write!(
+                f,
+                "{} keys and {} macro chunks still wait for flash",
+                status.pending_keys, status.pending_macro_chunks
             ),
             Self::BulkProtocol { cmd } => write!(f, "Rynk command {cmd:#06x}: bad bulk page"),
             Self::ReadOnly { cmd } => {
@@ -484,6 +497,75 @@ impl<T: RynkTransport> RynkClient<T> {
         self.request::<ergohaven::SetLayoutOption>(&options)
     }
 
+    /// Every setting id the board serves, ascending, paged by cursor as Vial's
+    /// query is.
+    pub(crate) fn setting_keys(&mut self) -> Result<Vec<u16>, RynkClientError> {
+        let cmd = ergohaven::GetSettingKeys::CMD.raw();
+        let mut keys: Vec<u16> = Vec::new();
+        loop {
+            let after = keys.last().copied().unwrap_or(0);
+            let page = self.request::<ergohaven::GetSettingKeys>(&after)?.0;
+            if page.is_empty() {
+                return Ok(keys);
+            }
+            if page.first().is_some_and(|&first| first <= after) || !page.is_sorted_by(|a, b| a < b)
+            {
+                return Err(RynkClientError::BulkProtocol { cmd });
+            }
+            keys.extend(page);
+        }
+    }
+
+    /// A setting's value in the bytes Vial carries for the same id.
+    pub(crate) fn setting(&mut self, id: u16) -> Result<Vec<u8>, RynkClientError> {
+        Ok(self.request::<ergohaven::GetSetting>(&id)?.0.to_vec())
+    }
+
+    pub(crate) fn set_setting(&mut self, id: u16, value: &[u8]) -> Result<(), RynkClientError> {
+        let cmd = ergohaven::SetSetting::CMD.raw();
+        let value = value.try_into().map_err(|_| RynkClientError::TooLarge {
+            cmd,
+            len: value.len(),
+            max: ergohaven::SETTING_VALUE_MAX_LEN,
+        })?;
+        self.request::<ergohaven::SetSetting>(&SetSettingRequest {
+            id,
+            value: SettingValue(value),
+        })
+    }
+
+    /// Battery levels of the halves; also asks them for fresh ones.
+    pub(crate) fn battery_halves(&mut self) -> Result<BatteryHalves, RynkClientError> {
+        self.request::<ergohaven::GetBatteryHalves>(&())
+    }
+
+    /// Starts writing staged changes and waits until none are pending,
+    /// reporting each status read on the way. `Ok` only once the queue is
+    /// empty and nothing failed; a board without staging is done at once.
+    pub(crate) fn commit_writes(
+        &mut self,
+        poll: Duration,
+        limit: Duration,
+        mut progress: impl FnMut(WriteStatus),
+    ) -> Result<(), RynkClientError> {
+        let deadline = Instant::now() + limit;
+        let mut status = self.request::<ergohaven::CommitWrites>(&())?;
+        loop {
+            progress(status);
+            if status.fault {
+                return Err(RynkClientError::WriteFault);
+            }
+            if status.pending_keys == 0 && status.pending_macro_chunks == 0 {
+                return Ok(());
+            }
+            if Instant::now() + poll > deadline {
+                return Err(RynkClientError::WritesPending(status));
+            }
+            std::thread::sleep(poll);
+            status = self.request::<ergohaven::GetWriteStatus>(&())?;
+        }
+    }
+
     /// Every key of `layer`, row by row, in as few pages as the board sends.
     pub(crate) fn read_keymap_layer(
         &mut self,
@@ -742,6 +824,8 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::testing::*;
     use super::*;
     use rmk_types_rynk::action::Action;
@@ -1084,5 +1168,146 @@ mod tests {
         for _ in 0..100 {
             assert!((1..=u8::MAX).contains(&initial_seq()));
         }
+    }
+
+    #[test]
+    fn settings_page_by_cursor_and_keep_vial_bytes() {
+        let ids: Vec<u16> = (1..=150).map(|i| i * 2).collect();
+        let values = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let store = values.clone();
+        let board = FakeBoard::new(move |header, payload| {
+            if let Some(reply) = handshake(header, 512) {
+                return vec![reply];
+            }
+            vec![match header.cmd {
+                Cmd::GetSettingKeys => {
+                    let after: u16 = postcard::from_bytes(payload).unwrap();
+                    let page: Vec<u16> = ids
+                        .iter()
+                        .copied()
+                        .filter(|&id| id > after)
+                        .take(64)
+                        .collect();
+                    ok(
+                        header,
+                        ergohaven::SettingKeysPage(page.as_slice().try_into().unwrap()),
+                    )
+                }
+                Cmd::SetSetting => {
+                    let request: SetSettingRequest = postcard::from_bytes(payload).unwrap();
+                    store.lock().unwrap().insert(request.id, request.value);
+                    ok(header, ())
+                }
+                Cmd::GetSetting => {
+                    let id: u16 = postcard::from_bytes(payload).unwrap();
+                    match store.lock().unwrap().get(&id) {
+                        Some(value) => ok(header, value.clone()),
+                        None => err(header, RynkError::Invalid),
+                    }
+                }
+                _ => return vec![],
+            }]
+        });
+        let (mut client, _) = RynkClient::connect(board.transport(), quick()).unwrap();
+        let keys = client.setting_keys().unwrap();
+        assert_eq!(keys, (1..=150).map(|i| i * 2).collect::<Vec<u16>>());
+        let pages = board
+            .sent()
+            .iter()
+            .filter(|h| h.cmd == Cmd::GetSettingKeys)
+            .count();
+        assert_eq!(pages, 4, "three pages and the empty one");
+
+        // A layer name: UTF-8 and its NUL, as Vial carries it.
+        let name = b"\xd0\x9d\xd0\xb0\xd0\xb2\0";
+        client.set_setting(200, name).unwrap();
+        assert_eq!(client.setting(200).unwrap(), name);
+        assert!(client
+            .setting(201)
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid"));
+        assert!(matches!(
+            client.set_setting(200, &[0; 29]),
+            Err(RynkClientError::TooLarge {
+                len: 29,
+                max: 28,
+                ..
+            })
+        ));
+        assert_eq!(values.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn setting_pages_that_do_not_advance_are_refused() {
+        let board = FakeBoard::new(|header, _| {
+            vec![handshake(header, 512).unwrap_or_else(|| {
+                ok(
+                    header,
+                    ergohaven::SettingKeysPage([5u16, 3].as_slice().try_into().unwrap()),
+                )
+            })]
+        });
+        let (mut client, _) = RynkClient::connect(board.transport(), quick()).unwrap();
+        assert!(matches!(
+            client.setting_keys(),
+            Err(RynkClientError::BulkProtocol { cmd: 0x7E10 })
+        ));
+    }
+
+    #[test]
+    fn commit_waits_for_an_empty_queue_and_reports_a_fault() {
+        let statuses = |list: Vec<(u16, u16, bool)>| {
+            let list = std::sync::Arc::new(std::sync::Mutex::new(VecDeque::from(list)));
+            FakeBoard::new(move |header, _| {
+                if let Some(reply) = handshake(header, 512) {
+                    return vec![reply];
+                }
+                assert!(matches!(
+                    header.cmd,
+                    Cmd::CommitWrites | Cmd::GetWriteStatus
+                ));
+                let (pending_keys, pending_macro_chunks, fault) =
+                    list.lock().unwrap().pop_front().unwrap_or((0, 0, false));
+                vec![ok(
+                    header,
+                    WriteStatus {
+                        pending_keys,
+                        pending_macro_chunks,
+                        fault,
+                    },
+                )]
+            })
+        };
+        let poll = Duration::from_millis(1);
+
+        let board = statuses(vec![(40, 2, false), (12, 1, false), (0, 0, false)]);
+        let (mut client, _) = RynkClient::connect(board.transport(), quick()).unwrap();
+        let mut seen = Vec::new();
+        client
+            .commit_writes(poll, Duration::from_secs(5), |status| {
+                seen.push(status.pending_keys)
+            })
+            .unwrap();
+        assert_eq!(seen, [40, 12, 0]);
+        let commits: Vec<u16> = board.sent()[4..].iter().map(|h| h.cmd.raw()).collect();
+        assert_eq!(commits, [0x7E50, 0x7E51, 0x7E51]);
+
+        let board = statuses(vec![(3, 0, false), (0, 0, true)]);
+        let (mut client, _) = RynkClient::connect(board.transport(), quick()).unwrap();
+        assert!(matches!(
+            client.commit_writes(poll, Duration::from_secs(5), |_| {}),
+            Err(RynkClientError::WriteFault)
+        ));
+
+        let board = statuses(vec![(9, 0, false); 1000]);
+        let (mut client, _) = RynkClient::connect(board.transport(), quick()).unwrap();
+        assert!(matches!(
+            client.commit_writes(poll, Duration::from_millis(20), |_| {}),
+            Err(RynkClientError::WritesPending(WriteStatus {
+                pending_keys: 9,
+                ..
+            }))
+        ));
     }
 }
