@@ -561,16 +561,12 @@ impl EntropyApp {
     }
 
     fn paste_selected_layer(&mut self, mut desired: LayerSnapshot) {
-        // A layer copied from a Vial board brings native v1 actions.
+        // A layer copied from a board of the other firmware brings its actions.
         for binding in &mut desired.keycodes {
             match self.board_binding(*binding) {
                 Some(taken) => *binding = taken,
                 None => {
-                    self.status_msg = crate::i18n::tr_catalog(
-                        self.app_settings.language,
-                        "rynk_import.not_on_rynk",
-                    )
-                    .into();
+                    self.status_msg = self.board_refusal();
                     return;
                 }
             }
@@ -2729,5 +2725,41 @@ mod tests {
         let held = app.layout.as_ref().unwrap().layers[0][0];
         assert_eq!(crate::rynk::keycode::binding_action(held), Ok(expected));
         assert_eq!(state.lock().unwrap().keymap[0], expected);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_layer_from_a_rynk_board_pastes_onto_a_vial_board_only_unchanged() {
+        use rmk_types_rynk::action::{Action, KeyAction};
+        let ctx = egui::Context::default();
+        let creation_context = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = EntropyApp::new(&creation_context);
+        let positions = [(0.0, 0.0), (1.0, 0.0)];
+        app.layout = Some(layout(&positions, &[0x04, 0x05], &[]));
+        let user = KeyBinding::Rynk(KeyAction::Single(Action::User(0x90)));
+
+        // A board without native v1 cannot hold the action: nothing is pasted.
+        let mut source = layout(&positions, &[0x06, 0x07], &[]);
+        source.layers[0][0] = user;
+        app.layer_clipboard = capture_clipboard(&source, 0);
+        app.paste_selected_layer(app.layer_paste_snapshot().unwrap());
+        assert_eq!(
+            app.layout.as_ref().unwrap().layers[0],
+            bindings(&[0x04, 0x05])
+        );
+        assert!(app.layer_write_task.is_none() && app.pending_layer_write.is_none());
+        assert_eq!(
+            app.status_msg,
+            crate::i18n::tr_catalog(app.app_settings.language, "rynk_import.not_on_vial")
+        );
+
+        // With native v1 the action crosses as the one it upgrades back to.
+        app.keycode_picker.supports_rmk_native_key_actions = true;
+        assert_eq!(
+            app.board_binding(user),
+            Some(KeyBinding::Rmk(rmk_types::action::KeyAction::Single(
+                rmk_types::action::Action::User(0x90)
+            )))
+        );
     }
 }

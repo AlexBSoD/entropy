@@ -58,6 +58,21 @@ pub(crate) fn rynk_board_binding(binding: KeyBinding) -> Option<KeyBinding> {
     }
 }
 
+/// What a Vial board takes for a binding a Rynk board's layer brought: the
+/// action's keycode, or with `native_v1` the native v1 action that upgrades
+/// back to exactly it. `None` when neither holds the action.
+pub(crate) fn vial_board_binding(binding: KeyBinding, native_v1: bool) -> Option<KeyBinding> {
+    let KeyBinding::Rynk(action) = binding else {
+        return Some(binding);
+    };
+    if let Some(keycode) = exact_vial_keycode(action) {
+        return Some(KeyBinding::Vial(keycode));
+    }
+    let v1 = super::native_v1::v1_label_action(action).filter(|_| native_v1)?;
+    let back = super::native_v1::upgrade_native_v1_key_action(v1);
+    (back.losses.is_empty() && identical(back.action, action)).then_some(KeyBinding::Rmk(v1))
+}
+
 /// The action a binding writes to a Rynk board.
 pub(crate) fn binding_action(binding: KeyBinding) -> Result<KeyAction, KeyBindingError> {
     match binding {
@@ -758,5 +773,47 @@ mod tests {
         );
         let rynk = KeyBinding::Rynk(KeyAction::Single(Action::User(200)));
         assert_eq!(rynk_board_binding(rynk), Some(rynk));
+    }
+
+    #[test]
+    fn rynk_actions_cross_to_a_vial_board_only_unchanged() {
+        use rmk_types::action::{Action as V1Action, KeyAction as V1KeyAction};
+        use rmk_types::keycode::HidKeyCode as V1HidKeyCode;
+        use rmk_types::modifier::ModifierCombination as V1Modifiers;
+
+        let a = KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::A)));
+        assert_eq!(
+            vial_board_binding(KeyBinding::Rynk(a), false),
+            Some(KeyBinding::Vial(0x04))
+        );
+
+        let user = KeyBinding::Rynk(KeyAction::Single(Action::User(0x90)));
+        assert_eq!(vial_board_binding(user, false), None);
+        assert_eq!(
+            vial_board_binding(user, true),
+            Some(KeyBinding::Rmk(V1KeyAction::Single(V1Action::User(0x90))))
+        );
+
+        let tap = Action::KeyWithModifier(HidKeyCode::LeftBracket, ModifierCombination::LSHIFT);
+        let hold = Action::Modifier(ModifierCombination::RCTRL);
+        let mod_tap = KeyAction::TapHold(tap, hold, u8::MAX);
+        assert_eq!(
+            vial_board_binding(KeyBinding::Rynk(mod_tap), true),
+            Some(KeyBinding::Rmk(V1KeyAction::TapHold(
+                V1Action::KeyWithModifier(V1HidKeyCode::LeftBracket, V1Modifiers::LSHIFT),
+                V1Action::Modifier(V1Modifiers::RCTRL),
+                Default::default(),
+            )))
+        );
+        // Native v1 has no profile table: another profile would be lost.
+        let profiled = KeyAction::TapHold(tap, hold, 3);
+        assert_eq!(vial_board_binding(KeyBinding::Rynk(profiled), true), None);
+
+        for other in [
+            KeyBinding::Vial(0x05),
+            KeyBinding::Rmk(V1KeyAction::Single(V1Action::User(1))),
+        ] {
+            assert_eq!(vial_board_binding(other, true), Some(other));
+        }
     }
 }

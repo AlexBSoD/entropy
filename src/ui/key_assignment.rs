@@ -28,9 +28,7 @@ impl EntropyApp {
                 return;
             }
             let Some(binding) = self.board_binding(binding) else {
-                self.status_msg =
-                    crate::i18n::tr_catalog(self.app_settings.language, "rynk_import.not_on_rynk")
-                        .into();
+                self.status_msg = self.board_refusal();
                 return;
             };
             let kc_value = binding.vial_keycode();
@@ -256,8 +254,10 @@ impl EntropyApp {
     }
 
     /// `binding` as the connected board takes it: on a Rynk board the native
-    /// v1 actions the picker builds become Rynk ones. `None` when that would
-    /// change the action, and the target stays as it is.
+    /// v1 actions the picker builds become Rynk ones, on a Vial board the Rynk
+    /// actions another board's layer brought become keycodes or native v1.
+    /// `None` when that would change the action, and the target stays as it
+    /// is; `board_refusal` says why.
     pub(super) fn board_binding(
         &self,
         binding: crate::keyboard::KeyBinding,
@@ -265,8 +265,20 @@ impl EntropyApp {
         if self.rynk_board_connected() {
             crate::rynk::keycode::rynk_board_binding(binding)
         } else {
-            Some(binding)
+            crate::rynk::keycode::vial_board_binding(
+                binding,
+                self.keycode_picker.supports_rmk_native_key_actions,
+            )
         }
+    }
+
+    pub(super) fn board_refusal(&self) -> String {
+        let key = if self.rynk_board_connected() {
+            "rynk_import.not_on_rynk"
+        } else {
+            "rynk_import.not_on_vial"
+        };
+        crate::i18n::tr_catalog(self.app_settings.language, key).into()
     }
 
     pub(super) fn handle_secondary_target(
