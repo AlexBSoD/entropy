@@ -3273,7 +3273,7 @@ impl EntropyApp {
                 }
 
                 let size = hid.get_macro_buffer_size()?;
-                let buf = crate::hid::HidDevice::encode_macros(&macro_texts, size);
+                let buf = crate::hid::HidDevice::encode_macros(&macro_texts, size)?;
                 hid.set_macro_buffer(&buf)?;
                 if bundle.version == MACROPAD_ENTLAYOUT_VERSION {
                     let confirmed =

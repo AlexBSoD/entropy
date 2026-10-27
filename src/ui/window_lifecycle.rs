@@ -60,7 +60,12 @@ impl EntropyApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn deferred_exit_has_pending_hid_writes(&self) -> bool {
-        self.keycode_picker.macros_dirty
+        // Macros over the keyboard's memory stay dirty but will not be
+        // written until edited, so they must not hold the window open.
+        (self.keycode_picker.macros_dirty
+            && !self
+                .macro_memory_use()
+                .is_some_and(|(used, capacity)| used > capacity))
             || self.combo_dirty
             || self.combo_term_dirty
             || self.keycode_picker.tap_dance_dirty
@@ -1296,5 +1301,38 @@ mod tests {
                 .count()
                 >= 2
         );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn deferred_exit_does_not_wait_for_macros_over_the_keyboard_memory() {
+        let ctx = egui::Context::default();
+        let creation_context = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = EntropyApp::new(&creation_context);
+        let (hid_device, recorder) = crate::hid::HidDevice::test_device();
+        app.hid_device = Some(hid_device.into());
+        app.device_about_info = Some(DeviceAboutInfo {
+            macro_memory_bytes: Some(16),
+            ..Default::default()
+        });
+        app.keycode_picker.macro_texts = vec![vec![b'x'; 16]];
+        app.keycode_picker.mark_macros_dirty();
+        app.maybe_start_macro_write(&ctx);
+        app.exit_after_hid_write = true;
+
+        let output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            app.finish_deferred_exit_after_hid_write(&ctx);
+        });
+
+        assert!(output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .is_some_and(|viewport| viewport.commands.contains(&egui::ViewportCommand::Close)));
+        assert!(!app.exit_after_hid_write);
+        assert!(app.keycode_picker.macros_dirty);
+        assert!(recorder
+            .requests()
+            .iter()
+            .all(|request| request[0] != 0x0D && request[0] != 0x0F));
     }
 }
