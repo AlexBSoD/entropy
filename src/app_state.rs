@@ -1,7 +1,7 @@
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub(crate) static TRAY_QUIT_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub(crate) static TRAY_RESTORE_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -5641,6 +5641,12 @@ pub struct EntropyApp {
     pub(crate) linux_background_since: Option<f64>,
     #[cfg(target_os = "linux")]
     pub(crate) linux_background_focus_left: bool,
+    #[cfg(target_os = "linux")]
+    pub(crate) linux_tray: Option<crate::linux_tray::LinuxTray>,
+    #[cfg(target_os = "linux")]
+    pub(crate) linux_hidden_to_tray: bool,
+    #[cfg(target_os = "linux")]
+    pub(crate) linux_start_hidden_to_tray_pending: bool,
     pub(crate) close_to_tray_prompt_open: bool,
     pub(crate) close_to_tray_prompt_remember: bool,
     pub(crate) force_close_requested: bool,

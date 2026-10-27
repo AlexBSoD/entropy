@@ -22,7 +22,53 @@ impl EntropyApp {
     #[cfg(target_os = "linux")]
     pub(crate) fn with_start_in_background(mut self) -> Self {
         self.linux_background_since = Some(0.0);
+        self.linux_start_hidden_to_tray_pending = true;
         self
+    }
+
+    /// `--minimized` starts in the tray, or minimized without a panel to show
+    /// the icon. On the first pass eframe has painted nothing yet, so a window
+    /// that goes to the tray never shows.
+    #[cfg(target_os = "linux")]
+    pub(super) fn handle_linux_start_hidden_to_tray(&mut self, ctx: &egui::Context) {
+        if std::mem::take(&mut self.linux_start_hidden_to_tray_pending) {
+            self.hide_window_to_linux_tray(ctx);
+        }
+    }
+
+    /// Hides the window to the tray, where the icon brings it back, and only
+    /// minimizes it where no panel shows the icon.
+    #[cfg(target_os = "linux")]
+    fn hide_window_to_linux_tray(&mut self, ctx: &egui::Context) {
+        if self.linux_tray.is_none() {
+            self.linux_tray = crate::linux_tray::LinuxTray::spawn(ctx, self.app_settings.language);
+        }
+        let online = self.linux_tray.as_ref().is_some_and(|tray| tray.online());
+        ctx.send_viewport_cmd(crate::linux_tray::background_command(online));
+        self.linux_hidden_to_tray = online;
+        self.linux_background_since = Some(ctx.input(|i| i.time));
+        self.linux_background_focus_left = false;
+    }
+
+    /// Keeps the window within reach of the tray: it comes back when the panel
+    /// that shows the icon goes away, and a window left minimized because no
+    /// panel was up yet, as at login, hides once one is.
+    #[cfg(target_os = "linux")]
+    pub(super) fn sync_linux_tray(&mut self, ctx: &egui::Context) {
+        let language = self.app_settings.language;
+        if let Some(tray) = self.linux_tray.as_mut() {
+            tray.set_language(language);
+        }
+        let online = self.linux_tray.as_ref().is_some_and(|tray| tray.online());
+        match crate::linux_tray::tray_sync(
+            self.linux_hidden_to_tray,
+            online,
+            self.linux_background_since.is_some(),
+        ) {
+            crate::linux_tray::TraySync::Restore => self.restore_from_tray(ctx),
+            crate::linux_tray::TraySync::Hide => self.hide_window_to_linux_tray(ctx),
+            crate::linux_tray::TraySync::Stay => {}
+        }
     }
 
     // Wayland compositors do not tell clients that a window is minimized, so
@@ -197,6 +243,7 @@ impl EntropyApp {
         #[cfg(target_os = "linux")]
         {
             self.linux_background_since = None;
+            self.linux_hidden_to_tray = false;
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
@@ -257,7 +304,7 @@ impl EntropyApp {
             return;
         }
 
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
         if self.consume_tray_quit_request() {
             #[cfg(not(target_arch = "wasm32"))]
             if self.defer_exit_until_hid_write_returns(ctx) {
@@ -340,9 +387,7 @@ impl EntropyApp {
         }
         #[cfg(target_os = "linux")]
         {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-            self.linux_background_since = Some(ctx.input(|i| i.time));
-            self.linux_background_focus_left = false;
+            self.hide_window_to_linux_tray(ctx);
             self.status_msg = background_status.into();
             return;
         }
@@ -368,6 +413,10 @@ impl EntropyApp {
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             {
                 self.tray_icon = None;
+            }
+            #[cfg(target_os = "linux")]
+            {
+                self.linux_tray = None;
             }
         }
         save_app_settings(&self.app_settings);
@@ -828,7 +877,7 @@ impl EntropyApp {
         }
     }
 
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     fn consume_tray_quit_request(&mut self) -> bool {
         if !TRAY_QUIT_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
             return false;
@@ -838,7 +887,7 @@ impl EntropyApp {
         true
     }
 
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     pub(super) fn handle_tray_quit_request(&mut self, ctx: &egui::Context) {
         if should_keep_vial_unlock_visible(self.unlock_open, self.vial_unlock_polling)
             && TRAY_QUIT_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed)
@@ -861,7 +910,7 @@ impl EntropyApp {
         }
     }
 
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     pub(super) fn handle_tray_restore_request(&mut self, ctx: &egui::Context) {
         if TRAY_RESTORE_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
             self.restore_from_tray(ctx);
@@ -1216,6 +1265,51 @@ mod tests {
             app.restore_from_tray(ui.ctx())
         });
         assert!(app.linux_background_since.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn root_commands(output: &egui::FullOutput) -> Vec<egui::ViewportCommand> {
+        output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.commands.clone())
+            .unwrap_or_default()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_window_without_a_tray_only_minimizes() {
+        // Tests never start a panel: the window must stay within reach.
+        let ctx = egui::Context::default();
+        let mut app = EntropyApp::new_inert_for_test();
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.minimize_window_to_tray(ui.ctx())
+        });
+        assert_eq!(
+            root_commands(&output),
+            [egui::ViewportCommand::Minimized(true)]
+        );
+        assert!(!app.linux_hidden_to_tray);
+        assert!(app.linux_tray.is_none());
+        assert!(app.linux_background_since.is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_minimized_launch_decides_on_the_first_pass() {
+        let ctx = egui::Context::default();
+        let mut app = EntropyApp::new_inert_for_test().with_start_in_background();
+        let mut frame = || {
+            root_commands(&ctx.run_ui(egui::RawInput::default(), |ui| {
+                app.handle_linux_start_hidden_to_tray(ui.ctx())
+            }))
+        };
+        // No panel in tests: minimized rather than out of reach, and only once.
+        assert_eq!(frame(), [egui::ViewportCommand::Minimized(true)]);
+        assert!(frame().is_empty());
+        assert!(!app.linux_start_hidden_to_tray_pending);
+        assert!(!app.linux_hidden_to_tray);
+        assert!(app.linux_background_since.is_some());
     }
 
     #[test]
