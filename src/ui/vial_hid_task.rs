@@ -339,7 +339,7 @@ fn run_vial_hid_operation_with_progress(
             .map(|()| VialHidOutcome::EncoderWritten),
         VialHidOperation::MacroWrite { macros, .. } => {
             let size = hid.get_macro_buffer_size()?;
-            let buffer = crate::hid::HidDevice::encode_macros(&macros, size)?;
+            let buffer = hid.encode_macros(&macros, size)?;
             hid.set_macro_buffer(&buffer)
                 .map(VialHidOutcome::MacrosWritten)
         }
@@ -2342,6 +2342,28 @@ mod tests {
 
         app.device_about_info.as_mut().unwrap().macro_memory_bytes = Some(2048);
         assert_eq!(app.macro_memory_use(), Some((5, 2048)));
+    }
+
+    #[test]
+    fn macro_memory_use_counts_a_rynk_board_pool_in_ops() {
+        let mut app = EntropyApp::new_inert_for_test();
+        let mut layout = crate::keyboard::KeyboardLayout::from_vial_json(&serde_json::json!({
+            "matrix": {"rows": 1, "cols": 1},
+            "layouts": {"keymap": [["0,0"]]}
+        }))
+        .unwrap();
+        layout.firmware = FirmwareProtocol::Rynk;
+        app.layout = Some(layout);
+        app.keycode_picker.macro_count = 2;
+        app.keycode_picker.macro_texts = vec![b"ab".to_vec(), Vec::new()];
+        app.device_about_info = Some(DeviceAboutInfo {
+            macro_memory_bytes: Some(4096),
+            ..Default::default()
+        });
+
+        // Two characters of two bytes and the slot's length byte, then one
+        // byte for the empty slot; Vial's buffer would count 4.
+        assert_eq!(app.macro_memory_use(), Some((6, 4096)));
     }
 
     #[test]

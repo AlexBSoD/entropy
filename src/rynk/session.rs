@@ -208,6 +208,13 @@ impl RynkSession {
                 ops
             })
             .collect();
+        // The board would refuse the SetMacro that passes its pool, after the
+        // ones before it went through.
+        let used = macros::macro_space_used(wanted.iter().map(Vec::as_slice), max);
+        let available = self.capabilities().macro_space_size as usize;
+        if used > available {
+            bail!("macros need {used} bytes, but the keyboard's macro memory is {available} bytes");
+        }
         let changed: Vec<(u8, Vec<MacroOp>)> = wanted
             .iter()
             .enumerate()
@@ -803,6 +810,44 @@ mod tests {
         let state = state.lock().unwrap();
         assert_eq!(state.macros[0], [MacroOp::Char(b'o'), MacroOp::Char(b'k')]);
         assert_eq!(state.macros[1], [MacroOp::Char(b'a')]);
+    }
+
+    #[test]
+    fn a_macro_write_past_the_pool_is_refused_before_any_write() {
+        let mut stored = Stored::new(1, 2, 1);
+        stored.macros = vec![Vec::new()];
+        stored.capabilities.max_macros = 1;
+        stored.capabilities.macro_space_size = 8;
+        let (session, state) = session("macro pool", stored);
+
+        // Four characters of two bytes each and the slot's length byte.
+        let error = session.set_macro_buffer(b"abcd\0").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "macros need 9 bytes, but the keyboard's macro memory is 8 bytes"
+        );
+        assert!(state.lock().unwrap().writes().is_empty());
+
+        session.set_macro_buffer(b"abc\0").unwrap();
+        assert_eq!(state.lock().unwrap().macros[0].len(), 3);
+    }
+
+    #[test]
+    fn vial_bytes_are_no_limit_for_a_rynk_board_pool() {
+        let mut stored = Stored::new(1, 2, 1);
+        stored.macros = vec![Vec::new()];
+        stored.capabilities.max_macros = 1;
+        stored.capabilities.macro_space_size = 16;
+        let (session, state) = session("macro delays", stored);
+        let device = DeviceSession::from(session);
+
+        // Five 10 ms delays: 21 bytes in Vial's buffer, 11 of the board's pool.
+        let delays: Vec<u8> = (0..5).flat_map(|_| [0x01, 0x04, 11, 1]).collect();
+        let size = device.get_macro_buffer_size().unwrap();
+        let buffer = device.encode_macros(&[delays], size).unwrap();
+        device.set_macro_buffer(&buffer).unwrap();
+
+        assert_eq!(state.lock().unwrap().macros[0], vec![MacroOp::Delay(10); 5]);
     }
 
     #[test]

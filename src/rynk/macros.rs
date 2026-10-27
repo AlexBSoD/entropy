@@ -171,6 +171,13 @@ pub(crate) fn macro_space_used<'a>(
     used + slots.saturating_sub(count)
 }
 
+/// Bytes the editor's Vial `macros` take of a Rynk board's pool once they are
+/// ops: a typed character costs two there, one in Vial's buffer.
+pub(crate) fn vial_macros_space_used(macros: &[Vec<u8>], slots: usize) -> usize {
+    let ops: Vec<Vec<MacroOp>> = macros.iter().map(|bytes| vial_macro_ops(bytes).0).collect();
+    macro_space_used(ops.iter().map(Vec::as_slice), slots)
+}
+
 fn varint_len(value: usize) -> usize {
     match value {
         0..=0x7F => 1,

@@ -228,6 +228,17 @@ impl DeviceSession {
         }
     }
 
+    /// The macros in Vial's buffer for `set_macro_buffer`. A Vial board's
+    /// buffer is `size` bytes; a Rynk board counts its own pool of ops when it
+    /// takes them, so Vial's bytes are no limit there.
+    pub(crate) fn encode_macros(&self, macros: &[Vec<u8>], size: u16) -> Result<Vec<u8>> {
+        let size = match self {
+            Self::Vial(_) => size,
+            Self::Rynk(_) => u16::MAX,
+        };
+        crate::hid::HidDevice::encode_macros(macros, size)
+    }
+
     /// Writes the macro buffer and returns, by macro, what of it the board
     /// does not run: a Vial board stores the bytes as they are.
     pub(crate) fn set_macro_buffer(
