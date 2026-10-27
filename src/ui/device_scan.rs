@@ -433,12 +433,28 @@ impl EntropyApp {
         }
 
         // The board picked last comes back on its own, however many others
-        // are listed. It has been opened before, so no udev gate applies.
-        if self.selected_device.is_none() && self.layout.is_none() && !was_loading {
+        // are listed, and takes over from a board connected without a pick,
+        // such as the one left alone while it was gone: picking that board
+        // would have replaced the memory. It has been opened before, so no
+        // udev gate applies.
+        if !was_loading {
+            let idle = self.selected_device.is_none() && self.layout.is_none();
             let remembered = self.remembered_device.as_ref().and_then(|identity| {
-                unique_reconnect_device_index(self.device_manager.devices(), identity)
+                let index = unique_reconnect_device_index(self.device_manager.devices(), identity)?;
+                let other_connected = previous_device
+                    .as_ref()
+                    .is_some_and(|device| !identity.matches(device));
+                (idle || other_connected).then_some(index)
             });
             if let Some(index) = remembered {
+                // The previous board's index is from the last scan; the
+                // handoff in start_connect needs it in this one.
+                self.selected_device = previous_device_key.as_ref().and_then(|key| {
+                    self.device_manager
+                        .devices()
+                        .iter()
+                        .position(|dev| dev.display_name_cache_key() == *key)
+                });
                 self.start_connect(index);
                 return;
             }
@@ -820,6 +836,44 @@ mod tests {
         assert!(
             requests.try_recv().is_err(),
             "the twin was opened as the pick"
+        );
+    }
+
+    #[test]
+    fn the_picked_board_takes_over_from_the_one_left_alone() {
+        let mut app = EntropyApp::new_inert_for_test();
+        let (launch_tx, requests) = mpsc::channel();
+        app.test_connect_requests = Some(launch_tx);
+        let picked = scan_test_device("Picked");
+        let other = scan_test_device("Other");
+        app.device_manager
+            .replace_devices(vec![picked.clone(), other.clone()]);
+        app.connect_picked_device(0);
+        assert_eq!(requests.try_recv().unwrap().0.name, "Picked");
+        connected_to(&mut app, 0);
+
+        // Unplugged: the board left alone is connected on its own.
+        app.apply_device_scan_result(vec![other.clone()]);
+        assert_eq!(requests.try_recv().unwrap().0.name, "Other");
+        connected_to(&mut app, 0);
+        app.apply_device_scan_result(vec![other.clone()]);
+        assert!(requests.try_recv().is_err());
+
+        // Back: the picked board takes over, and keeps the connection after.
+        app.apply_device_scan_result(vec![other.clone(), picked.clone()]);
+        assert_eq!(requests.try_recv().unwrap().0.name, "Picked");
+        connected_to(&mut app, 1);
+        app.apply_device_scan_result(vec![other.clone(), picked.clone()]);
+        assert!(requests.try_recv().is_err(), "the connection moved again");
+
+        // Picking the other board makes it the one remembered.
+        app.connect_picked_device(0);
+        assert_eq!(requests.try_recv().unwrap().0.name, "Other");
+        connected_to(&mut app, 0);
+        app.apply_device_scan_result(vec![other, picked]);
+        assert!(
+            requests.try_recv().is_err(),
+            "the manual choice was overridden"
         );
     }
 
