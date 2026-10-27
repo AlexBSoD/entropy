@@ -304,6 +304,7 @@ pub(crate) struct TestHidRecorder {
     responses: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<[u8; MSG_LEN]>>>,
     responder: std::sync::Arc<std::sync::Mutex<Option<TestHidResponder>>>,
     output_connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    retired: std::sync::Arc<std::sync::atomic::AtomicBool>,
     output_hook: std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnMut(&[u8]) + Send>>>>,
     bluetooth: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -340,6 +341,17 @@ impl TestHidRecorder {
     pub(crate) fn disconnect_output(&self) {
         self.output_connected
             .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Retires the scripted connection as a timed-out helper retires its
+    /// proxy: every later request fails, and the transport reports it.
+    pub(crate) fn retire_transport(&self) {
+        self.retired
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn is_retired(&self) -> bool {
+        self.retired.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn ensure_output_connected(&self) -> Result<()> {
@@ -663,6 +675,7 @@ impl HidDevice {
             responder: Default::default(),
             output_hook: Default::default(),
             output_connected: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            retired: Default::default(),
             bluetooth: Default::default(),
         };
         let device = Self {
@@ -767,6 +780,8 @@ impl HidDevice {
     pub(crate) fn is_transport_available(&self) -> bool {
         match &self.backend {
             HidBackend::Proxy(proxy) => proxy.is_available(),
+            #[cfg(test)]
+            HidBackend::Test { recorder, .. } => !recorder.is_retired(),
             _ => true,
         }
     }
@@ -1000,6 +1015,9 @@ impl HidDevice {
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .push(request);
+                if recorder.is_retired() {
+                    bail!("HID helper timed out or disconnected");
+                }
 
                 let fault = {
                     let mut pending = fault_after_requests

@@ -1670,6 +1670,51 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn an_export_that_loses_the_connection_hands_it_to_recovery() {
+        for bluetooth in [false, true] {
+            let _storage = crate::app::app_storage::ScopedTempConfig::new();
+            let lose = std::sync::Arc::new(AtomicBool::new(false));
+            let armed = lose.clone();
+            let (mut app, _, dir, socket, ctx) = running_instance_with(move |recorder| {
+                if bluetooth {
+                    recorder.set_bluetooth();
+                }
+                let transport = recorder.clone();
+                scripted_keyboard_answering(
+                    recorder,
+                    move |_| {
+                        // The helper times out under the export, retiring the
+                        // connection the GUI lent; the keyboard stays listed.
+                        armed.swap(false, Ordering::AcqRel).then(|| {
+                            transport.retire_transport();
+                            Err("HID helper timed out".to_owned())
+                        })
+                    },
+                    None,
+                );
+            });
+            lose.store(true, Ordering::Release);
+            let path = dir.path().join("backup.entlayout");
+
+            let code = console_export(&mut app, &ctx, &socket, export_to(&path, "export fixture"));
+
+            assert_ne!(code, Some(EXIT_OK), "bluetooth: {bluetooth}");
+            assert!(!path.exists());
+            assert!(
+                app.hid_device.is_none(),
+                "the retired connection stayed installed, bluetooth: {bluetooth}"
+            );
+            // The fixture's device is a USB one: its recovery is the cleanup
+            // after which the next scan opens it again.
+            assert!(
+                app.layout.is_none(),
+                "the lost connection was kept, bluetooth: {bluetooth}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn running_instance_answers_a_console_export_without_writes() {
         let _storage = crate::app::app_storage::ScopedTempConfig::new();
         let (mut app, recorder, dir, socket, ctx) = running_instance();

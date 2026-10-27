@@ -632,11 +632,14 @@ impl EntropyApp {
                 &worker_progress,
                 &worker_cancel,
             );
-            let disconnected = outcome
-                .as_ref()
-                .err()
-                .map(crate::hid::is_disconnect_error)
-                .unwrap_or(false);
+            let disconnected = match &outcome {
+                Err(error) => crate::hid::is_disconnect_error(error),
+                // A lent export answers its console whatever became of the
+                // connection; whether the connection survived it is told here.
+                #[cfg(unix)]
+                Ok(VialHidOutcome::ConsoleExported(_)) => !hid_device.is_transport_available(),
+                Ok(_) => false,
+            };
             if let Some(label) = diagnostic_label {
                 match &outcome {
                     Ok(_) => log::debug!(
@@ -1061,6 +1064,15 @@ impl EntropyApp {
             Ok(VialHidOutcome::ConsoleExported(reply)) => {
                 if let VialHidOperation::ConsoleExport { request, .. } = result.operation {
                     self.finish_console_export(request, reply);
+                }
+                if result.disconnected {
+                    // The export lost the connection it borrowed: recover it
+                    // as after any operation's disconnect.
+                    self.finish_vial_hid_error(
+                        result.operation,
+                        "HID device disconnected during a console export".to_owned(),
+                        true,
+                    );
                 }
             }
             Err(error) => {
