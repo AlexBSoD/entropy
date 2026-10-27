@@ -343,7 +343,7 @@ fn run_vial_hid_operation_with_progress(
             .map(|()| VialHidOutcome::EncoderWritten),
         VialHidOperation::MacroWrite { macros, .. } => {
             let size = hid.get_macro_buffer_size()?;
-            let buffer = crate::hid::HidDevice::encode_macros(&macros, size);
+            let buffer = crate::hid::HidDevice::encode_macros(&macros, size)?;
             hid.set_macro_buffer(&buffer)?;
             Ok(VialHidOutcome::MacrosWritten)
         }
@@ -689,6 +689,23 @@ impl EntropyApp {
         }
 
         let revision = self.keycode_picker.macro_edit_revision;
+        if let Some((used, capacity)) = self
+            .macro_memory_use()
+            .filter(|(used, capacity)| used > capacity)
+        {
+            // The firmware cannot hold these macros; keep the edit dirty so
+            // shortening them retries, and do not spend a round trip on it.
+            self.keycode_picker.macro_attempted_revision = Some(revision);
+            self.status_msg = crate::i18n::tr_catalog_format(
+                self.app_settings.language,
+                "status_messages.macro_memory_full",
+                &[
+                    ("used", &used.to_string()),
+                    ("capacity", &capacity.to_string()),
+                ],
+            );
+            return;
+        }
         let operation = VialHidOperation::MacroWrite {
             macros: self.keycode_picker.macro_texts.clone(),
             revision,
@@ -2180,6 +2197,77 @@ mod tests {
         app.keycode_picker.mark_macros_dirty();
         assert_ne!(app.keycode_picker.macro_edit_revision, failed_revision);
         app.maybe_start_macro_write(&ctx);
+        assert!(app.vial_hid_task_active());
+        poll_until_vial_hid_idle(&mut app, &ctx);
+        assert!(!app.keycode_picker.macros_dirty);
+    }
+
+    #[test]
+    fn macro_memory_use_counts_the_vial_buffer_only_when_the_board_reports_its_size() {
+        let mut app = EntropyApp::new_inert_for_test();
+        app.keycode_picker.macro_texts = vec![b"abc".to_vec(), Vec::new()];
+        assert_eq!(app.macro_memory_use(), None);
+
+        app.device_about_info = Some(DeviceAboutInfo::default());
+        assert_eq!(app.macro_memory_use(), None);
+
+        app.device_about_info.as_mut().unwrap().macro_memory_bytes = Some(2048);
+        assert_eq!(app.macro_memory_use(), Some((5, 2048)));
+    }
+
+    #[test]
+    fn macro_write_over_the_keyboard_memory_is_not_started_and_stays_dirty() {
+        let ctx = egui::Context::default();
+        let creation_context = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = EntropyApp::new(&creation_context);
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        app.hid_device = Some(hid);
+        app.device_about_info = Some(DeviceAboutInfo {
+            macro_memory_bytes: Some(16),
+            ..Default::default()
+        });
+        app.keycode_picker.macro_texts = vec![vec![b'x'; 15], Vec::new()];
+        app.keycode_picker.mark_macros_dirty();
+        let revision = app.keycode_picker.macro_edit_revision;
+
+        app.maybe_start_macro_write(&ctx);
+
+        assert!(!app.vial_hid_task_active());
+        assert!(app.hid_device.is_some());
+        assert!(recorder.requests().is_empty());
+        assert!(app.keycode_picker.macros_dirty);
+        assert_eq!(app.keycode_picker.macro_attempted_revision, Some(revision));
+        assert_eq!(
+            app.status_msg,
+            crate::i18n::tr_catalog_format(
+                app.app_settings.language,
+                "status_messages.macro_memory_full",
+                &[("used", "17"), ("capacity", "16")],
+            )
+        );
+
+        app.keycode_picker.macro_texts[0].pop();
+        app.keycode_picker.mark_macros_dirty();
+        assert_eq!(app.macro_memory_use(), Some((16, 16)));
+        app.maybe_start_macro_write(&ctx);
+        assert!(app.vial_hid_task_active());
+        poll_until_vial_hid_idle(&mut app, &ctx);
+        assert!(!app.keycode_picker.macros_dirty);
+    }
+
+    #[test]
+    fn macro_write_is_not_blocked_when_the_board_did_not_report_its_memory() {
+        let ctx = egui::Context::default();
+        let creation_context = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = EntropyApp::new(&creation_context);
+        let (hid, _) = crate::hid::HidDevice::test_device();
+        app.hid_device = Some(hid);
+        app.device_about_info = Some(DeviceAboutInfo::default());
+        app.keycode_picker.macro_texts = vec![vec![b'x'; 15], Vec::new()];
+        app.keycode_picker.mark_macros_dirty();
+
+        app.maybe_start_macro_write(&ctx);
+
         assert!(app.vial_hid_task_active());
         poll_until_vial_hid_idle(&mut app, &ctx);
         assert!(!app.keycode_picker.macros_dirty);

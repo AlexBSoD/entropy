@@ -430,6 +430,7 @@ app_settings_import_report_title = "Отчёт импорта настроек �
 app_settings_import_failed_title = "Импорт настроек приложения не выполнен"
 import_app_settings_failed = "Импорт настроек приложения не удался: {error}"
 macro_write_error = "Ошибка записи макросов: {error}"
+macro_memory_full = "Макросы не сохранены: нужно {used} байт, а в клавиатуре только {capacity}"
 combo_write_error = "Ошибка записи combo: {error}"
 combo_timeout_write_error = "Ошибка записи combo timeout: {error}"
 tap_dance_write_error = "Ошибка записи Tap Dance: {error}"
@@ -982,6 +983,8 @@ plus_up = "+ Up"
 release_a_key = "Отпустить клавишу"
 plus_delay = "+ Задержка"
 pause_in_milliseconds = "Пауза в миллисекундах"
+memory_use = "Память макросов: {used} из {capacity} байт"
+memory_use_shared_by_all_macros = "Эту память делят все макросы клавиатуры"
 
 [tap_dance_editor]
 title = "Tap Dance"
