@@ -417,7 +417,11 @@ fn production_connect_and_loading_scan_keep_existing_background_owner() {
     assert!(matches!(app.connect_state, ConnectState::Loading { .. }));
     assert_eq!(app.qmk_hid_hosts.len(), 1);
     app.apply_device_scan_result(vec![b, a.clone()]);
-    assert_eq!(app.selected_device, Some(0));
+    assert_eq!(
+        app.selected_device
+            .map(|index| app.device_manager.devices()[index].path.clone()),
+        Some(requested.path.clone())
+    );
     assert!(app.qmk_hid_hosts.contains_key(&a.path));
     app.clear_connected_keyboard_state("Open failed: scripted B");
     assert!(app.qmk_hid_hosts.contains_key(&a.path));
