@@ -9,6 +9,13 @@ fn should_keep_vial_unlock_visible(unlock_open: bool, unlock_polling: bool) -> b
     unlock_open || unlock_polling
 }
 
+/// Closing asks whether to keep running when something needs Entropy in the
+/// background, or when a tray icon can bring the window back. Only Linux tells
+/// about the tray: elsewhere only Text Expander does, as before.
+fn close_to_tray_prompt_needed(text_expander_enabled: bool, tray_shows_icon: bool) -> bool {
+    text_expander_enabled || tray_shows_icon
+}
+
 #[cfg(target_os = "linux")]
 const LINUX_BACKGROUND_INPUT_GRACE_SECS: f64 = 1.0;
 
@@ -287,7 +294,14 @@ impl EntropyApp {
     }
 
     fn close_to_tray_prompt_needed(&self) -> bool {
-        self.app_settings.text_expander_enabled
+        #[cfg(target_os = "linux")]
+        let tray_shows_icon = self
+            .linux_tray
+            .as_ref()
+            .map_or_else(crate::linux_tray::host_running, |tray| tray.online());
+        #[cfg(not(target_os = "linux"))]
+        let tray_shows_icon = false;
+        close_to_tray_prompt_needed(self.app_settings.text_expander_enabled, tray_shows_icon)
     }
 
     pub(super) fn handle_close_to_tray(&mut self, ctx: &egui::Context) {
@@ -451,7 +465,9 @@ impl EntropyApp {
         let (title, body, remember, close_label, tray_label, cancel_label) =
             linux_close_to_tray_prompt_copy(
                 lang,
-                crate::smart_input::text_expander_runs_outside_entropy_process(),
+                self.app_settings
+                    .text_expander_enabled
+                    .then(crate::smart_input::text_expander_runs_outside_entropy_process),
             );
         #[cfg(target_os = "macos")]
         let (title, body, remember, close_label, tray_label, cancel_label) = match lang {
@@ -1128,9 +1144,11 @@ fn plist_xml_escape(value: &str) -> String {
 }
 
 #[cfg(target_os = "linux")]
+/// `input_method_backend` is `None` with Text Expander off: the prompt then
+/// only comes up because the tray can bring the window back.
 fn linux_close_to_tray_prompt_copy(
     lang: crate::i18n::Language,
-    input_method_backend: bool,
+    input_method_backend: Option<bool>,
 ) -> (
     &'static str,
     &'static str,
@@ -1140,7 +1158,7 @@ fn linux_close_to_tray_prompt_copy(
     &'static str,
 ) {
     match (lang, input_method_backend) {
-        (crate::i18n::Language::Russian, true) => (
+        (crate::i18n::Language::Russian, Some(true)) => (
             "Закрыть Entropy?",
             "Text Expander продолжит работать через IBus после закрытия Entropy",
             "Запомнить выбор",
@@ -1148,7 +1166,7 @@ fn linux_close_to_tray_prompt_copy(
             "В фон",
             "Отмена",
         ),
-        (crate::i18n::Language::English, true) => (
+        (crate::i18n::Language::English, Some(true)) => (
             "Close Entropy?",
             "Text Expander keeps running through IBus after Entropy closes",
             "Remember my choice",
@@ -1156,7 +1174,7 @@ fn linux_close_to_tray_prompt_copy(
             "Keep running",
             "Cancel",
         ),
-        (crate::i18n::Language::Russian, false) => (
+        (crate::i18n::Language::Russian, Some(false)) => (
             "Закрыть Entropy?",
             "Text Expander работает через IBus; фоновое окно Entropy его не заменяет",
             "Запомнить выбор",
@@ -1164,9 +1182,25 @@ fn linux_close_to_tray_prompt_copy(
             "В фон",
             "Отмена",
         ),
-        (crate::i18n::Language::English, false) => (
+        (crate::i18n::Language::English, Some(false)) => (
             "Close Entropy?",
             "Text Expander uses IBus; keeping the Entropy window open does not replace it",
+            "Remember my choice",
+            "Close",
+            "Keep running",
+            "Cancel",
+        ),
+        (crate::i18n::Language::Russian, None) => (
+            "Закрыть Entropy?",
+            "Синхронизация раскладки и live-данные остановятся, если закрыть Entropy",
+            "Запомнить выбор",
+            "Закрыть",
+            "В фон",
+            "Отмена",
+        ),
+        (crate::i18n::Language::English, None) => (
+            "Close Entropy?",
+            "Layout sync and live keyboard data stop if Entropy is closed",
             "Remember my choice",
             "Close",
             "Keep running",
@@ -1310,6 +1344,59 @@ mod tests {
         assert!(!app.linux_start_hidden_to_tray_pending);
         assert!(!app.linux_hidden_to_tray);
         assert!(app.linux_background_since.is_some());
+    }
+
+    #[test]
+    fn close_asks_to_keep_running_where_the_tray_brings_the_window_back() {
+        assert!(close_to_tray_prompt_needed(true, false));
+        assert!(close_to_tray_prompt_needed(false, true));
+        assert!(close_to_tray_prompt_needed(true, true));
+        // Nothing runs in the background, and no icon to come back from.
+        assert!(!close_to_tray_prompt_needed(false, false));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn close_request() -> egui::RawInput {
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .expect("root viewport exists")
+            .events
+            .push(egui::ViewportEvent::Close);
+        input
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_close_without_a_tray_asks_only_for_text_expander() {
+        // Tests never see a panel, as a session without a tray.
+        let ctx = egui::Context::default();
+        let mut app = EntropyApp::new_inert_for_test();
+        app.app_settings.minimize_to_tray_on_close = false;
+        app.app_settings.close_to_tray_behavior = CloseToTrayBehavior::Ask;
+
+        let output = ctx.run_ui(close_request(), |ui| app.handle_close_to_tray(ui.ctx()));
+        assert!(!root_commands(&output).contains(&egui::ViewportCommand::CancelClose));
+        assert!(!app.close_to_tray_prompt_open);
+
+        app.app_settings.text_expander_enabled = true;
+        let output = ctx.run_ui(close_request(), |ui| app.handle_close_to_tray(ui.ctx()));
+        assert!(root_commands(&output).contains(&egui::ViewportCommand::CancelClose));
+        assert!(app.close_to_tray_prompt_open);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_close_prompt_for_the_tray_alone_leaves_text_expander_out() {
+        use crate::i18n::Language;
+
+        for lang in [Language::English, Language::Russian] {
+            let (_, tray_alone, ..) = linux_close_to_tray_prompt_copy(lang, None);
+            let (_, text_expander, ..) = linux_close_to_tray_prompt_copy(lang, Some(true));
+            assert!(!tray_alone.contains("Text Expander"));
+            assert!(text_expander.contains("Text Expander"));
+        }
     }
 
     #[test]

@@ -109,6 +109,27 @@ fn spawn_tray(_tray: EntropyTray) -> Result<ksni::blocking::Handle<EntropyTray>,
     Err(ksni::Error::WontShow)
 }
 
+/// Whether a panel in this session shows StatusNotifierItems, before there is
+/// an icon to tell: such a panel runs the watcher the icon registers with.
+#[cfg(not(test))]
+pub(crate) fn host_running() -> bool {
+    let Ok(connection) = zbus::blocking::Connection::session() else {
+        return false;
+    };
+    let Ok(dbus) = zbus::blocking::fdo::DBusProxy::new(&connection) else {
+        return false;
+    };
+    let Ok(watcher) = zbus::names::BusName::try_from("org.kde.StatusNotifierWatcher") else {
+        return false;
+    };
+    dbus.name_has_owner(watcher).unwrap_or(false)
+}
+
+#[cfg(test)]
+pub(crate) fn host_running() -> bool {
+    false
+}
+
 struct EntropyTray {
     ctx: egui::Context,
     language: Language,
