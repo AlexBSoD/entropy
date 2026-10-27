@@ -3388,7 +3388,8 @@ enum IbusSignal {
     Absent {
         started: zbus::MessageStream,
     },
-    /// IBus runs, but its engine signal could not be subscribed to.
+    /// IBus runs, or may run, but its engine signal could not be subscribed
+    /// to.
     Unreached,
 }
 
@@ -3397,41 +3398,50 @@ enum IbusSignal {
 #[cfg(target_os = "linux")]
 async fn layout_signal_streams() -> Option<LayoutSignalStreams> {
     let session = zbus::Connection::session().await.ok()?;
-    let kde_serves = zbus::fdo::DBusProxy::new(&session)
-        .await
-        .ok()?
+    let ibus = async { zbus::connection::Builder::ibus()?.build().await };
+    layout_signal_streams_on(&session, ibus, gnome_desktop_session()).await
+}
+
+/// [`layout_signal_streams`] on `session`, with `ibus` connecting to IBus.
+#[cfg(target_os = "linux")]
+async fn layout_signal_streams_on(
+    session: &zbus::Connection,
+    ibus: impl std::future::Future<Output = zbus::Result<zbus::Connection>>,
+    gnome: bool,
+) -> Option<LayoutSignalStreams> {
+    let bus = zbus::fdo::DBusProxy::new(session).await.ok()?;
+    let kde_serves = bus
         .name_has_owner(KDE_LAYOUT_DESTINATION.try_into().ok()?)
         .await
         .ok()?;
     let kde = if kde_serves {
-        Some(layout_signal_stream(&session, KDE_LAYOUT_INTERFACE, KDE_LAYOUT_PATH).await?)
+        Some(layout_signal_stream(session, KDE_LAYOUT_INTERFACE, KDE_LAYOUT_PATH).await?)
     } else {
         None
     };
     // Watched before IBus is looked for, so that one starting in between is
     // not missed.
-    let started = ibus_started_stream(&session).await?;
+    let started = ibus_started_stream(session).await?;
     // With no IBus daemon there is no engine switch to miss. With one, its
     // switches count too: the Entropy engine takes precedence over KDE.
-    let ibus = match zbus::connection::Builder::ibus() {
-        Ok(builder) => match builder.build().await {
-            Ok(ibus) => match layout_signal_stream(&ibus, IBUS_INTERFACE, IBUS_PATH).await {
-                Some(stream) => IbusSignal::Subscribed(stream),
-                None => IbusSignal::Unreached,
-            },
-            Err(error) if ibus_is_absent(&error) => IbusSignal::Absent { started },
-            Err(_) => IbusSignal::Unreached,
+    let ibus = match ibus.await {
+        Ok(ibus) => match layout_signal_stream(&ibus, IBUS_INTERFACE, IBUS_PATH).await {
+            Some(stream) => IbusSignal::Subscribed(stream),
+            None => IbusSignal::Unreached,
         },
-        Err(_) => IbusSignal::Absent { started },
+        // `ibus address` also fails when the command cannot run or prints no
+        // address, so that alone does not mean IBus is absent. IBus owns its
+        // session bus name while it runs: one that already runs announces no
+        // start, and following KDE alone would miss its switches for good.
+        Err(zbus::Error::Address(_)) => {
+            match bus.name_has_owner(IBUS_DESTINATION.try_into().ok()?).await {
+                Ok(false) => IbusSignal::Absent { started },
+                _ => IbusSignal::Unreached,
+            }
+        }
+        Err(_) => IbusSignal::Unreached,
     };
-    followed_layout_signals(kde, ibus, gnome_desktop_session())
-}
-
-/// `ibus address` named no daemon to connect to. Any other failure is one of
-/// a daemon that runs.
-#[cfg(target_os = "linux")]
-fn ibus_is_absent(error: &zbus::Error) -> bool {
-    matches!(error, zbus::Error::Address(_))
+    followed_layout_signals(kde, ibus, gnome)
 }
 
 /// The streams to follow, if together they announce every layout change.
