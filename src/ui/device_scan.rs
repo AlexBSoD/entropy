@@ -95,14 +95,28 @@ fn in_listed_order(listed: &[Device], mut scanned: Vec<Device>) -> Vec<Device> {
 
 impl EntropyApp {
     /// Connects the board the user picked, and remembers it to connect it
-    /// again whenever it comes back.
+    /// again whenever it comes back. Only an identity that names this board
+    /// alone is remembered: same-model boards without distinct serials cannot
+    /// be told apart once one of them is gone.
     pub(super) fn connect_picked_device(&mut self, device_idx: usize) {
-        self.remembered_device = self
-            .device_manager
-            .devices()
+        let devices = self.device_manager.devices();
+        self.remembered_device = devices
             .get(device_idx)
-            .map(Device::stable_identity);
+            .map(Device::stable_identity)
+            .filter(|identity| devices.iter().filter(|d| identity.matches(d)).count() == 1);
         self.start_connect(device_idx);
+    }
+
+    /// Forgets the picked board once a scan lists two boards its identity
+    /// names: from then on neither proves to be the one picked.
+    fn forget_ambiguous_remembered_device(&mut self) {
+        let ambiguous = self.remembered_device.as_ref().is_some_and(|identity| {
+            let devices = self.device_manager.devices();
+            devices.iter().filter(|d| identity.matches(d)).count() > 1
+        });
+        if ambiguous {
+            self.remembered_device = None;
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -285,6 +299,7 @@ impl EntropyApp {
                 })
             });
             self.device_manager.replace_devices(devices);
+            self.forget_ambiguous_remembered_device();
             if let Some(previous) = previous {
                 let changed = selected.is_some_and(|i| {
                     let current = &self.device_manager.devices()[i];
@@ -310,6 +325,7 @@ impl EntropyApp {
             let reconnect_device_index =
                 unique_reconnect_device_index(&devices, &reconnect.identity);
             self.device_manager.replace_devices(devices);
+            self.forget_ambiguous_remembered_device();
             self.retain_connected_qmk_hid_host_bridges();
             let connected_display_name_keys: std::collections::HashSet<String> = self
                 .device_manager
@@ -339,6 +355,7 @@ impl EntropyApp {
         let selecting_device = matches!(self.connect_state, ConnectState::SelectingDevice);
 
         self.device_manager.replace_devices(devices);
+        self.forget_ambiguous_remembered_device();
         self.retain_connected_qmk_hid_host_bridges();
         let connected_display_name_keys: std::collections::HashSet<String> = self
             .device_manager
@@ -725,6 +742,85 @@ mod tests {
         unplugged(&mut app);
         app.apply_device_scan_result(vec![phenom, replugged, mini]);
         assert_eq!(requests.try_recv().unwrap().0.name, "Phenom");
+    }
+
+    /// The same model without a serial: nothing tells two of them apart.
+    fn serial_less_twin(path: &str) -> Device {
+        let mut twin = scan_test_device("Twin");
+        twin.serial_number.clear();
+        twin.path = format!("/nonexistent/entropy-test-{path}");
+        twin.instance_token = format!("{path}-instance");
+        twin
+    }
+
+    /// The picked board, opened and loaded.
+    fn connected_to(app: &mut EntropyApp, index: usize) {
+        let device = app.device_manager.devices()[index].clone();
+        app.connect_state = ConnectState::Idle;
+        app.selected_device = Some(index);
+        app.layout = Some(KeyboardLayout {
+            name: device.name.clone(),
+            rows: 0,
+            cols: 0,
+            keys: Vec::new(),
+            encoders: Vec::new(),
+            layers: vec![Vec::new()],
+            encoder_layers: vec![Vec::new()],
+            layer_names: vec!["Base".to_owned()],
+            custom_keycodes: Vec::new(),
+            layout_options: Vec::new(),
+            live_features: Default::default(),
+            supports_rgb: false,
+            lighting_mode: None,
+            firmware: FirmwareProtocol::Vial,
+        });
+        app.hid_device = Some(crate::hid::HidDevice::test_device().0.into());
+    }
+
+    #[test]
+    fn a_board_its_twin_could_be_is_not_connected_again() {
+        let mut app = EntropyApp::new_inert_for_test();
+        let (launch_tx, requests) = mpsc::channel();
+        app.test_connect_requests = Some(launch_tx);
+        let a = serial_less_twin("a");
+        let b = serial_less_twin("b");
+        let other = scan_test_device("Other");
+        // Both twins gone and the connection with them.
+        let gone = |app: &mut EntropyApp| {
+            app.connect_state = ConnectState::Idle;
+            app.selected_device = None;
+            app.layout = None;
+            app.hid_device = None;
+        };
+
+        // Picked while its twin was listed: the pick names either.
+        app.device_manager
+            .replace_devices(vec![a.clone(), b.clone(), other.clone()]);
+        app.connect_picked_device(0);
+        assert_eq!(requests.try_recv().unwrap().0.path, a.path);
+        assert!(app.remembered_device.is_none());
+        gone(&mut app);
+        app.apply_device_scan_result(vec![b.clone(), other.clone()]);
+        assert!(
+            requests.try_recv().is_err(),
+            "the twin was opened as the pick"
+        );
+
+        // Picked alone, then listed beside its twin: neither proves to be it.
+        app.device_manager
+            .replace_devices(vec![a.clone(), other.clone()]);
+        app.connect_picked_device(0);
+        assert_eq!(requests.try_recv().unwrap().0.path, a.path);
+        assert!(app.remembered_device.is_some());
+        connected_to(&mut app, 0);
+        app.apply_device_scan_result(vec![a, b.clone(), other.clone()]);
+        assert!(app.remembered_device.is_none());
+        gone(&mut app);
+        app.apply_device_scan_result(vec![b, other]);
+        assert!(
+            requests.try_recv().is_err(),
+            "the twin was opened as the pick"
+        );
     }
 
     #[test]
