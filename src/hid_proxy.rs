@@ -1005,10 +1005,10 @@ mod tests {
     }
 
     /// Fills the admission budget with failed startups whose workers `gate`
-    /// holds, and returns how many startups that took. A startup can also
-    /// fail before it takes a slot, when its deadline runs out while capacity
-    /// is busy: it holds nothing, so startups go on until every slot is held.
-    fn hold_failed_startups(gate: &ExitGate, first_timeout: Duration) -> usize {
+    /// holds. A startup can also fail before it takes a slot, when its
+    /// deadline runs out while capacity is busy: it holds nothing, so
+    /// startups go on until every slot is held, however many that takes.
+    fn hold_failed_startups(gate: &ExitGate) {
         let held = || {
             REGISTRY
                 .lock()
@@ -1024,15 +1024,10 @@ mod tests {
                 attempts < 20,
                 "failed startups never took the admission slots"
             );
-            let timeout = if attempts == 0 {
-                first_timeout
-            } else {
-                Duration::from_millis(80)
-            };
             assert!(HidProxy::start(
                 &device(&format!("failed-{attempts}")),
                 spec("startup-silence", gate.flag(), None),
-                timeout,
+                Duration::from_millis(80),
             )
             .is_err());
             attempts += 1;
@@ -1045,7 +1040,6 @@ mod tests {
                     .iter()
                     .all(|entry| entry.slot.reaped.load(Ordering::Acquire))
         });
-        attempts
     }
 
     /// With every slot held by unreclaimed work, a fresh startup is refused
@@ -1536,7 +1530,7 @@ mod tests {
     fn real_helper_failed_startups_cannot_accumulate_unreclaimed_workers() {
         let _guard = serial_test();
         let gate = ExitGate::closed();
-        hold_failed_startups(&gate, Duration::from_millis(80));
+        hold_failed_startups(&gate);
         assert_admission_stays_closed();
         gate.open();
         empty_registry();
@@ -1550,12 +1544,17 @@ mod tests {
     fn real_helper_a_startup_that_fails_before_its_slot_holds_none() {
         let _guard = serial_test();
         let gate = ExitGate::closed();
-        // The first startup's deadline is gone before admission: it fails
-        // without a slot, and two more startups are needed to hold both.
-        assert_eq!(
-            hold_failed_startups(&gate, Duration::ZERO),
-            MAX_UNSETTLED_HELPERS + 1
-        );
+        // Its deadline is gone before admission: the startup fails without
+        // registering anything, and both slots are still free for the
+        // startups after it, however many of them fail before theirs.
+        assert!(HidProxy::start(
+            &device("failed-early"),
+            spec("startup-silence", gate.flag(), None),
+            Duration::ZERO,
+        )
+        .is_err());
+        assert!(REGISTRY.lock().unwrap().entries.is_empty());
+        hold_failed_startups(&gate);
         assert_admission_stays_closed();
         gate.open();
         empty_registry();
