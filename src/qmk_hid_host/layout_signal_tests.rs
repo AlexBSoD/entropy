@@ -270,14 +270,96 @@ fn an_ibus_that_runs_unfollowed_keeps_the_lane_polling() {
             followed_layout_signals(None, IbusSignal::Subscribed(ibus().await), false).is_none()
         );
     });
+}
 
-    // `ibus address` failing names no daemon; a refused connection is one's.
-    assert!(ibus_is_absent(&zbus::Error::Address(
-        "ibus terminated with code: 1".into()
-    )));
-    let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
-    let refused = zbus::Error::InputOutput(Arc::new(refused));
-    assert!(!ibus_is_absent(&refused));
+/// Plays the session bus daemon, which knows whether a name has an owner.
+/// About any other name its answer is an error.
+struct NameOwners(&'static [(&'static str, bool)]);
+
+#[zbus::interface(name = "org.freedesktop.DBus")]
+impl NameOwners {
+    fn name_has_owner(&self, name: &str) -> zbus::fdo::Result<bool> {
+        self.0
+            .iter()
+            .find(|(owned, _)| *owned == name)
+            .map(|(_, has_owner)| *has_owner)
+            .ok_or_else(|| zbus::fdo::Error::Failed(format!("no owner known for {name}")))
+    }
+}
+
+/// A session bus that knows the owners in `names`. The bus object is served
+/// as the connection is built: one added after it could miss a first call.
+fn session_bus(
+    names: &'static [(&'static str, bool)],
+) -> (zbus::blocking::Connection, zbus::blocking::Connection) {
+    let (session, bus) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+    let guid = zbus::Guid::generate();
+    let bus = thread::spawn(move || {
+        zbus::blocking::connection::Builder::unix_stream(bus)
+            .server(guid)
+            .expect("server guid")
+            .p2p()
+            .serve_at("/org/freedesktop/DBus", NameOwners(names))
+            .expect("bus object")
+            .build()
+            .expect("bus connection")
+    });
+    let session = zbus::blocking::connection::Builder::unix_stream(session)
+        .p2p()
+        .build()
+        .expect("session connection");
+    (session, bus.join().expect("bus thread"))
+}
+
+#[test]
+fn an_ibus_address_that_fails_is_no_proof_that_ibus_is_absent() {
+    let address_failed = || async {
+        Err::<zbus::Connection, _>(zbus::Error::Address("ibus terminated with code: 1".into()))
+    };
+    futures_lite::future::block_on(async {
+        // IBus owns its name, so it runs and only its address is missing.
+        // It announces no start, and KDE alone would be followed for good.
+        let (session, _bus) =
+            session_bus(&[(KDE_LAYOUT_DESTINATION, true), (IBUS_DESTINATION, true)]);
+        assert!(
+            layout_signal_streams_on(session.inner(), address_failed(), false)
+                .await
+                .is_none()
+        );
+        // Whether IBus owns its name cannot be told either.
+        let (session, _bus) = session_bus(&[(KDE_LAYOUT_DESTINATION, true)]);
+        assert!(
+            layout_signal_streams_on(session.inner(), address_failed(), false)
+                .await
+                .is_none()
+        );
+        // Its name has no owner: no IBus runs, and its start is watched.
+        let (session, _bus) =
+            session_bus(&[(KDE_LAYOUT_DESTINATION, true), (IBUS_DESTINATION, false)]);
+        let followed = layout_signal_streams_on(session.inner(), address_failed(), false)
+            .await
+            .expect("KDE alone announces every switch");
+        assert!(followed.kde.is_some() && followed.ibus.is_none());
+        assert!(followed.ibus_started.is_some());
+        // A refused connection counts as an IBus that runs, whatever the bus
+        // says.
+        let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        let refused =
+            async { Err::<zbus::Connection, _>(zbus::Error::InputOutput(Arc::new(refused))) };
+        assert!(layout_signal_streams_on(session.inner(), refused, false)
+            .await
+            .is_none());
+        // The address is back: IBus is followed along with KDE.
+        let (session, _bus) =
+            session_bus(&[(KDE_LAYOUT_DESTINATION, true), (IBUS_DESTINATION, true)]);
+        let (ibus, _daemon) = p2p_pair();
+        let reached = async { Ok::<_, zbus::Error>(ibus.inner().clone()) };
+        let followed = layout_signal_streams_on(session.inner(), reached, false)
+            .await
+            .expect("KDE and IBus announce every switch");
+        assert!(followed.kde.is_some() && followed.ibus.is_some());
+        assert!(followed.ibus_started.is_none());
+    });
 }
 
 #[test]
