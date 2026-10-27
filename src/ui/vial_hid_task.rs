@@ -207,6 +207,8 @@ pub(super) enum VialHidOperation {
     ConsoleExport {
         device: crate::device::Device,
         deadline: std::time::Instant,
+        /// The console request it answers.
+        request: u64,
     },
 }
 
@@ -401,11 +403,11 @@ fn run_vial_hid_operation_with_progress(
                 .map(VialHidOutcome::Deferred)
         }
         #[cfg(unix)]
-        VialHidOperation::ConsoleExport { device, deadline } => {
-            Ok(VialHidOutcome::ConsoleExported(
-                super::headless_export::export_lent_keyboard(hid, device, deadline, cancel),
-            ))
-        }
+        VialHidOperation::ConsoleExport {
+            device, deadline, ..
+        } => Ok(VialHidOutcome::ConsoleExported(
+            super::headless_export::export_lent_keyboard(hid, device, deadline, cancel),
+        )),
     }
 }
 
@@ -1056,7 +1058,11 @@ impl EntropyApp {
                 self.finish_deferred_device_load(payload);
             }
             #[cfg(unix)]
-            Ok(VialHidOutcome::ConsoleExported(reply)) => self.finish_console_export(reply),
+            Ok(VialHidOutcome::ConsoleExported(reply)) => {
+                if let VialHidOperation::ConsoleExport { request, .. } = result.operation {
+                    self.finish_console_export(request, reply);
+                }
+            }
             Err(error) => {
                 self.finish_vial_hid_error(result.operation, error, result.disconnected);
             }
@@ -1232,10 +1238,13 @@ impl EntropyApp {
                 pictograms.upload_due = None;
             }
             #[cfg(unix)]
-            VialHidOperation::ConsoleExport { .. } => {
-                self.finish_console_export(super::headless_export::Reply::Failed {
-                    message: format!("The export stopped: {error}"),
-                });
+            VialHidOperation::ConsoleExport { request, .. } => {
+                self.finish_console_export(
+                    *request,
+                    super::headless_export::Reply::Failed {
+                        message: format!("The export stopped: {error}"),
+                    },
+                );
             }
             _ => {}
         }

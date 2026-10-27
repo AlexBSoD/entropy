@@ -12,6 +12,7 @@ use super::*;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::atomic::AtomicU64;
 use std::sync::{mpsc, Arc};
 
 const PROTOCOL_VERSION: u32 = 1;
@@ -359,8 +360,13 @@ pub(crate) fn export_lent_keyboard(
     }
 }
 
+/// Numbers console exports, so a worker's answer reaches the console whose
+/// export it ran and no other.
+static NEXT_CONSOLE_EXPORT: AtomicU64 = AtomicU64::new(0);
+
 /// A console export waiting for the connection, or running on it.
 pub(crate) struct PendingConsoleExport {
+    id: u64,
     reply: mpsc::Sender<Reply>,
     generation: u64,
     device: Device,
@@ -390,9 +396,17 @@ impl EntropyApp {
             .as_ref()
             .is_some_and(|pending| pending.cancel.load(Ordering::Relaxed))
         {
-            // Its console has gone: stop the export and take the next one.
+            // Its console has gone: stop the export. One already running keeps
+            // the channel until its worker answers, so the next console
+            // neither waits behind that worker nor gets its answer.
             self.cancel_console_export();
-            self.pending_console_export = None;
+            if self
+                .pending_console_export
+                .as_ref()
+                .is_some_and(|pending| !pending.started)
+            {
+                self.pending_console_export = None;
+            }
         }
         if self.pending_console_export.is_none() {
             let Some(job) = self
@@ -405,6 +419,7 @@ impl EntropyApp {
             match self.accept_console_export(job.device.as_deref()) {
                 Ok(device) => {
                     self.pending_console_export = Some(PendingConsoleExport {
+                        id: NEXT_CONSOLE_EXPORT.fetch_add(1, Ordering::Relaxed),
                         reply: job.reply,
                         generation: self.connection_generation,
                         device,
@@ -420,7 +435,7 @@ impl EntropyApp {
             }
         }
         if let Some(reply) = self.console_export_progress(ctx) {
-            self.finish_console_export(reply);
+            self.answer_console_export(reply);
         }
     }
 
@@ -466,6 +481,7 @@ impl EntropyApp {
         let operation = vial_hid_task::VialHidOperation::ConsoleExport {
             device: pending.device.clone(),
             deadline: pending.deadline,
+            request: pending.id,
         };
         match self.start_vial_hid_operation(ctx, operation) {
             vial_hid_task::VialHidTaskStart::Started => {
@@ -485,9 +501,21 @@ impl EntropyApp {
     }
 
     /// Hands the answer to the console waiting for it.
-    pub(crate) fn finish_console_export(&mut self, reply: Reply) {
+    fn answer_console_export(&mut self, reply: Reply) {
         if let Some(pending) = self.pending_console_export.take() {
             let _ = pending.reply.send(reply);
+        }
+    }
+
+    /// Hands a worker's answer to the console whose export it ran; an answer
+    /// for any other request is dropped.
+    pub(crate) fn finish_console_export(&mut self, request: u64, reply: Reply) {
+        if self
+            .pending_console_export
+            .as_ref()
+            .is_some_and(|pending| pending.id == request)
+        {
+            self.answer_console_export(reply);
         }
     }
 }

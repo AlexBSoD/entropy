@@ -1626,6 +1626,50 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn a_hung_up_export_never_answers_the_next_console() {
+        use std::io::Write;
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (gate, at_gate) = DefinitionGate::new();
+        let (mut app, _, dir, socket, ctx) = running_instance_with(move |recorder| {
+            scripted_keyboard_answering(
+                recorder,
+                move |request| {
+                    at_gate(request);
+                    None
+                },
+                None,
+            );
+        });
+        gate.arm();
+        let mut first = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        first
+            .write_all(b"{\"command\":\"export-layout\",\"version\":1,\"device\":null,\"timeout_ms\":20000}\n")
+            .unwrap();
+        let started = Instant::now();
+        gate.wait(&mut app, &ctx, started);
+
+        // A second console asks while the first export holds the keyboard,
+        // and the first hangs up: its export is cancelled with the second
+        // one already queued behind it.
+        let path = dir.path().join("backup.entlayout");
+        let second = start_console_export(&socket, export_to(&path, "export fixture"));
+        drop(first);
+        std::thread::sleep(Duration::from_millis(500));
+        for _ in 0..5 {
+            frame(&mut app, &ctx, started);
+        }
+        gate.open();
+
+        assert_eq!(
+            finish_console_export(&mut app, &ctx, second),
+            Some(EXIT_OK),
+            "the second console got the first export's answer"
+        );
+        assert!(path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn running_instance_answers_a_console_export_without_writes() {
         let _storage = crate::app::app_storage::ScopedTempConfig::new();
         let (mut app, recorder, dir, socket, ctx) = running_instance();
