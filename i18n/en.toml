@@ -165,7 +165,7 @@ key_legends_russian = "English + Russian"
 close_to_tray_label = "Close to tray"
 close_to_tray_tooltip = "Hide Entropy in the system tray instead of quitting when the window is closed"
 run_in_background_label = "Run in background"
-run_in_background_tooltip = "Keep Entropy running in the background instead of quitting when the window is closed"
+run_in_background_tooltip = "Keep Entropy running in the background instead of quitting when the window is closed. Where the panel shows a tray icon, the window hides there and the icon brings it back"
 launch_at_startup_label = "Launch at startup"
 launch_at_startup_tooltip = "Start Entropy automatically when you sign in"
 launch_minimized_label = "Launch minimized"
@@ -410,6 +410,10 @@ volume = "Volume"
 media = "Media"
 default = "default"
 unknown = "Unknown"
+
+[tray]
+open = "Open Entropy"
+quit = "Quit Entropy"
 
 [status_messages]
 macros_saved = "Macros saved"

@@ -175,8 +175,9 @@ impl EntropyApp {
         }
     }
 
-    // Linux has no tray: background mode only minimizes the window, so device
-    // polling stays on, but nobody sees the window repaint.
+    // On Linux the background window is minimized, or hidden to the tray where
+    // it can come back from there; device polling stays on either way, but
+    // nobody sees the window repaint.
     fn main_window_in_background(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
@@ -1461,9 +1462,13 @@ impl eframe::App for EntropyApp {
             // Cache the winit window/display handles so native file dialogs can be
             // parented to the main window instead of opening behind it.
             self.cache_parent_window_handles(frame);
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            #[cfg(target_os = "linux")]
+            self.handle_linux_start_hidden_to_tray(ctx);
+            #[cfg(target_os = "linux")]
+            self.sync_linux_tray(ctx);
+            #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
             self.handle_tray_quit_request(ctx);
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
             self.handle_tray_restore_request(ctx);
             self.handle_close_to_tray(ctx);
             #[cfg(any(target_os = "windows", target_os = "macos"))]
