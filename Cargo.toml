@@ -106,3 +106,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-cli
 
 [dev-dependencies]
 egui_kittest = { version = "0.34", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# Peer-to-peer connections let D-Bus tests run a peer without a session bus.
+zbus = { version = "5.16", features = ["p2p"] }

@@ -2001,7 +2001,13 @@ impl EntropyApp {
             let keep = same_mode
                 && bridge.matches_shared_output(shared_output.as_ref())
                 && *protocol == bridge.protocol();
-            if !keep && same_mode {
+            // A successor on the same shared owner is started below. Its first
+            // write clears whatever modes it drops (HostOutputLease::write), so
+            // this bridge must not shut the display down before that successor
+            // has even claimed the owner.
+            let same_owner =
+                shared_output.is_some() && bridge.matches_shared_output(shared_output.as_ref());
+            if !keep && (same_mode || same_owner) {
                 // Transfer the same service, not a request to clear its display.
                 bridge.suppress_shutdown();
             }

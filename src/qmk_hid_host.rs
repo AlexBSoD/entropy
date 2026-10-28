@@ -23,6 +23,17 @@ const SM62_VENDOR_ID: u16 = 0xE126;
 const SM62_PRODUCT_ID: u16 = 0x00B2;
 const DEFAULT_LAYOUT_CODES: [&str; 2] = ["en", "ru"];
 const LAYOUT_RESEND_INTERVAL: Duration = Duration::from_secs(10);
+const LAYOUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const LAYOUT_FOLLOWED_POLL_INTERVAL: Duration = LAYOUT_RESEND_INTERVAL;
+// An idle bridge still wakes this often, which bounds how late the Linux
+// device-path check notices an unplugged keyboard. Tests use a long recheck
+// so every path that must reach a bridge early has to prove its own wake.
+#[cfg(not(test))]
+const BRIDGE_IDLE_RECHECK: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const BRIDGE_IDLE_RECHECK: Duration = Duration::from_secs(60);
+// Application-layout snapshots change from the UI without waking the bridge.
+const BRIDGE_APPLICATION_LAYOUT_TICK: Duration = Duration::from_millis(20);
 #[cfg(target_os = "windows")]
 const MEDIA_POLL_INTERVAL: Duration = Duration::from_millis(500);
 #[cfg(not(target_os = "windows"))]
@@ -189,12 +200,104 @@ struct DesktopState {
     epoch: [u64; 3],
     snapshot: DesktopSnapshot,
     stopped: bool,
+    // Bridges to wake when a lane they subscribed to stores news for them.
+    listeners: Vec<([bool; 3], std::sync::Weak<BridgeWake>)>,
+    // The desktop announces every layout change (LayoutEvents): the layout
+    // lane polls rarely, samples when `layout_due` is set, and has its source
+    // drop what it read from the old list when `layout_list_stale` is.
+    layout_following: bool,
+    layout_due: bool,
+    layout_list_stale: bool,
+}
+
+/// Lets a desktop source tell the layout lane what the desktop announced.
+/// Holds the service weakly, so a stopped service ends whoever holds it.
+#[derive(Clone)]
+struct LayoutEvents {
+    shared: std::sync::Weak<DesktopShared>,
+}
+
+impl LayoutEvents {
+    /// The active layout may have changed; with `list_edited`, the list of
+    /// layouts did too. Returns false once the service is gone.
+    fn changed(&self, list_edited: bool) -> bool {
+        self.update(|state| {
+            state.layout_due = true;
+            state.layout_list_stale |= list_edited;
+        })
+    }
+
+    /// Whether every layout change is announced from now on, so that the
+    /// lane can stop polling for them. Returns false once the service is gone.
+    fn following(&self, following: bool) -> bool {
+        self.update(|state| state.layout_following = following)
+    }
+
+    fn update(&self, change: impl FnOnce(&mut DesktopState)) -> bool {
+        let Some(shared) = self.shared.upgrade() else {
+            return false;
+        };
+        let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.stopped {
+            return false;
+        }
+        change(&mut state);
+        shared.wake.notify_all();
+        true
+    }
 }
 
 #[derive(Default)]
 struct DesktopShared {
     state: Mutex<DesktopState>,
     wake: std::sync::Condvar,
+    #[cfg(test)]
+    lane_passes: [AtomicU64; 3],
+}
+
+#[cfg(test)]
+impl DesktopShared {
+    /// Stores a sample as a lane does, waking the subscribed bridges, for
+    /// tests that drive the snapshot without lane threads.
+    fn store_for_test(&self, update: impl FnOnce(&mut DesktopSnapshot)) {
+        let state = &mut *self.state.lock().unwrap();
+        update(&mut state.snapshot);
+        for (_, bridge) in &state.listeners {
+            if let Some(bridge) = bridge.upgrade() {
+                bridge.wake();
+            }
+        }
+    }
+}
+
+/// Wakes a host bridge before its next deadline: a desktop sample it uses
+/// changed, it was stopped, or it was handed a transport. A wake that lands
+/// while the bridge is busy is kept for its next wait, so none is lost.
+#[derive(Default)]
+struct BridgeWake {
+    pending: Mutex<bool>,
+    signal: std::sync::Condvar,
+    #[cfg(test)]
+    waits: AtomicU64,
+}
+
+impl BridgeWake {
+    fn wake(&self) {
+        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.signal.notify_one();
+    }
+
+    /// Waits up to `timeout`; returns whether a wake ended the wait.
+    fn wait(&self, timeout: Duration) -> bool {
+        #[cfg(test)]
+        self.waits.fetch_add(1, Ordering::Relaxed);
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut pending, _) = self
+            .signal
+            .wait_timeout_while(pending, timeout, |pending| !*pending)
+            .unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *pending)
+    }
 }
 
 struct DesktopOwner {
@@ -218,6 +321,12 @@ trait DesktopSource {
     fn volume(&mut self) -> Option<u8>;
     fn layout(&mut self) -> Option<u8>;
     fn media(&mut self) -> Option<MediaInfo>;
+    /// Starts following the layout changes the desktop announces. Called on
+    /// the layout lane before its first sample; a source that cannot follow
+    /// them is polled.
+    fn follow_layout(&mut self, _events: LayoutEvents) {}
+    /// The desktop's list of layouts changed: forget anything read from it.
+    fn layout_list_changed(&mut self) {}
 }
 
 struct NativeDesktopSource {
@@ -252,6 +361,22 @@ impl DesktopSource for NativeDesktopSource {
     fn media(&mut self) -> Option<MediaInfo> {
         current_media_info()
     }
+
+    #[cfg(target_os = "linux")]
+    fn follow_layout(&mut self, events: LayoutEvents) {
+        if let Err(error) = thread::Builder::new()
+            .name("layout-events".to_owned())
+            .spawn(move || follow_layout_signals(events))
+        {
+            log::warn!("layout signals unavailable, polling the layout instead: {error}");
+        }
+    }
+
+    fn layout_list_changed(&mut self) {
+        // Rebuild on the next sample instead of mapping onto the old list.
+        self.layout = None;
+        self.last_layout_attempt = Instant::now() - Duration::from_secs(60);
+    }
 }
 
 impl HostDataService {
@@ -261,18 +386,25 @@ impl HostDataService {
         // One process-wide service, three bounded lanes. Construct platform
         // handles on their owning thread; no OS query or source owns HID.
         // A slow layout/media API must never freeze fresh volume feedback.
-        for index in 0..3 {
+        for (index, name) in ["desktop-volume", "desktop-layout", "desktop-media"]
+            .into_iter()
+            .enumerate()
+        {
             let worker = shared.clone();
             let source = source.clone();
-            thread::spawn(move || run_desktop_service(worker, source(), index));
+            thread::Builder::new()
+                .name(name.to_owned())
+                .spawn(move || run_desktop_service(worker, source(), index))
+                .expect("failed to spawn a desktop host-data lane");
         }
         Self {
             owner: Arc::new(DesktopOwner { shared }),
         }
     }
 
-    fn subscribe(&self, mode: HostDataMode) -> DesktopSubscription {
+    fn subscribe(&self, mode: HostDataMode, bridge: &Arc<BridgeWake>) -> DesktopSubscription {
         let enabled = [mode.volume, mode.layout, mode.media];
+        let bridge = Arc::downgrade(bridge);
         let mut state = self
             .owner
             .shared
@@ -287,10 +419,12 @@ impl HostDataService {
                 state.demand[index] += 1;
             }
         }
+        state.listeners.push((enabled, bridge.clone()));
         self.owner.shared.wake.notify_all();
         DesktopSubscription {
             service: self.clone(),
             enabled,
+            bridge,
         }
     }
 
@@ -308,12 +442,20 @@ impl HostDataService {
 struct DesktopSubscription {
     service: HostDataService,
     enabled: [bool; 3],
+    bridge: std::sync::Weak<BridgeWake>,
 }
 
 impl Drop for DesktopSubscription {
     fn drop(&mut self) {
         let shared = &self.service.owner.shared;
         let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(listener) = state
+            .listeners
+            .iter()
+            .position(|(_, bridge)| bridge.ptr_eq(&self.bridge))
+        {
+            state.listeners.swap_remove(listener);
+        }
         for (index, enabled) in self.enabled.iter().enumerate() {
             if *enabled {
                 state.demand[index] -= 1;
@@ -334,7 +476,21 @@ impl Drop for DesktopSubscription {
 }
 
 fn run_desktop_service(shared: Arc<DesktopShared>, mut source: impl DesktopSource, index: usize) {
-    let interval = [VOLUME_POLL_INTERVAL, Duration::from_millis(100), MEDIA_POLL_INTERVAL][index];
+    let polled = [VOLUME_POLL_INTERVAL, LAYOUT_POLL_INTERVAL, MEDIA_POLL_INTERVAL][index];
+    // A followed layout is sampled when the desktop announces a change, and
+    // otherwise only now and then, in case an announcement went missing.
+    let interval = |state: &DesktopState| {
+        if index == 1 && state.layout_following {
+            LAYOUT_FOLLOWED_POLL_INTERVAL
+        } else {
+            polled
+        }
+    };
+    if index == 1 {
+        source.follow_layout(LayoutEvents {
+            shared: Arc::downgrade(&shared),
+        });
+    }
     let mut last_poll = Instant::now() - Duration::from_secs(60);
     let mut last_epoch = 0;
     loop {
@@ -344,8 +500,13 @@ fn run_desktop_service(shared: Arc<DesktopShared>, mut source: impl DesktopSourc
         }
         if state.stopped { return; }
         let epoch = state.epoch[index];
-        let due = last_epoch != epoch || last_poll.elapsed() >= interval;
+        let announced = index == 1 && std::mem::take(&mut state.layout_due);
+        let relist = index == 1 && std::mem::take(&mut state.layout_list_stale);
+        let due = announced || last_epoch != epoch || last_poll.elapsed() >= interval(&state);
         drop(state);
+        if relist {
+            source.layout_list_changed();
+        }
         if due {
             last_epoch = epoch;
             last_poll = Instant::now();
@@ -364,20 +525,47 @@ fn run_desktop_service(shared: Arc<DesktopShared>, mut source: impl DesktopSourc
             if state.stopped { return; }
             // Old in-flight queries cannot populate a re-enabled session.
             if state.demand[index] > 0 && state.epoch[index] == epoch {
-                match index {
-                    0 => state.snapshot.volume = sample.volume,
-                    1 => state.snapshot.layout = sample.layout,
+                // Every media sample is news: bridges resend and pace progress by it.
+                let news = match index {
+                    0 => {
+                        std::mem::replace(&mut state.snapshot.volume, sample.volume)
+                            != sample.volume
+                    }
+                    1 => {
+                        std::mem::replace(&mut state.snapshot.layout, sample.layout)
+                            != sample.layout
+                    }
                     _ => {
                         state.snapshot.media = sample.media;
                         state.snapshot.media_query_ms = sample.media_query_ms;
                         state.snapshot.media_sampled_at = sample.media_sampled_at;
+                        true
+                    }
+                };
+                if news {
+                    for (lanes, bridge) in &state.listeners {
+                        if let Some(bridge) = bridge.upgrade().filter(|_| lanes[index]) {
+                            bridge.wake();
+                        }
                     }
                 }
             }
         }
         let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.stopped { return; }
-        let _ = shared.wake.wait_timeout(state, Duration::from_millis(20));
+        // Sleep until the next sample is due, never closer than the old 20 ms
+        // pass. A re-enable or an announcement that arrived during the query
+        // is due at once; demand changes, announcements and stop notify the
+        // condvar and end the wait early.
+        let due_in = if state.epoch[index] != last_epoch || (index == 1 && state.layout_due) {
+            Duration::ZERO
+        } else {
+            interval(&state).saturating_sub(last_poll.elapsed())
+        }
+        .max(Duration::from_millis(20));
+        let _ = shared.wake.wait_timeout(state, due_in);
+        #[cfg(test)]
+        shared.lane_passes[index].fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -408,6 +596,10 @@ const KDE_LAYOUT_PATH: &str = "/Layouts";
 #[cfg(target_os = "linux")]
 const KDE_LAYOUT_INTERFACE: &str = "org.kde.KeyboardLayouts";
 #[cfg(target_os = "linux")]
+const KDE_LAYOUT_LIST_REFRESH: Duration = Duration::from_secs(1);
+#[cfg(target_os = "linux")]
+const LAYOUT_DBUS_CALL_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(target_os = "linux")]
 const IBUS_DESTINATION: &str = "org.freedesktop.IBus";
 #[cfg(target_os = "linux")]
 const IBUS_PATH: &str = "/org/freedesktop/IBus";
@@ -423,7 +615,11 @@ const VOLUME_POLL_INTERVAL: Duration = Duration::from_millis(40);
 #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 const VOLUME_POLL_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(test)]
+mod bridge_wake_tests;
+#[cfg(test)]
 mod clock_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod layout_signal_tests;
 #[cfg(any(target_os = "macos", test))]
 mod macos_volume;
 #[cfg(target_os = "macos")]
@@ -675,6 +871,7 @@ struct BridgeTransportControl {
     stop: AtomicBool,
     retirement: std::sync::Mutex<Option<crate::hid::HidRetirement>>,
     selected_handoff: std::sync::Mutex<Option<(crate::hid::HidDevice, bool)>>,
+    wake: Arc<BridgeWake>,
 }
 
 impl BridgeTransportControl {
@@ -694,6 +891,7 @@ impl BridgeTransportControl {
             return Err(hid);
         }
         *handoff = Some((hid, extended));
+        self.wake.wake();
         Ok(())
     }
 
@@ -738,6 +936,7 @@ impl BridgeTransportControl {
                 token.retire();
             }
         }
+        self.wake.wake();
     }
 }
 
@@ -1164,22 +1363,25 @@ impl QmkHidHostBridge {
         let worker_application_layouts_enabled = application_layouts_enabled.clone();
         let send_shutdown_on_drop = Arc::new(AtomicBool::new(true));
         let worker_shutdown = send_shutdown_on_drop.clone();
-        let thread = thread::spawn(move || {
-            run_bridge(
-                worker_device,
-                mode,
-                worker_output,
-                worker_control,
-                worker_layout,
-                worker_application_layout,
-                worker_application_layout_resend,
-                worker_application_layouts_enabled,
-                protocol,
-                worker_shutdown,
-                desktop,
-                open_hid,
-            )
-        });
+        let thread = thread::Builder::new()
+            .name("host-bridge".to_owned())
+            .spawn(move || {
+                run_bridge(
+                    worker_device,
+                    mode,
+                    worker_output,
+                    worker_control,
+                    worker_layout,
+                    worker_application_layout,
+                    worker_application_layout_resend,
+                    worker_application_layouts_enabled,
+                    protocol,
+                    worker_shutdown,
+                    desktop,
+                    open_hid,
+                )
+            })
+            .expect("failed to spawn a host-data bridge");
         Self {
             device,
             mode,
@@ -1539,7 +1741,10 @@ fn run_bridge(
 
         let Some(dev) = device.as_ref() else {
             desktop_subscription = None;
-            thread::sleep(Duration::from_millis(250));
+            // Until the next open attempt; stop and a handed-over owner wake it.
+            control
+                .wake
+                .wait(Duration::from_secs(2).saturating_sub(last_open_attempt.elapsed()));
             continue;
         };
         if stop.load(Ordering::Relaxed) {
@@ -1558,7 +1763,7 @@ fn run_bridge(
             last_application_layout = None;
             application_layout_snapshot.lock().unwrap_or_else(|e| e.into_inner()).revoke();
             application_layouts_enabled.store(false, Ordering::Release);
-            thread::sleep(Duration::from_millis(250));
+            control.wake.wait(Duration::from_millis(250));
             continue;
         }
 
@@ -1645,7 +1850,7 @@ fn run_bridge(
 
         // HID deadlines consume only cached desktop data. Subscribing cannot
         // run an OS query, and the sampler never receives transport ownership.
-        desktop_subscription.get_or_insert_with(|| desktop.subscribe(mode));
+        desktop_subscription.get_or_insert_with(|| desktop.subscribe(mode, &control.wake));
         let snapshot = desktop.snapshot();
 
         if mode.volume && last_volume_poll.elapsed() >= VOLUME_POLL_INTERVAL {
@@ -1663,7 +1868,7 @@ fn run_bridge(
             }
         }
 
-        if mode.layout && last_layout_poll.elapsed() >= Duration::from_millis(100) {
+        if mode.layout && last_layout_poll.elapsed() >= LAYOUT_POLL_INTERVAL {
             last_layout_poll = Instant::now();
             if let Some(layout) = snapshot.layout {
                 if stop.load(Ordering::Acquire) {
@@ -1770,7 +1975,19 @@ fn run_bridge(
             first_write_failure_at = None;
         }
 
-        thread::sleep(Duration::from_millis(20));
+        control.wake.wait(bridge_idle_wait(
+            Instant::now(),
+            mode,
+            application_layouts_enabled.load(Ordering::Acquire),
+            last_time_poll,
+            (snapshot.volume, last_volume, last_volume_poll),
+            (
+                snapshot.layout,
+                last_layout,
+                last_layout_poll,
+                last_layout_full_send,
+            ),
+        ));
     }
 
     if send_shutdown.load(Ordering::Relaxed) {
@@ -1835,6 +2052,47 @@ fn layout_needs_send(
     layout: u8,
 ) -> bool {
     last_layout != Some(layout) || elapsed_since_last_send >= LAYOUT_RESEND_INTERVAL
+}
+
+/// How long a bridge pass may wait before one of its own deadlines falls due.
+/// New desktop samples, stop and a handed-over owner wake it earlier.
+///
+/// `volume` is the sampled value, the last one sent and the last poll;
+/// `layout` adds the last full send, which paces the periodic resend.
+fn bridge_idle_wait(
+    now: Instant,
+    mode: HostDataMode,
+    application_layouts: bool,
+    last_time_poll: Instant,
+    (volume, last_volume, last_volume_poll): (Option<u8>, Option<u8>, Instant),
+    (layout, last_layout, last_layout_poll, last_layout_full_send): (
+        Option<u8>,
+        Option<u8>,
+        Instant,
+        Instant,
+    ),
+) -> Duration {
+    if application_layouts {
+        return BRIDGE_APPLICATION_LAYOUT_TICK;
+    }
+    let mut due = now + BRIDGE_IDLE_RECHECK;
+    if mode.time {
+        due = due.min(last_time_poll + Duration::from_secs(1));
+    }
+    // A sample that arrived inside its poll interval is still unsent: come
+    // back when the interval opens instead of at the next recheck.
+    if mode.volume && volume.is_some() && volume != last_volume {
+        due = due.min(last_volume_poll + VOLUME_POLL_INTERVAL);
+    }
+    if let Some(layout) = layout.filter(|_| mode.layout) {
+        let since_send = now.saturating_duration_since(last_layout_full_send);
+        due = due.min(if layout_needs_send(last_layout, since_send, layout) {
+            last_layout_poll + LAYOUT_POLL_INTERVAL
+        } else {
+            last_layout_full_send + LAYOUT_RESEND_INTERVAL
+        });
+    }
+    due.saturating_duration_since(now)
 }
 
 fn send_shutdown_payloads(
@@ -2576,6 +2834,94 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn kde_layout_list(codes: &[&str], read_at: Instant) -> KdeLayoutList {
+        KdeLayoutList {
+            codes: codes.iter().map(|code| (*code).to_owned()).collect(),
+            read_at,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn kde_layouts(codes: &[&str]) -> Option<Vec<String>> {
+        Some(codes.iter().map(|code| (*code).to_owned()).collect())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kde_layout_list_follows_a_reorder_in_the_running_session() {
+        let start = Instant::now();
+        let mut list = kde_layout_list(&["us", "ru"], start);
+
+        let fresh = start + KDE_LAYOUT_LIST_REFRESH / 2;
+        let unread = list.code_index(0, fresh, || panic!("a fresh list is not read again"));
+        assert_eq!(unread, Some(0));
+
+        // Same length, so the index alone cannot tell the order changed.
+        let due = start + KDE_LAYOUT_LIST_REFRESH;
+        let reordered = list.code_index(0, due, || kde_layouts(&["ru", "us"]));
+        assert_eq!(reordered, Some(1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kde_layout_list_is_read_at_once_for_an_index_past_its_end() {
+        let start = Instant::now();
+        let mut list = kde_layout_list(&["us"], start);
+
+        let added = list.code_index(1, start, || kde_layouts(&["us", "ru"]));
+        assert_eq!(added, Some(1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kde_layout_list_keeps_the_last_list_when_kde_does_not_answer() {
+        let start = Instant::now();
+        let mut list = kde_layout_list(&["us", "ru"], start);
+
+        let due = start + KDE_LAYOUT_LIST_REFRESH;
+        assert_eq!(list.code_index(1, due, || None), Some(1));
+        assert_eq!(list.code_index(1, due, || Some(Vec::new())), Some(1));
+        // The failed read counts as the refresh; the next one waits its turn.
+        let soon = due + KDE_LAYOUT_LIST_REFRESH / 2;
+        let unread = list.code_index(1, soon, || panic!("a failed read is not retried at once"));
+        assert_eq!(unread, Some(1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn layout_bus_calls_give_up_on_a_peer_that_never_answers() {
+        let (client, server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        let guid = zbus::Guid::generate();
+        // A peer with no object server reads the call and never replies.
+        let server = thread::spawn(move || {
+            zbus::blocking::connection::Builder::unix_stream(server)
+                .server(guid)
+                .expect("server guid")
+                .p2p()
+                .build()
+        });
+        let timeout = Duration::from_millis(200);
+        let client = layout_bus(
+            Ok(zbus::blocking::connection::Builder::unix_stream(client).p2p()),
+            timeout,
+        )
+        .expect("client connection");
+        let _server = server
+            .join()
+            .expect("server thread")
+            .expect("server connection");
+
+        let started = Instant::now();
+        let reply = client.call_method(None::<&str>, "/", Some("org.example.Silent"), "Never", &());
+
+        assert!(
+            matches!(&reply, Err(zbus::Error::InputOutput(error)) if error.kind() == std::io::ErrorKind::TimedOut),
+            "expected a timeout, got {reply:?}"
+        );
+        assert!(started.elapsed() < timeout * 10);
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn gnome_desktop_names_are_recognized_without_matching_other_desktops() {
         assert!(desktop_list_has_gnome("GNOME"));
@@ -2797,37 +3143,37 @@ impl LayoutTracker {
     }
 }
 
+/// Builds a layout tracker connection whose method calls give up after
+/// `timeout`. zbus applies no reply timeout of its own, so a wedged KWin or
+/// IBus daemon would otherwise park the layout lane for good.
+#[cfg(target_os = "linux")]
+fn layout_bus(
+    builder: zbus::Result<zbus::blocking::connection::Builder<'_>>,
+    timeout: Duration,
+) -> Option<zbus::blocking::Connection> {
+    builder.ok()?.method_timeout(timeout).build().ok()
+}
+
 #[cfg(target_os = "linux")]
 struct KdeLayoutTracker {
     connection: zbus::blocking::Connection,
-    layout_codes: Vec<String>,
+    layout_codes: KdeLayoutList,
 }
 
 #[cfg(target_os = "linux")]
 impl KdeLayoutTracker {
     fn new() -> Option<Self> {
-        let connection = zbus::blocking::Connection::session().ok()?;
-        let layout_codes = {
-            let proxy = zbus::blocking::Proxy::new(
-                &connection,
-                KDE_LAYOUT_DESTINATION,
-                KDE_LAYOUT_PATH,
-                KDE_LAYOUT_INTERFACE,
-            )
-            .ok()?;
-            proxy
-                .call::<_, _, Vec<(String, String, String)>>("getLayoutsList", &())
-                .ok()?
-                .into_iter()
-                .map(|(short_name, _, _)| short_name)
-                .collect::<Vec<_>>()
-        };
-        if layout_codes.is_empty() {
-            return None;
-        }
+        let connection = layout_bus(
+            zbus::blocking::connection::Builder::session(),
+            LAYOUT_DBUS_CALL_TIMEOUT,
+        )?;
+        let layout_codes = kde_layout_list(&connection).filter(|codes| !codes.is_empty())?;
         Some(Self {
             connection,
-            layout_codes,
+            layout_codes: KdeLayoutList {
+                codes: layout_codes,
+                read_at: Instant::now(),
+            },
         })
     }
 
@@ -2840,7 +3186,61 @@ impl KdeLayoutTracker {
         )
         .ok()?;
         let layout = proxy.call::<_, _, u32>("getLayout", &()).ok()?;
-        kde_layout_code_index(layout, &self.layout_codes)
+        let connection = &self.connection;
+        self.layout_codes
+            .code_index(layout, Instant::now(), || kde_layout_list(connection))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn kde_layout_list(connection: &zbus::blocking::Connection) -> Option<Vec<String>> {
+    let proxy = zbus::blocking::Proxy::new(
+        connection,
+        KDE_LAYOUT_DESTINATION,
+        KDE_LAYOUT_PATH,
+        KDE_LAYOUT_INTERFACE,
+    )
+    .ok()?;
+    let layouts = proxy
+        .call::<_, _, Vec<(String, String, String)>>("getLayoutsList", &())
+        .ok()?;
+    Some(
+        layouts
+            .into_iter()
+            .map(|(short_name, _, _)| short_name)
+            .collect(),
+    )
+}
+
+/// KDE's layout list as last read. `getLayout` answers with a position in it,
+/// and a running session adds, removes and reorders layouts without telling
+/// the tracker, so the list is read again rather than kept for good.
+#[cfg(target_os = "linux")]
+struct KdeLayoutList {
+    codes: Vec<String>,
+    read_at: Instant,
+}
+
+#[cfg(target_os = "linux")]
+impl KdeLayoutList {
+    fn code_index(
+        &mut self,
+        layout: u32,
+        now: Instant,
+        read: impl FnOnce() -> Option<Vec<String>>,
+    ) -> Option<u8> {
+        // An index past the end means the list grew: read it now rather than
+        // after the refresh interval.
+        let past_end = usize::try_from(layout).map_or(true, |index| index >= self.codes.len());
+        if past_end || now.duration_since(self.read_at) >= KDE_LAYOUT_LIST_REFRESH {
+            // Stamp the attempt: a list KDE cannot return right now keeps the
+            // last one and is asked for again at the next refresh.
+            self.read_at = now;
+            if let Some(codes) = read().filter(|codes| !codes.is_empty()) {
+                self.codes = codes;
+            }
+        }
+        kde_layout_code_index(layout, &self.codes)
     }
 }
 
@@ -2858,10 +3258,10 @@ struct IbusLayoutTracker {
 #[cfg(target_os = "linux")]
 impl IbusLayoutTracker {
     fn new() -> Option<Self> {
-        let connection = zbus::blocking::connection::Builder::ibus()
-            .ok()?
-            .build()
-            .ok()?;
+        let connection = layout_bus(
+            zbus::blocking::connection::Builder::ibus(),
+            LAYOUT_DBUS_CALL_TIMEOUT,
+        )?;
         Some(Self { connection })
     }
 
@@ -2931,6 +3331,227 @@ fn desktop_list_has_gnome(value: &str) -> bool {
                 .get(..6)
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case("gnome-"))
     })
+}
+
+#[cfg(target_os = "linux")]
+fn kde_desktop_session() -> bool {
+    ["XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .filter_map(|value| value.into_string().ok())
+        .any(|value| {
+            value
+                .split(':')
+                .any(|desktop| desktop.eq_ignore_ascii_case("kde"))
+        })
+}
+
+#[cfg(target_os = "linux")]
+const LAYOUT_SIGNALS_RETRY: Duration = Duration::from_secs(10);
+
+/// Follows KDE's and IBus's layout signals for the layout lane. Whenever they
+/// stop, for instance across a Plasma or IBus restart, the lane polls again
+/// until they are back. Ends with the service, or at once on a desktop that
+/// announces no layout changes.
+#[cfg(target_os = "linux")]
+fn follow_layout_signals(events: LayoutEvents) {
+    while kde_desktop_session() || gnome_desktop_session() {
+        futures_lite::future::block_on(async {
+            if let Some(streams) = layout_signal_streams().await {
+                watch_layout_signals(streams, &events).await;
+            }
+        });
+        if !events.following(false) {
+            return;
+        }
+        thread::sleep(LAYOUT_SIGNALS_RETRY);
+    }
+}
+
+/// The signals the layout lane follows.
+#[cfg(target_os = "linux")]
+struct LayoutSignalStreams {
+    kde: Option<zbus::MessageStream>,
+    ibus: Option<zbus::MessageStream>,
+    /// While no IBus runs: IBus taking its name on the session bus.
+    ibus_started: Option<zbus::MessageStream>,
+}
+
+/// What setting up IBus's engine signal found.
+#[cfg(target_os = "linux")]
+enum IbusSignal {
+    Subscribed(zbus::MessageStream),
+    /// No IBus runs, so it switches no engine until `started` says it runs.
+    Absent {
+        started: zbus::MessageStream,
+    },
+    /// IBus runs, or may run, but its engine signal could not be subscribed
+    /// to.
+    Unreached,
+}
+
+/// KDE's layout signals while KDE serves layouts, and IBus's engine signal
+/// while IBus runs; None unless together they announce every layout change.
+#[cfg(target_os = "linux")]
+async fn layout_signal_streams() -> Option<LayoutSignalStreams> {
+    let session = zbus::Connection::session().await.ok()?;
+    let ibus = async { zbus::connection::Builder::ibus()?.build().await };
+    layout_signal_streams_on(&session, ibus, gnome_desktop_session()).await
+}
+
+/// [`layout_signal_streams`] on `session`, with `ibus` connecting to IBus.
+#[cfg(target_os = "linux")]
+async fn layout_signal_streams_on(
+    session: &zbus::Connection,
+    ibus: impl std::future::Future<Output = zbus::Result<zbus::Connection>>,
+    gnome: bool,
+) -> Option<LayoutSignalStreams> {
+    let bus = zbus::fdo::DBusProxy::new(session).await.ok()?;
+    let kde_serves = bus
+        .name_has_owner(KDE_LAYOUT_DESTINATION.try_into().ok()?)
+        .await
+        .ok()?;
+    let kde = if kde_serves {
+        Some(layout_signal_stream(session, KDE_LAYOUT_INTERFACE, KDE_LAYOUT_PATH).await?)
+    } else {
+        None
+    };
+    // Watched before IBus is looked for, so that one starting in between is
+    // not missed.
+    let started = ibus_started_stream(session).await?;
+    // With no IBus daemon there is no engine switch to miss. With one, its
+    // switches count too: the Entropy engine takes precedence over KDE.
+    let ibus = match ibus.await {
+        Ok(ibus) => match layout_signal_stream(&ibus, IBUS_INTERFACE, IBUS_PATH).await {
+            Some(stream) => IbusSignal::Subscribed(stream),
+            None => IbusSignal::Unreached,
+        },
+        // `ibus address` also fails when the command cannot run or prints no
+        // address, so that alone does not mean IBus is absent. IBus owns its
+        // session bus name while it runs: one that already runs announces no
+        // start, and following KDE alone would miss its switches for good.
+        Err(zbus::Error::Address(_)) => {
+            match bus.name_has_owner(IBUS_DESTINATION.try_into().ok()?).await {
+                Ok(false) => IbusSignal::Absent { started },
+                _ => IbusSignal::Unreached,
+            }
+        }
+        Err(_) => IbusSignal::Unreached,
+    };
+    followed_layout_signals(kde, ibus, gnome)
+}
+
+/// The streams to follow, if together they announce every layout change.
+/// KDE announces its own switches; elsewhere only IBus does (GNOME). An IBus
+/// that runs unfollowed switches engines unannounced, so the lane must keep
+/// polling for it.
+#[cfg(target_os = "linux")]
+fn followed_layout_signals(
+    kde: Option<zbus::MessageStream>,
+    ibus: IbusSignal,
+    gnome: bool,
+) -> Option<LayoutSignalStreams> {
+    let (ibus, ibus_started) = match ibus {
+        IbusSignal::Subscribed(stream) => (Some(stream), None),
+        IbusSignal::Absent { started } => (None, Some(started)),
+        IbusSignal::Unreached => return None,
+    };
+    (kde.is_some() || (ibus.is_some() && gnome)).then_some(LayoutSignalStreams {
+        kde,
+        ibus,
+        ibus_started,
+    })
+}
+
+/// IBus taking its name on the session bus, as it does when it starts.
+#[cfg(target_os = "linux")]
+async fn ibus_started_stream(session: &zbus::Connection) -> Option<zbus::MessageStream> {
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender("org.freedesktop.DBus")
+        .ok()?
+        .interface("org.freedesktop.DBus")
+        .ok()?
+        .member("NameOwnerChanged")
+        .ok()?
+        .arg(0, IBUS_DESTINATION)
+        .ok()?
+        .build();
+    zbus::MessageStream::for_match_rule(rule, session, None)
+        .await
+        .ok()
+}
+
+#[cfg(target_os = "linux")]
+async fn layout_signal_stream(
+    connection: &zbus::Connection,
+    interface: &'static str,
+    path: &'static str,
+) -> Option<zbus::MessageStream> {
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface(interface)
+        .ok()?
+        .path(path)
+        .ok()?
+        .build();
+    zbus::MessageStream::for_match_rule(rule, connection, None)
+        .await
+        .ok()
+}
+
+/// Turns layout signals into lane events until a stream ends or fails, or
+/// IBus starts and its engine signal is to be followed too.
+#[cfg(target_os = "linux")]
+async fn watch_layout_signals(streams: LayoutSignalStreams, events: &LayoutEvents) {
+    use futures_lite::StreamExt as _;
+
+    let LayoutSignalStreams {
+        mut kde,
+        mut ibus,
+        mut ibus_started,
+    } = streams;
+    // Whatever changed while nobody listened is read again first.
+    if !events.following(true) || !events.changed(true) {
+        return;
+    }
+    loop {
+        let next = futures_lite::future::race(
+            futures_lite::future::race(
+                async {
+                    match kde.as_mut() {
+                        Some(kde) => kde.next().await.map(|message| (true, message)),
+                        None => std::future::pending().await,
+                    }
+                },
+                async {
+                    match ibus.as_mut() {
+                        Some(ibus) => ibus.next().await.map(|message| (false, message)),
+                        None => std::future::pending().await,
+                    }
+                },
+            ),
+            async {
+                match ibus_started.as_mut() {
+                    // Ends the watch: the next setup subscribes to IBus too.
+                    Some(started) => started.next().await.and(None),
+                    None => std::future::pending().await,
+                }
+            },
+        )
+        .await;
+        let Some((from_kde, Ok(message))) = next else {
+            return;
+        };
+        let list_edited = from_kde
+            && message
+                .header()
+                .member()
+                .is_some_and(|member| member.as_str() == "layoutListChanged");
+        if !events.changed(list_edited) {
+            return;
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -3732,12 +4353,9 @@ mod qa_followup_shared_output {
         let (mut old, entered, release, finished) = blocked_media_bridge(output.clone());
         entered.recv_timeout(Duration::from_secs(5)).unwrap();
         let before = recorder.requests().len();
-        let stopped = Instant::now();
-        old.stop();
-        assert!(
-            stopped.elapsed() < Duration::from_secs(1),
-            "shared stop waited for desktop I/O"
-        );
+        // The replacement claims the owner before the old bridge is stopped.
+        // Stop wakes the old bridge at once, so the other order would let its
+        // shutdown run first; the UI suppresses it in that case instead.
         let mut replacement = QmkHidHostBridge::start_with_media_source(
             target(),
             HostDataMode {
@@ -3747,6 +4365,12 @@ mod qa_followup_shared_output {
             Some(output),
             HostProtocol::Selected(true),
             || panic!("time-only bridge must not poll media"),
+        );
+        let stopped = Instant::now();
+        old.stop();
+        assert!(
+            stopped.elapsed() < Duration::from_secs(1),
+            "shared stop waited for desktop I/O"
         );
         let reports = wait_for(&recorder, before, DATA_DATE);
         assert_eq!(
@@ -3779,10 +4403,12 @@ mod qa_followup_shared_output {
         let output = hid.shared_output().unwrap();
         let (mut old, entered, release, finished) = blocked_media_bridge(output.clone());
         entered.recv_timeout(Duration::from_secs(5)).unwrap();
-        old.stop();
-        // No replacement was available to old.stop(). An intermediate claim is
-        // never initialized; the next generation must still clear the old modes.
+        // No replacement bridge was available to old.stop(), only a claim that
+        // lands before it and is never initialized: the next generation must
+        // still clear the old modes. A stopped bridge shuts down at once, so
+        // the claim has to come first rather than race the old shutdown.
         let unused = output.for_host_bridge(HostDataMode::default(), false);
+        old.stop();
         drop(unused);
         let before = recorder.requests().len();
         let mut next = QmkHidHostBridge::start_with_media_source(

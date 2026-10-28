@@ -370,16 +370,17 @@ fn one_desktop_sampler_survives_subscription_churn_and_discards_old_epoch() {
         entered.recv_timeout(Duration::from_millis(60)).is_err(),
         "idle service polled"
     );
-    let first = service.subscribe(mode);
+    let bridge = Arc::new(BridgeWake::default());
+    let first = service.subscribe(mode, &bridge);
     assert_eq!(entered.recv_timeout(Duration::from_secs(5)).unwrap(), 1);
     drop(first);
     // Reusing the same production service cannot spawn another query or worker
     // when repeated enable/reconnect arrives during an uninterruptible call.
     for _ in 0..100 {
-        drop(service.subscribe(mode));
+        drop(service.subscribe(mode, &bridge));
     }
-    let survivor = service.subscribe(mode);
-    let peer = service.subscribe(mode);
+    let survivor = service.subscribe(mode, &bridge);
+    let peer = service.subscribe(mode, &bridge);
     assert_eq!(service.owner.shared.state.lock().unwrap().demand, [0, 0, 2]);
     drop(peer);
     assert_eq!(service.owner.shared.state.lock().unwrap().demand, [0, 0, 1]);

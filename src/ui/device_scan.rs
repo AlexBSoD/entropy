@@ -29,6 +29,32 @@ fn unique_reconnect_device_index(devices: &[Device], identity: &DeviceIdentity) 
     matches.next().is_none().then_some(first)
 }
 
+/// `scanned` in the order the list already shows: listed devices keep their
+/// rows and new ones follow in scan order. Scans order the transports
+/// differently (a USB-only one keeps the other transports first, a full one
+/// lists them last), and a list that moves under the pointer gets the wrong
+/// row picked.
+#[cfg(not(target_arch = "wasm32"))]
+fn in_listed_order(listed: &[Device], mut scanned: Vec<Device>) -> Vec<Device> {
+    let mut ordered = Vec::with_capacity(scanned.len());
+    for device in listed {
+        let identity = device.stable_identity();
+        let found = scanned
+            .iter()
+            .position(|d| d.path == device.path && d.instance_token == device.instance_token)
+            // A board re-enumerated between two scans keeps its row.
+            .or_else(|| {
+                unique_reconnect_device_index(listed, &identity)?;
+                unique_reconnect_device_index(&scanned, &identity)
+            });
+        if let Some(index) = found {
+            ordered.push(scanned.remove(index));
+        }
+    }
+    ordered.extend(scanned);
+    ordered
+}
+
 impl EntropyApp {
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn maybe_start_bluetooth_reconnect_scan(&mut self, ctx: &egui::Context) {
@@ -181,6 +207,7 @@ impl EntropyApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn apply_device_scan_result_inner(&mut self, devices: Vec<Device>, allow_discovery_connect: bool) {
+        let devices = in_listed_order(self.device_manager.devices(), devices);
         if !allow_discovery_connect {
             // Inventory is not permission to retry/open any transport. Keep the
             // chosen endpoint by identity; only retire an actually removed or
@@ -837,5 +864,56 @@ mod tests {
             unique_reconnect_device_index(&[expected, duplicate], &identity),
             None
         );
+    }
+
+    fn device_names(app: &EntropyApp) -> Vec<String> {
+        app.device_manager
+            .devices()
+            .iter()
+            .map(|device| device.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn scans_keep_the_rows_of_the_listed_devices() {
+        let ctx = egui::Context::default();
+        let mut app = EntropyApp::new_inert_for_test();
+        let (launch_tx, _requests) = mpsc::channel();
+        app.test_connect_requests = Some(launch_tx);
+        let phenom = scan_test_device("Phenom");
+        let qube = scan_test_device("Qube");
+        let mut mini = scan_test_device("Mini");
+        mini.bus_type = "Bluetooth".to_owned();
+        app.device_manager
+            .replace_devices(vec![phenom.clone(), qube.clone(), mini.clone()]);
+
+        // A USB-only scan keeps the other transports and adds its own after
+        // them, in its own order.
+        let (scan_tx, scan_rx) = mpsc::channel();
+        scan_tx
+            .send(Ok(vec![qube.clone(), phenom.clone()]))
+            .unwrap();
+        app.device_scan_state = DeviceScanState::Scanning {
+            rx: scan_rx,
+            started_at: std::time::Instant::now(),
+            generation: app.connection_generation,
+            timeout_logged: false,
+            usb_only: true,
+        };
+        app.poll_device_scan(&ctx);
+        assert_eq!(device_names(&app), ["Phenom", "Qube", "Mini"]);
+
+        // A full scan lists Bluetooth first here.
+        app.apply_device_scan_result(vec![mini.clone(), qube.clone(), phenom.clone()]);
+        assert_eq!(device_names(&app), ["Phenom", "Qube", "Mini"]);
+
+        // A board that turns up goes last; one re-enumerated between two
+        // scans keeps its row.
+        let mut replugged = qube.clone();
+        replugged.path = format!("{}-replugged", qube.path);
+        replugged.instance_token = "replugged-instance".to_owned();
+        let k03 = scan_test_device("K03");
+        app.apply_device_scan_result(vec![k03, mini, replugged, phenom]);
+        assert_eq!(device_names(&app), ["Phenom", "Qube", "Mini", "K03"]);
     }
 }
