@@ -5454,6 +5454,12 @@ pub struct EntropyApp {
     pub(super) settings_write_generation: u64,
     pub(super) qmk_settings_write_queue: QmkSettingsWriteQueue,
     pub(super) pending_device_connect: Option<DeviceIdentity>,
+    /// The board the user picked last: it is connected again when it comes
+    /// back, however many others are listed. Picking another replaces it.
+    pub(super) remembered_device: Option<DeviceIdentity>,
+    /// The remembered board's takeover while it waits in
+    /// `pending_device_connect`: it lapses with the memory.
+    pub(super) pending_takeover: Option<DeviceIdentity>,
     /// Built-in qmk-hid-host bridges for displays/presets that need host data
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) qmk_hid_hosts:

@@ -113,7 +113,12 @@ impl EntropyApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn deferred_exit_has_pending_hid_writes(&self) -> bool {
-        self.keycode_picker.macros_dirty
+        // Macros over the keyboard's memory stay dirty but will not be
+        // written until edited, so they must not hold the window open.
+        (self.keycode_picker.macros_dirty
+            && !self
+                .macro_memory_use()
+                .is_some_and(|(used, capacity)| used > capacity))
             || self.combo_dirty
             || self.combo_term_dirty
             || self.keycode_picker.tap_dance_dirty
@@ -1483,5 +1488,92 @@ mod tests {
                 .count()
                 >= 2
         );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn deferred_exit_does_not_wait_for_macros_over_the_keyboard_memory() {
+        let ctx = egui::Context::default();
+        let creation_context = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = EntropyApp::new(&creation_context);
+        let (hid_device, recorder) = crate::hid::HidDevice::test_device();
+        app.hid_device = Some(hid_device);
+        app.device_about_info = Some(DeviceAboutInfo {
+            macro_memory_bytes: Some(16),
+            ..Default::default()
+        });
+        app.keycode_picker.macro_texts = vec![vec![b'x'; 16]];
+        app.keycode_picker.mark_macros_dirty();
+        app.maybe_start_macro_write(&ctx);
+        app.exit_after_hid_write = true;
+
+        let output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            app.finish_deferred_exit_after_hid_write(&ctx);
+        });
+
+        assert!(output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .is_some_and(|viewport| viewport.commands.contains(&egui::ViewportCommand::Close)));
+        assert!(!app.exit_after_hid_write);
+        assert!(app.keycode_picker.macros_dirty);
+        assert!(recorder
+            .requests()
+            .iter()
+            .all(|request| request[0] != 0x0D && request[0] != 0x0F));
+    }
+
+    /// The connect could not read the memory size, so the write goes ahead
+    /// and learns it: 8 bytes, one short of the macro and its terminator.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn deferred_exit_does_not_wait_for_macros_their_write_found_over_memory() {
+        let ctx = egui::Context::default();
+        let creation_context = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = EntropyApp::new(&creation_context);
+        let (hid_device, recorder) = crate::hid::HidDevice::test_device();
+        recorder.respond_by(|request| {
+            (request[0] == 0x0D).then(|| {
+                let mut response = [0u8; 32];
+                response[..3].copy_from_slice(&[0x0D, 0, 8]);
+                Ok(response)
+            })
+        });
+        app.hid_device = Some(hid_device);
+        app.device_about_info = Some(DeviceAboutInfo::default());
+        app.keycode_picker.macro_texts = vec![vec![b'x'; 8]];
+        app.keycode_picker.mark_macros_dirty();
+        app.maybe_start_macro_write(&ctx);
+        assert!(
+            app.vial_hid_task_active(),
+            "an unknown size admits the write"
+        );
+        for _ in 0..100 {
+            app.poll_vial_hid_task(&ctx);
+            if !app.vial_hid_task_active() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            !app.vial_hid_task_active(),
+            "the macro write did not finish"
+        );
+        app.exit_after_hid_write = true;
+
+        let output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            app.finish_deferred_exit_after_hid_write(&ctx);
+        });
+
+        assert!(output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .is_some_and(|viewport| viewport.commands.contains(&egui::ViewportCommand::Close)));
+        assert!(!app.exit_after_hid_write);
+        assert!(app.keycode_picker.macros_dirty, "the edit is kept");
+        assert_eq!(app.macro_memory_use(), Some((9, 8)));
+        let requests = recorder.requests();
+        assert_eq!(requests.len(), 1, "only the size was read");
+        assert_eq!(requests[0][0], 0x0D);
     }
 }
