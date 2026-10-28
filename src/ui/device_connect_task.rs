@@ -763,8 +763,7 @@ impl EntropyApp {
                 .expect("test connect worker receiver");
             return;
         }
-        #[cfg(test)]
-        let test_hid = self.test_connect_hid.take();
+        let supplied_hid = self.connect_hid.take();
         let language = self.app_settings.language;
 
         std::thread::spawn(move || {
@@ -788,13 +787,10 @@ impl EntropyApp {
                     dev.vendor_id,
                     dev.product_id
                 );
-                #[cfg(test)]
-                let opened = match test_hid {
+                let opened = match supplied_hid {
                     Some(hid) => Ok(hid),
                     None => HidDevice::open_fresh_for(&dev),
                 };
-                #[cfg(not(test))]
-                let opened = HidDevice::open_fresh_for(&dev);
                 let dev_conn = opened.map_err(|e| format!("Open failed: {e:#}"))?;
                 let standby_animation_load = Self::device_uses_automatic_display_host_data(&dev)
                     .then(|| dev_conn.pause_standby_animation_for_load());

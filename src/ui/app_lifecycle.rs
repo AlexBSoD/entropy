@@ -281,6 +281,8 @@ impl EntropyApp {
         self.poll_single_instance_signal(ctx);
         self.poll_connect(ctx);
         self.maybe_begin_bluetooth_reconnect();
+        #[cfg(unix)]
+        self.poll_console_export(ctx);
         self.finish_deferred_full_layout_action(ctx);
         self.maybe_start_periodic_battery_refresh(ctx, main_window_hidden_to_tray);
         self.maybe_start_deferred_device_load(ctx, main_window_hidden_to_tray);
