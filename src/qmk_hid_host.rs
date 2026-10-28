@@ -24,6 +24,7 @@ const SM62_PRODUCT_ID: u16 = 0x00B2;
 const DEFAULT_LAYOUT_CODES: [&str; 2] = ["en", "ru"];
 const LAYOUT_RESEND_INTERVAL: Duration = Duration::from_secs(10);
 const LAYOUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const LAYOUT_FOLLOWED_POLL_INTERVAL: Duration = LAYOUT_RESEND_INTERVAL;
 // An idle bridge still wakes this often, which bounds how late the Linux
 // device-path check notices an unplugged keyboard. Tests use a long recheck
 // so every path that must reach a bridge early has to prove its own wake.
@@ -201,6 +202,49 @@ struct DesktopState {
     stopped: bool,
     // Bridges to wake when a lane they subscribed to stores news for them.
     listeners: Vec<([bool; 3], std::sync::Weak<BridgeWake>)>,
+    // The desktop announces every layout change (LayoutEvents): the layout
+    // lane polls rarely, samples when `layout_due` is set, and has its source
+    // drop what it read from the old list when `layout_list_stale` is.
+    layout_following: bool,
+    layout_due: bool,
+    layout_list_stale: bool,
+}
+
+/// Lets a desktop source tell the layout lane what the desktop announced.
+/// Holds the service weakly, so a stopped service ends whoever holds it.
+#[derive(Clone)]
+struct LayoutEvents {
+    shared: std::sync::Weak<DesktopShared>,
+}
+
+impl LayoutEvents {
+    /// The active layout may have changed; with `list_edited`, the list of
+    /// layouts did too. Returns false once the service is gone.
+    fn changed(&self, list_edited: bool) -> bool {
+        self.update(|state| {
+            state.layout_due = true;
+            state.layout_list_stale |= list_edited;
+        })
+    }
+
+    /// Whether every layout change is announced from now on, so that the
+    /// lane can stop polling for them. Returns false once the service is gone.
+    fn following(&self, following: bool) -> bool {
+        self.update(|state| state.layout_following = following)
+    }
+
+    fn update(&self, change: impl FnOnce(&mut DesktopState)) -> bool {
+        let Some(shared) = self.shared.upgrade() else {
+            return false;
+        };
+        let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.stopped {
+            return false;
+        }
+        change(&mut state);
+        shared.wake.notify_all();
+        true
+    }
 }
 
 #[derive(Default)]
@@ -277,6 +321,12 @@ trait DesktopSource {
     fn volume(&mut self) -> Option<u8>;
     fn layout(&mut self) -> Option<u8>;
     fn media(&mut self) -> Option<MediaInfo>;
+    /// Starts following the layout changes the desktop announces. Called on
+    /// the layout lane before its first sample; a source that cannot follow
+    /// them is polled.
+    fn follow_layout(&mut self, _events: LayoutEvents) {}
+    /// The desktop's list of layouts changed: forget anything read from it.
+    fn layout_list_changed(&mut self) {}
 }
 
 struct NativeDesktopSource {
@@ -310,6 +360,22 @@ impl DesktopSource for NativeDesktopSource {
 
     fn media(&mut self) -> Option<MediaInfo> {
         current_media_info()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn follow_layout(&mut self, events: LayoutEvents) {
+        if let Err(error) = thread::Builder::new()
+            .name("layout-events".to_owned())
+            .spawn(move || follow_layout_signals(events))
+        {
+            log::warn!("layout signals unavailable, polling the layout instead: {error}");
+        }
+    }
+
+    fn layout_list_changed(&mut self) {
+        // Rebuild on the next sample instead of mapping onto the old list.
+        self.layout = None;
+        self.last_layout_attempt = Instant::now() - Duration::from_secs(60);
     }
 }
 
@@ -410,7 +476,21 @@ impl Drop for DesktopSubscription {
 }
 
 fn run_desktop_service(shared: Arc<DesktopShared>, mut source: impl DesktopSource, index: usize) {
-    let interval = [VOLUME_POLL_INTERVAL, LAYOUT_POLL_INTERVAL, MEDIA_POLL_INTERVAL][index];
+    let polled = [VOLUME_POLL_INTERVAL, LAYOUT_POLL_INTERVAL, MEDIA_POLL_INTERVAL][index];
+    // A followed layout is sampled when the desktop announces a change, and
+    // otherwise only now and then, in case an announcement went missing.
+    let interval = |state: &DesktopState| {
+        if index == 1 && state.layout_following {
+            LAYOUT_FOLLOWED_POLL_INTERVAL
+        } else {
+            polled
+        }
+    };
+    if index == 1 {
+        source.follow_layout(LayoutEvents {
+            shared: Arc::downgrade(&shared),
+        });
+    }
     let mut last_poll = Instant::now() - Duration::from_secs(60);
     let mut last_epoch = 0;
     loop {
@@ -420,8 +500,13 @@ fn run_desktop_service(shared: Arc<DesktopShared>, mut source: impl DesktopSourc
         }
         if state.stopped { return; }
         let epoch = state.epoch[index];
-        let due = last_epoch != epoch || last_poll.elapsed() >= interval;
+        let announced = index == 1 && std::mem::take(&mut state.layout_due);
+        let relist = index == 1 && std::mem::take(&mut state.layout_list_stale);
+        let due = announced || last_epoch != epoch || last_poll.elapsed() >= interval(&state);
         drop(state);
+        if relist {
+            source.layout_list_changed();
+        }
         if due {
             last_epoch = epoch;
             last_poll = Instant::now();
@@ -469,12 +554,13 @@ fn run_desktop_service(shared: Arc<DesktopShared>, mut source: impl DesktopSourc
         let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.stopped { return; }
         // Sleep until the next sample is due, never closer than the old 20 ms
-        // pass. A re-enable that arrived during the query is due at once;
-        // demand changes and stop notify the condvar and end the wait early.
-        let due_in = if state.epoch[index] != last_epoch {
+        // pass. A re-enable or an announcement that arrived during the query
+        // is due at once; demand changes, announcements and stop notify the
+        // condvar and end the wait early.
+        let due_in = if state.epoch[index] != last_epoch || (index == 1 && state.layout_due) {
             Duration::ZERO
         } else {
-            interval.saturating_sub(last_poll.elapsed())
+            interval(&state).saturating_sub(last_poll.elapsed())
         }
         .max(Duration::from_millis(20));
         let _ = shared.wake.wait_timeout(state, due_in);
@@ -532,6 +618,8 @@ const VOLUME_POLL_INTERVAL: Duration = Duration::from_millis(250);
 mod bridge_wake_tests;
 #[cfg(test)]
 mod clock_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod layout_signal_tests;
 #[cfg(any(target_os = "macos", test))]
 mod macos_volume;
 #[cfg(target_os = "macos")]
@@ -3246,6 +3334,227 @@ fn desktop_list_has_gnome(value: &str) -> bool {
                 .get(..6)
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case("gnome-"))
     })
+}
+
+#[cfg(target_os = "linux")]
+fn kde_desktop_session() -> bool {
+    ["XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .filter_map(|value| value.into_string().ok())
+        .any(|value| {
+            value
+                .split(':')
+                .any(|desktop| desktop.eq_ignore_ascii_case("kde"))
+        })
+}
+
+#[cfg(target_os = "linux")]
+const LAYOUT_SIGNALS_RETRY: Duration = Duration::from_secs(10);
+
+/// Follows KDE's and IBus's layout signals for the layout lane. Whenever they
+/// stop, for instance across a Plasma or IBus restart, the lane polls again
+/// until they are back. Ends with the service, or at once on a desktop that
+/// announces no layout changes.
+#[cfg(target_os = "linux")]
+fn follow_layout_signals(events: LayoutEvents) {
+    while kde_desktop_session() || gnome_desktop_session() {
+        futures_lite::future::block_on(async {
+            if let Some(streams) = layout_signal_streams().await {
+                watch_layout_signals(streams, &events).await;
+            }
+        });
+        if !events.following(false) {
+            return;
+        }
+        thread::sleep(LAYOUT_SIGNALS_RETRY);
+    }
+}
+
+/// The signals the layout lane follows.
+#[cfg(target_os = "linux")]
+struct LayoutSignalStreams {
+    kde: Option<zbus::MessageStream>,
+    ibus: Option<zbus::MessageStream>,
+    /// While no IBus runs: IBus taking its name on the session bus.
+    ibus_started: Option<zbus::MessageStream>,
+}
+
+/// What setting up IBus's engine signal found.
+#[cfg(target_os = "linux")]
+enum IbusSignal {
+    Subscribed(zbus::MessageStream),
+    /// No IBus runs, so it switches no engine until `started` says it runs.
+    Absent {
+        started: zbus::MessageStream,
+    },
+    /// IBus runs, or may run, but its engine signal could not be subscribed
+    /// to.
+    Unreached,
+}
+
+/// KDE's layout signals while KDE serves layouts, and IBus's engine signal
+/// while IBus runs; None unless together they announce every layout change.
+#[cfg(target_os = "linux")]
+async fn layout_signal_streams() -> Option<LayoutSignalStreams> {
+    let session = zbus::Connection::session().await.ok()?;
+    let ibus = async { zbus::connection::Builder::ibus()?.build().await };
+    layout_signal_streams_on(&session, ibus, gnome_desktop_session()).await
+}
+
+/// [`layout_signal_streams`] on `session`, with `ibus` connecting to IBus.
+#[cfg(target_os = "linux")]
+async fn layout_signal_streams_on(
+    session: &zbus::Connection,
+    ibus: impl std::future::Future<Output = zbus::Result<zbus::Connection>>,
+    gnome: bool,
+) -> Option<LayoutSignalStreams> {
+    let bus = zbus::fdo::DBusProxy::new(session).await.ok()?;
+    let kde_serves = bus
+        .name_has_owner(KDE_LAYOUT_DESTINATION.try_into().ok()?)
+        .await
+        .ok()?;
+    let kde = if kde_serves {
+        Some(layout_signal_stream(session, KDE_LAYOUT_INTERFACE, KDE_LAYOUT_PATH).await?)
+    } else {
+        None
+    };
+    // Watched before IBus is looked for, so that one starting in between is
+    // not missed.
+    let started = ibus_started_stream(session).await?;
+    // With no IBus daemon there is no engine switch to miss. With one, its
+    // switches count too: the Entropy engine takes precedence over KDE.
+    let ibus = match ibus.await {
+        Ok(ibus) => match layout_signal_stream(&ibus, IBUS_INTERFACE, IBUS_PATH).await {
+            Some(stream) => IbusSignal::Subscribed(stream),
+            None => IbusSignal::Unreached,
+        },
+        // `ibus address` also fails when the command cannot run or prints no
+        // address, so that alone does not mean IBus is absent. IBus owns its
+        // session bus name while it runs: one that already runs announces no
+        // start, and following KDE alone would miss its switches for good.
+        Err(zbus::Error::Address(_)) => {
+            match bus.name_has_owner(IBUS_DESTINATION.try_into().ok()?).await {
+                Ok(false) => IbusSignal::Absent { started },
+                _ => IbusSignal::Unreached,
+            }
+        }
+        Err(_) => IbusSignal::Unreached,
+    };
+    followed_layout_signals(kde, ibus, gnome)
+}
+
+/// The streams to follow, if together they announce every layout change.
+/// KDE announces its own switches; elsewhere only IBus does (GNOME). An IBus
+/// that runs unfollowed switches engines unannounced, so the lane must keep
+/// polling for it.
+#[cfg(target_os = "linux")]
+fn followed_layout_signals(
+    kde: Option<zbus::MessageStream>,
+    ibus: IbusSignal,
+    gnome: bool,
+) -> Option<LayoutSignalStreams> {
+    let (ibus, ibus_started) = match ibus {
+        IbusSignal::Subscribed(stream) => (Some(stream), None),
+        IbusSignal::Absent { started } => (None, Some(started)),
+        IbusSignal::Unreached => return None,
+    };
+    (kde.is_some() || (ibus.is_some() && gnome)).then_some(LayoutSignalStreams {
+        kde,
+        ibus,
+        ibus_started,
+    })
+}
+
+/// IBus taking its name on the session bus, as it does when it starts.
+#[cfg(target_os = "linux")]
+async fn ibus_started_stream(session: &zbus::Connection) -> Option<zbus::MessageStream> {
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender("org.freedesktop.DBus")
+        .ok()?
+        .interface("org.freedesktop.DBus")
+        .ok()?
+        .member("NameOwnerChanged")
+        .ok()?
+        .arg(0, IBUS_DESTINATION)
+        .ok()?
+        .build();
+    zbus::MessageStream::for_match_rule(rule, session, None)
+        .await
+        .ok()
+}
+
+#[cfg(target_os = "linux")]
+async fn layout_signal_stream(
+    connection: &zbus::Connection,
+    interface: &'static str,
+    path: &'static str,
+) -> Option<zbus::MessageStream> {
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface(interface)
+        .ok()?
+        .path(path)
+        .ok()?
+        .build();
+    zbus::MessageStream::for_match_rule(rule, connection, None)
+        .await
+        .ok()
+}
+
+/// Turns layout signals into lane events until a stream ends or fails, or
+/// IBus starts and its engine signal is to be followed too.
+#[cfg(target_os = "linux")]
+async fn watch_layout_signals(streams: LayoutSignalStreams, events: &LayoutEvents) {
+    use futures_lite::StreamExt as _;
+
+    let LayoutSignalStreams {
+        mut kde,
+        mut ibus,
+        mut ibus_started,
+    } = streams;
+    // Whatever changed while nobody listened is read again first.
+    if !events.following(true) || !events.changed(true) {
+        return;
+    }
+    loop {
+        let next = futures_lite::future::race(
+            futures_lite::future::race(
+                async {
+                    match kde.as_mut() {
+                        Some(kde) => kde.next().await.map(|message| (true, message)),
+                        None => std::future::pending().await,
+                    }
+                },
+                async {
+                    match ibus.as_mut() {
+                        Some(ibus) => ibus.next().await.map(|message| (false, message)),
+                        None => std::future::pending().await,
+                    }
+                },
+            ),
+            async {
+                match ibus_started.as_mut() {
+                    // Ends the watch: the next setup subscribes to IBus too.
+                    Some(started) => started.next().await.and(None),
+                    None => std::future::pending().await,
+                }
+            },
+        )
+        .await;
+        let Some((from_kde, Ok(message))) = next else {
+            return;
+        };
+        let list_edited = from_kde
+            && message
+                .header()
+                .member()
+                .is_some_and(|member| member.as_str() == "layoutListChanged");
+        if !events.changed(list_edited) {
+            return;
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
