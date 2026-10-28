@@ -301,6 +301,9 @@ impl EntropyApp {
             if let Err(e) = hid.set_layout_options(packed) {
                 self.status_msg = format!("Failed to save layout option: {e}");
                 log::warn!("set_layout_options failed: {e}");
+                self.keep_unsaved_rewrite(&e, "layout_option", option_idx as u16, move |app| {
+                    app.set_layout_option_value(option_idx, value);
+                });
             }
         }
         #[cfg(not(target_arch = "wasm32"))]

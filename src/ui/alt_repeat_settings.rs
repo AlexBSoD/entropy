@@ -85,6 +85,13 @@ impl EntropyApp {
         ) {
             self.status_msg = format!("Failed to save Alt Repeat {}: {}", idx + 1, e);
             log::warn!("set_alt_repeat_key({idx}) failed: {e}");
+            #[cfg(not(target_arch = "wasm32"))]
+            self.keep_unsaved_rewrite(&e, "alt_repeat", idx as u16, move |app| {
+                if let Some(slot) = app.alt_repeat_entries.get_mut(idx) {
+                    *slot = entry;
+                    app.write_alt_repeat_entry(idx);
+                }
+            });
         }
     }
 

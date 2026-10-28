@@ -1113,6 +1113,38 @@ mod tests {
     }
 
     #[test]
+    fn a_write_made_outside_any_queue_goes_again_once_the_board_is_back() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (board, state) = board(stored());
+        let path = "hid:unsaved-rename";
+        let first = link(path, &board);
+        let mut app = connected_over_bluetooth(path);
+
+        board.go_away();
+        let error = app
+            .hid_device
+            .as_ref()
+            .unwrap()
+            .set_qmk_setting_string(201, "Fn")
+            .expect_err("the board is gone");
+        app.keep_unsaved_layer_name(&error, 1, "Fn".into());
+        app.keep_unsaved_rewrite(&anyhow::anyhow!("invalid value"), "other", 0, |app| {
+            app.status_msg = "written again".into();
+        });
+        drop(first);
+
+        let _second = reconnect(&mut app, path, &board);
+        settle_writes(&mut app);
+        assert!(state.lock().unwrap().settings[&201].starts_with(b"Fn"));
+        assert_eq!(app.layer_names[1], "Fn");
+        assert_ne!(
+            app.status_msg, "written again",
+            "a failure other than the board going away is not kept"
+        );
+        assert!(app.unsaved_edits.is_none());
+    }
+
+    #[test]
     fn unsaved_edits_of_one_board_are_not_written_to_another() {
         let _storage = crate::app::app_storage::ScopedTempConfig::new();
         let (board, state) = board(stored());

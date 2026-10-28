@@ -1,5 +1,6 @@
 use super::qmk_settings_write_queue::QmkSettingWriteRequest;
 use super::settings_write_queue::SettingsWriteRequest;
+use super::vial_hid_task::LayerNameWrite;
 use super::*;
 
 /// Macro bytes and the actions they were edited as.
@@ -25,7 +26,14 @@ pub(super) struct UnsavedEdits {
     combo_term: Option<u16>,
     tap_dance: Option<Vec<crate::keycode_picker::TapDanceEntry>>,
     key_overrides: Option<Vec<KeyOverrideEntry>>,
+    /// Names an application layout gives the board's layers.
+    layer_name_writes: Vec<LayerNameWrite>,
+    /// Writes made outside any queue, by what they set and its index. Each
+    /// puts its value back on screen and writes it again.
+    rewrites: Vec<((&'static str, u16), Rewrite)>,
 }
+
+type Rewrite = Box<dyn FnOnce(&mut EntropyApp)>;
 
 /// What a layer's keys and encoders should hold, by index.
 #[derive(Default)]
@@ -47,6 +55,8 @@ impl UnsavedEdits {
             combo_term: None,
             tap_dance: None,
             key_overrides: None,
+            layer_name_writes: Vec::new(),
+            rewrites: Vec::new(),
         }
     }
 
@@ -64,6 +74,8 @@ impl UnsavedEdits {
             + usize::from(self.combo_term.is_some())
             + usize::from(self.tap_dance.is_some())
             + usize::from(self.key_overrides.is_some())
+            + self.layer_name_writes.len()
+            + self.rewrites.len()
     }
 
     pub(super) fn keep_settings(&mut self, requests: Vec<SettingsWriteRequest>) {
@@ -93,6 +105,12 @@ impl UnsavedEdits {
             .encoders
             .insert(encoder_index, keycode);
     }
+
+    pub(super) fn keep_layer_name_write(&mut self, request: LayerNameWrite) {
+        self.layer_name_writes
+            .retain(|kept| kept.layout_id != request.layout_id || kept.layer != request.layer);
+        self.layer_name_writes.push(request);
+    }
 }
 
 impl EntropyApp {
@@ -113,6 +131,49 @@ impl EntropyApp {
         )
     }
 
+    /// Keeps a write that failed as the board went away, to make again once
+    /// it is back. `rewrite` puts the value back on screen and writes it; a
+    /// later one for the same `what` and `index` replaces it.
+    pub(super) fn keep_unsaved_rewrite(
+        &mut self,
+        error: &anyhow::Error,
+        what: &'static str,
+        index: u16,
+        rewrite: impl FnOnce(&mut EntropyApp) + 'static,
+    ) {
+        if !crate::hid::is_disconnect_error(error) {
+            return;
+        }
+        let Some(edits) = self.unsaved_edits_mut() else {
+            return;
+        };
+        edits.rewrites.retain(|(kept, _)| *kept != (what, index));
+        edits.rewrites.push(((what, index), Box::new(rewrite)));
+    }
+
+    /// Keeps a layer's name the board went away under. The connect takes the
+    /// board's names over local ones, so it is set and written again.
+    pub(super) fn keep_unsaved_layer_name(
+        &mut self,
+        error: &anyhow::Error,
+        layer: usize,
+        name: String,
+    ) {
+        self.keep_unsaved_rewrite(error, "layer_name", layer as u16, move |app| {
+            while app.layer_names.len() <= layer {
+                app.layer_names.push(app.layer_names.len().to_string());
+            }
+            app.layer_names[layer] = name.clone();
+            app.keycode_picker.layer_names = app.layer_names.clone();
+            save_layer_names(&app.layer_names, &app.current_device_name);
+            if let Some(dev) = &app.hid_device {
+                if let Err(error) = dev.set_qmk_setting_string(200 + layer as u16, &name) {
+                    log::warn!("Layer {layer} name not written again: {error}");
+                }
+            }
+        });
+    }
+
     /// Keeps what is still queued for the board as its connection drops,
     /// which would otherwise be dropped with it.
     pub(super) fn keep_unsaved_edits(&mut self) {
@@ -120,6 +181,7 @@ impl EntropyApp {
         let settings = self.settings_write_queue.pending_requests();
         let touchpad = self.qmk_settings_write_queue.take_all();
         let tap_hold_numeric = std::mem::take(&mut self.pending_tap_hold_numeric_writes);
+        let layer_name_writes = std::mem::take(&mut self.pending_layer_name_writes);
         let picker = &self.keycode_picker;
         let macros = picker
             .macros_dirty
@@ -141,6 +203,9 @@ impl EntropyApp {
             edits.touchpad.push(request);
         }
         edits.tap_hold_numeric.extend(tap_hold_numeric);
+        for request in layer_name_writes {
+            edits.keep_layer_name_write(request);
+        }
         edits.macros = macros.or(edits.macros.take());
         edits.combos = combos.or(edits.combos.take());
         edits.combo_term = combo_term.or(edits.combo_term);
@@ -180,6 +245,8 @@ impl EntropyApp {
         let combo_term = edits.combo_term.take();
         let tap_dance = edits.tap_dance.take();
         let key_overrides = edits.key_overrides.take();
+        let rewrites = std::mem::take(&mut edits.rewrites);
+        let layer_name_writes = std::mem::take(&mut edits.layer_name_writes);
         if edits.layers.is_empty() {
             self.unsaved_edits = None;
         }
@@ -190,6 +257,11 @@ impl EntropyApp {
             "Writing {count} edit(s) {} had not saved before it went away",
             self.current_device_name
         );
+        // Writes made outside any queue go first, while no worker holds the
+        // board they need.
+        for (_, rewrite) in rewrites {
+            rewrite(self);
+        }
         self.rewrite_unsaved_settings_writes(settings);
         // Debounced values follow: they were edited after anything queued.
         self.rewrite_unsaved_touchpad_values(touchpad);
@@ -227,6 +299,18 @@ impl EntropyApp {
         {
             self.key_override_entries = entries;
             self.key_override_dirty = true;
+        }
+        // Their queue checks each against this connection.
+        let device = self
+            .selected_device
+            .and_then(|index| self.device_manager.devices().get(index))
+            .cloned();
+        for mut request in layer_name_writes {
+            request.generation = self.connection_generation;
+            if let Some(device) = &device {
+                request.device = device.clone();
+            }
+            self.pending_layer_name_writes.push_back(request);
         }
     }
 

@@ -83,7 +83,28 @@ impl EntropyApp {
             Err(e) => {
                 self.status_msg = format!("Failed to save Mouse keys setting (qsid {qsid}): {}", e);
                 log::warn!("set_qmk_setting_u8(mouse_keys qsid {qsid}) failed: {e}");
+                #[cfg(not(target_arch = "wasm32"))]
+                self.keep_unsaved_rewrite(&e, "mouse_keys", qsid, move |app| {
+                    app.set_mouse_keys_value(qsid, value.into());
+                    app.write_mouse_keys_setting(qsid, value.into());
+                });
             }
+        }
+    }
+
+    fn set_mouse_keys_value(&mut self, qsid: u16, value: u16) {
+        let settings = &mut self.mouse_keys_settings;
+        match qsid {
+            9 => settings.delay = value,
+            10 => settings.interval = value,
+            11 => settings.move_delta = value,
+            12 => settings.max_speed = value,
+            13 => settings.time_to_max = value,
+            14 => settings.wheel_delay = value,
+            15 => settings.wheel_interval = value,
+            16 => settings.wheel_max_speed = value,
+            17 => settings.wheel_time_to_max = value,
+            _ => {}
         }
     }
 
@@ -224,18 +245,7 @@ impl EntropyApp {
                         let parsed = filtered.parse::<u32>().unwrap_or(0).min(max);
                         let new_value = parsed as u16;
                         if new_value != current {
-                            match qsid {
-                                9 => self.mouse_keys_settings.delay = new_value,
-                                10 => self.mouse_keys_settings.interval = new_value,
-                                11 => self.mouse_keys_settings.move_delta = new_value,
-                                12 => self.mouse_keys_settings.max_speed = new_value,
-                                13 => self.mouse_keys_settings.time_to_max = new_value,
-                                14 => self.mouse_keys_settings.wheel_delay = new_value,
-                                15 => self.mouse_keys_settings.wheel_interval = new_value,
-                                16 => self.mouse_keys_settings.wheel_max_speed = new_value,
-                                17 => self.mouse_keys_settings.wheel_time_to_max = new_value,
-                                _ => {}
-                            }
+                            self.set_mouse_keys_value(qsid, new_value);
                             self.write_mouse_keys_setting(qsid, new_value);
                         }
                         text = filtered;

@@ -275,6 +275,13 @@ impl EntropyApp {
                 "set_qmk_setting(bluetooth qsid {}) failed: {e}",
                 setting.qsid
             );
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let setting = setting.clone();
+                self.keep_unsaved_rewrite(&e, "bluetooth", setting.qsid, move |app| {
+                    app.write_bluetooth_select_setting(&setting, value);
+                });
+            }
         }
     }
 
@@ -303,6 +310,10 @@ impl EntropyApp {
                     "set_qmk_setting(bluetooth charge indicator qsid {}) failed: {e}",
                     setting.qsid
                 );
+                #[cfg(not(target_arch = "wasm32"))]
+                self.keep_unsaved_rewrite(&e, "bluetooth", setting.qsid, move |app| {
+                    app.write_bluetooth_charge_indicator(setting, enabled);
+                });
             }
         }
     }

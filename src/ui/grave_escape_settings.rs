@@ -151,6 +151,14 @@ impl EntropyApp {
         if let Err(e) = hid.set_qmk_setting_u8(1, self.grave_escape_settings.bits) {
             self.status_msg = format!("Failed to save Grave Escape settings: {}", e);
             log::warn!("set_qmk_setting_u8(grave_escape qsid 1) failed: {e}");
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let bits = self.grave_escape_settings.bits;
+                self.keep_unsaved_rewrite(&e, "grave_escape", 1, move |app| {
+                    app.grave_escape_settings.bits = bits;
+                    app.write_grave_escape_settings();
+                });
+            }
         }
     }
 }

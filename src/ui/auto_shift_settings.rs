@@ -296,6 +296,14 @@ impl EntropyApp {
             Err(e) => {
                 self.status_msg = format!("Failed to save Auto Shift flags: {}", e);
                 log::warn!("set_qmk_setting_u8(auto_shift_flags) failed: {e}");
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let options = self.auto_shift_options;
+                    self.keep_unsaved_rewrite(&e, "auto_shift_flags", 0, move |app| {
+                        app.auto_shift_options = options;
+                        app.write_auto_shift_flags();
+                    });
+                }
             }
         }
     }
@@ -310,6 +318,12 @@ impl EntropyApp {
         if let Err(e) = hid.set_qmk_setting_u16(4, timeout) {
             self.status_msg = format!("Failed to save Auto Shift timeout: {}", e);
             log::warn!("set_qmk_setting_u16(auto_shift_timeout) failed: {e}");
+            #[cfg(not(target_arch = "wasm32"))]
+            self.keep_unsaved_rewrite(&e, "auto_shift_timeout", 0, move |app| {
+                app.auto_shift_timeout = Some(timeout);
+                app.auto_shift_timeout_text = timeout.to_string();
+                app.write_auto_shift_timeout();
+            });
         }
     }
 }
