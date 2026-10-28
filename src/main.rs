@@ -313,6 +313,11 @@ fn main() -> eframe::Result<()> {
     {
         if let Some(request) = headless_export {
             if single_instance_enabled() && !try_acquire_single_instance() {
+                // The running instance owns the keyboards; it exports for us.
+                #[cfg(unix)]
+                if let Some(code) = app::export_via_running_instance(&request) {
+                    std::process::exit(code);
+                }
                 log::error!(
                     "Another Entropy instance is running; close it or export from its Layout menu"
                 );

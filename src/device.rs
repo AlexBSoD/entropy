@@ -541,8 +541,8 @@ pub struct DeviceManager {
 }
 
 impl DeviceManager {
-    #[cfg(test)]
-    pub(crate) fn empty_for_test() -> Self {
+    /// No devices and no scan: the caller supplies them.
+    pub(crate) fn empty() -> Self {
         Self { devices: vec![] }
     }
 
