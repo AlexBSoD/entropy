@@ -1,10 +1,12 @@
 //! Synchronous Rynk client over any byte transport.
 //!
-//! One request at a time, as device operations run today; the link owner
-//! serializes its callers and adds the window for requests nobody waits on.
+//! One request at a time, or a window of reads where the transport pipelines;
+//! the link owner serializes its callers and adds the window for requests
+//! nobody waits on.
 //! Requests are generic over `Endpoint`, so endpoint tables declared elsewhere
 //! (the ergohaven vendor table, a private branch's) work without a change here.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 use std::time::{Duration, Instant, SystemTime};
@@ -35,6 +37,12 @@ const RX_BUFFER_SIZE: usize = max_wire_size(RYNK_HEADER_SIZE + u16::MAX as usize
 /// the link stays quiet this long, within `DRAIN_LIMIT`.
 const DRAIN_QUIET: Duration = Duration::from_millis(50);
 const DRAIN_LIMIT: Duration = Duration::from_millis(500);
+/// Requests in flight over a transport that pipelines, in wire bytes and in
+/// frames: well inside the 512-byte pipe the board's BLE writes land in, so
+/// a write is never held back, and a small tail parked in the board's buffer
+/// while it answers the request in front.
+const PIPELINE_BYTES: usize = 256;
+const PIPELINE_FRAMES: usize = 32;
 
 /// A byte link to one board: USB bulk endpoints, BLE GATT, or 32-byte HID
 /// reports. The client only frames; the transport moves bytes.
@@ -44,6 +52,16 @@ pub(crate) trait RynkTransport {
     /// Bytes that arrived, waiting up to `timeout`; `Ok(0)` when none did.
     /// Zero padding after a frame, as HID reports carry, is fine.
     fn recv(&mut self, buf: &mut [u8], timeout: Duration) -> io::Result<usize>;
+    /// Whether the board takes the next request before the host has read the
+    /// reply to the last one. Over USB it does not: its session blocks on a
+    /// reply until the host polls for it, and takes no frame meanwhile.
+    fn pipelines(&self) -> bool {
+        false
+    }
+    /// Several whole frames back to back, for a transport that pipelines.
+    fn send_all(&mut self, frames: &[Vec<u8>]) -> io::Result<()> {
+        frames.iter().try_for_each(|frame| self.send(frame))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -489,13 +507,96 @@ impl<T: RynkTransport> RynkClient<T> {
         reply
     }
 
+    /// Requests of one endpoint and their replies, in order. Over a transport
+    /// that pipelines, a window of them goes out back to back before their
+    /// replies are read, which the board sends in order. One the board
+    /// answers `Busy`, short of room beside the requests parked behind it,
+    /// goes again on its own. Elsewhere they go one at a time, as `request`.
+    pub(crate) fn request_all<E: Endpoint>(
+        &mut self,
+        requests: &[E::Request],
+    ) -> Result<Vec<E::Response>, RynkClientError> {
+        if !self.transport.pipelines() {
+            return requests
+                .iter()
+                .map(|request| self.request::<E>(request))
+                .collect();
+        }
+        self.admit::<E>()?;
+        let replies = self.pipeline::<E>(requests);
+        if let (Err(_), Some(session)) = (&replies, &self.read_only) {
+            session.record_failed_read(E::CMD);
+        }
+        replies
+    }
+
+    fn pipeline<E: Endpoint>(
+        &mut self,
+        requests: &[E::Request],
+    ) -> Result<Vec<E::Response>, RynkClientError> {
+        let mut replies: Vec<Option<E::Response>> = requests.iter().map(|_| None).collect();
+        let mut queue: VecDeque<usize> = (0..requests.len()).collect();
+        let mut alone = false;
+        while !queue.is_empty() {
+            let mut window = Vec::new();
+            let mut frames = Vec::new();
+            let mut bytes = 0;
+            while let Some(&index) = queue.front() {
+                if !window.is_empty() && (alone || window.len() == PIPELINE_FRAMES) {
+                    break;
+                }
+                let seq = self.take_seq();
+                let frame = encode_request::<E>(seq, &requests[index], self.max_payload)?;
+                if !window.is_empty() && bytes + frame.len() > PIPELINE_BYTES {
+                    break;
+                }
+                bytes += frame.len();
+                frames.push(frame);
+                window.push((index, seq));
+                queue.pop_front();
+            }
+            self.take_unasked()?;
+            self.transport.send_all(&frames)?;
+            let mut busy = Vec::new();
+            for &(index, seq) in &window {
+                let frame = self.wait_reply(E::CMD, seq)?;
+                match decode_reply::<E>(&frame) {
+                    Ok(reply) => replies[index] = Some(reply),
+                    Err(RynkClientError::Device {
+                        error: RynkError::Busy,
+                        ..
+                    }) if window.len() > 1 => busy.push(index),
+                    Err(error) => return Err(error),
+                }
+            }
+            alone = !busy.is_empty();
+            for index in busy.into_iter().rev() {
+                queue.push_front(index);
+            }
+        }
+        Ok(replies
+            .into_iter()
+            .map(|reply| reply.expect("every request was answered"))
+            .collect())
+    }
+
     /// Sends a request without waiting; its reply is dropped when it comes.
-    /// Returns the request's SEQ. Every frame leaves through here, so this is
-    /// where a read-only session refuses what is not a read.
+    /// Returns the request's SEQ. Every frame leaves through here or
+    /// `request_all`, which is where a read-only session refuses what is not
+    /// a read.
     pub(crate) fn send<E: Endpoint>(
         &mut self,
         request: &E::Request,
     ) -> Result<u8, RynkClientError> {
+        self.admit::<E>()?;
+        let seq = self.take_seq();
+        let frame = encode_request::<E>(seq, request, self.max_payload)?;
+        self.take_unasked()?;
+        self.transport.send(&frame)?;
+        Ok(seq)
+    }
+
+    fn admit<E: Endpoint>(&self) -> Result<(), RynkClientError> {
         if self
             .read_only
             .as_ref()
@@ -503,12 +604,13 @@ impl<T: RynkTransport> RynkClient<T> {
         {
             return Err(RynkClientError::ReadOnly { cmd: E::CMD.raw() });
         }
+        Ok(())
+    }
+
+    fn take_seq(&mut self) -> u8 {
         let seq = self.next_seq;
         self.next_seq = if seq == u8::MAX { 1 } else { seq + 1 };
-        let frame = encode_request::<E>(seq, request, self.max_payload)?;
-        self.take_unasked()?;
-        self.transport.send(&frame)?;
-        Ok(seq)
+        seq
     }
 
     /// Reads away what the board sent since the last reply: topics, or the
@@ -657,6 +759,15 @@ impl<T: RynkTransport> RynkClient<T> {
         Ok(self.request::<ergohaven::GetSetting>(&id)?.0.to_vec())
     }
 
+    /// The settings `ids` name, in order.
+    pub(crate) fn settings(&mut self, ids: &[u16]) -> Result<Vec<Vec<u8>>, RynkClientError> {
+        Ok(self
+            .request_all::<ergohaven::GetSetting>(ids)?
+            .into_iter()
+            .map(|value| value.0.to_vec())
+            .collect())
+    }
+
     pub(crate) fn set_setting(&mut self, id: u16, value: &[u8]) -> Result<(), RynkClientError> {
         let cmd = ergohaven::SetSetting::CMD.raw();
         let value = value.try_into().map_err(|_| RynkClientError::TooLarge {
@@ -767,8 +878,14 @@ impl<T: RynkTransport> RynkClient<T> {
         Ok(all)
     }
 
-    pub(crate) fn read_macro(&mut self, index: u8) -> Result<Vec<MacroOp>, RynkClientError> {
-        Ok(self.request::<command::GetMacro>(&index)?.ops().collect())
+    /// The first `count` macros.
+    pub(crate) fn read_macros(&mut self, count: u8) -> Result<Vec<Vec<MacroOp>>, RynkClientError> {
+        let indices: Vec<u8> = (0..count).collect();
+        Ok(self
+            .request_all::<command::GetMacro>(&indices)?
+            .iter()
+            .map(|stored| stored.ops().collect())
+            .collect())
     }
 
     pub(crate) fn write_macro(
@@ -802,6 +919,9 @@ pub(crate) mod testing {
         pending: VecDeque<u8>,
         chunk: usize,
         usb: bool,
+        pipelines: bool,
+        /// Frames per `send_all`, one entry per call.
+        batches: Vec<usize>,
         sent: Vec<RynkHeader>,
         dropped: usize,
         unplug_on: Option<Cmd>,
@@ -825,6 +945,8 @@ pub(crate) mod testing {
                     pending: VecDeque::new(),
                     chunk: usize::MAX,
                     usb: false,
+                    pipelines: false,
+                    batches: Vec::new(),
                     sent: Vec::new(),
                     dropped: 0,
                     unplug_on: None,
@@ -845,6 +967,17 @@ pub(crate) mod testing {
         pub(crate) fn usb(self) -> Self {
             self.state().usb = true;
             self
+        }
+
+        /// Takes requests back to back, as over BLE.
+        pub(crate) fn pipelining(self) -> Self {
+            self.state().pipelines = true;
+            self
+        }
+
+        /// Frames per `send_all` so far.
+        pub(crate) fn batches(&self) -> Vec<usize> {
+            self.state().batches.clone()
         }
 
         /// A transport to the board; dropping it is letting the board go.
@@ -914,6 +1047,15 @@ pub(crate) mod testing {
             drop(state);
             self.0 .0 .1.notify_all();
             Ok(())
+        }
+
+        fn pipelines(&self) -> bool {
+            self.0.state().pipelines
+        }
+
+        fn send_all(&mut self, frames: &[Vec<u8>]) -> io::Result<()> {
+            self.0.state().batches.push(frames.len());
+            frames.iter().try_for_each(|frame| self.send(frame))
         }
 
         fn recv(&mut self, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
@@ -1237,7 +1379,7 @@ mod tests {
             client.request::<command::GetKeyAction>(&position).unwrap(),
             KeyAction::No
         );
-        assert_eq!(client.read_macro(0).unwrap(), []);
+        assert_eq!(client.read_macros(1).unwrap(), [Vec::<MacroOp>::new()]);
         assert!(matches!(
             client.request::<command::GetMatrixState>(&()),
             Err(RynkClientError::Device {
@@ -1655,5 +1797,113 @@ mod tests {
             assert!(text.contains("K:04 Mini") && !text.contains('{'), "{text}");
             assert_ne!(text, lost.describe(language));
         }
+    }
+
+    /// A board that answers `GetSetting` with the id, little-endian, and
+    /// calls `busy` first: a `Busy` there answers that request instead.
+    fn settings_board(mut busy: impl FnMut(u16) -> bool + Send + 'static) -> FakeBoard {
+        FakeBoard::new(move |header, payload| {
+            if let Some(reply) = handshake(header, 4128) {
+                return vec![reply];
+            }
+            let id: u16 = postcard::from_bytes(payload).unwrap();
+            if busy(id) {
+                return vec![err(header, RynkError::Busy)];
+            }
+            let value = SettingValue(id.to_le_bytes().as_slice().try_into().unwrap());
+            vec![ok(header, value)]
+        })
+    }
+
+    #[test]
+    fn pipelined_reads_go_out_in_windows_and_come_back_in_order() {
+        let board = settings_board(|_| false).pipelining();
+        let (mut client, _) = RynkClient::connect(board.transport(), quick()).unwrap();
+        let ids: Vec<u16> = (0..100).collect();
+
+        let values = client.settings(&ids).unwrap();
+
+        let expected: Vec<Vec<u8>> = ids.iter().map(|id| id.to_le_bytes().to_vec()).collect();
+        assert_eq!(values, expected);
+        let batches = board.batches();
+        assert_eq!(batches.iter().sum::<usize>(), ids.len());
+        assert!(batches.len() <= 4, "{batches:?}");
+        assert!(
+            batches
+                .iter()
+                .all(|&frames| (2..=PIPELINE_FRAMES).contains(&frames)),
+            "{batches:?}"
+        );
+        let settings = board
+            .sent()
+            .iter()
+            .filter(|header| header.cmd == ergohaven::GetSetting::CMD)
+            .count();
+        assert_eq!(settings, ids.len(), "each id asked once");
+    }
+
+    #[test]
+    fn a_request_the_board_is_too_busy_for_goes_again_on_its_own() {
+        let mut first = true;
+        let board = settings_board(move |id| id == 5 && std::mem::take(&mut first)).pipelining();
+        let (mut client, _) = RynkClient::connect(board.transport(), quick()).unwrap();
+        let ids: Vec<u16> = (0..10).collect();
+
+        let values = client.settings(&ids).unwrap();
+
+        assert_eq!(values[5], 5u16.to_le_bytes());
+        assert_eq!(values.len(), 10);
+        assert_eq!(
+            board.batches(),
+            [10, 1],
+            "the busy one alone, then nothing left"
+        );
+
+        // Busy on its own too: the board means it.
+        let board = settings_board(|id| id == 7).pipelining();
+        let (mut client, _) = RynkClient::connect(board.transport(), quick()).unwrap();
+        assert!(matches!(
+            client.settings(&[6, 7, 8]),
+            Err(RynkClientError::Device {
+                error: RynkError::Busy,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn without_pipelining_reads_go_one_at_a_time() {
+        let board = settings_board(|_| false).usb();
+        let (mut client, _) = RynkClient::connect(board.transport(), quick()).unwrap();
+
+        assert_eq!(client.settings(&[3, 4]).unwrap(), [[3, 0], [4, 0]]);
+        assert_eq!(
+            board.batches(),
+            Vec::<usize>::new(),
+            "no frames back to back"
+        );
+    }
+
+    #[test]
+    fn read_only_sessions_pipeline_reads_and_refuse_writes_before_sending() {
+        let board = settings_board(|_| false).pipelining();
+        let session = ReadOnlyRynkSession::default();
+        let mut client = RynkClient::test_read_only(board.transport(), quick(), session.clone());
+        client.max_payload = 4128;
+
+        assert_eq!(client.settings(&[1, 2]).unwrap(), [[1, 0], [2, 0]]);
+        let request = SetSettingRequest {
+            id: 1,
+            value: SettingValue::default(),
+        };
+        assert!(matches!(
+            client.request_all::<ergohaven::SetSetting>(&[request]),
+            Err(RynkClientError::ReadOnly { .. })
+        ));
+        assert_eq!(board.batches(), [2], "the write never left");
+        assert_eq!(
+            session.refused_requests(),
+            [ergohaven::SetSetting::CMD.raw()]
+        );
     }
 }

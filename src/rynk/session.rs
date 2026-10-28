@@ -8,6 +8,7 @@
 //!
 //! [`DeviceSession`]: crate::device_session::DeviceSession
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -41,6 +42,9 @@ pub(crate) struct RynkSession {
     link: Arc<RynkLink>,
     morses: Mutex<Vec<Option<Morse>>>,
     macros: Mutex<Vec<Option<Vec<MacroOp>>>>,
+    /// Settings read ahead in one go while connecting, by id; a write drops
+    /// its id. Empty once the connect is done.
+    read_ahead: Mutex<HashMap<u16, Vec<u8>>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -53,6 +57,7 @@ impl RynkSession {
             link,
             morses: Mutex::new(Vec::new()),
             macros: Mutex::new(Vec::new()),
+            read_ahead: Mutex::new(HashMap::new()),
         }
     }
 
@@ -171,11 +176,7 @@ impl RynkSession {
     /// zeros up to `size` when they are shorter.
     pub(crate) fn macro_buffer(&self, size: u16, count: u8) -> Result<Vec<u8>> {
         let count = count.min(self.capabilities().max_macros);
-        let read = self.link.run(move |client| {
-            (0..count)
-                .map(|index| client.read_macro(index))
-                .collect::<Result<Vec<_>, _>>()
-        })?;
+        let read = self.link.run(move |client| client.read_macros(count))?;
         let mut buffer = Vec::new();
         for ops in &read {
             buffer.extend(macros::macro_vial_bytes(ops).0);
@@ -247,13 +248,20 @@ impl RynkSession {
         Ok(keys.chunks(layer_len).map(<[KeyAction]>::to_vec).collect())
     }
 
-    pub(crate) fn encoder(&self, layer: u8, idx: u8) -> Result<EncoderAction> {
-        Ok(self
+    /// The first `count` encoders of the first `layers` layers, a layer each.
+    pub(crate) fn encoders(&self, layers: u8, count: u8) -> Result<Vec<Vec<EncoderAction>>> {
+        let requests: Vec<GetEncoderRequest> = (0..layers)
+            .flat_map(|layer| {
+                (0..count).map(move |encoder_id| GetEncoderRequest { encoder_id, layer })
+            })
+            .collect();
+        let actions = self
             .link
-            .request::<command::GetEncoderAction>(GetEncoderRequest {
-                encoder_id: idx,
-                layer,
-            })?)
+            .run(move |client| client.request_all::<command::GetEncoderAction>(&requests))?;
+        Ok(actions
+            .chunks(usize::from(count).max(1))
+            .map(<[EncoderAction]>::to_vec)
+            .collect())
     }
 
     pub(crate) fn read_combos(&self) -> Result<Vec<Combo>> {
@@ -262,12 +270,10 @@ impl RynkSession {
     }
 
     pub(crate) fn read_forks(&self) -> Result<Vec<Fork>> {
-        let count = self.capabilities().max_forks;
-        Ok(self.link.run(move |client| {
-            (0..count)
-                .map(|index| client.request::<command::GetFork>(&index))
-                .collect()
-        })?)
+        let indices: Vec<u8> = (0..self.capabilities().max_forks).collect();
+        Ok(self
+            .link
+            .run(move |client| client.request_all::<command::GetFork>(&indices))?)
     }
 
     pub(crate) fn layout_options(&self) -> Result<u32> {
@@ -276,7 +282,24 @@ impl RynkSession {
 
     /// A setting in the bytes Vial carries for the same id.
     pub(crate) fn setting(&self, qsid: u16) -> Result<Vec<u8>> {
+        if let Some(value) = lock(&self.read_ahead).get(&qsid) {
+            return Ok(value.clone());
+        }
         Ok(self.link.run(move |client| client.setting(qsid))?)
+    }
+
+    /// Reads the settings `ids` name in one go for the reads of a connect
+    /// that follow, which over BLE would each wait for their own reply.
+    pub(crate) fn read_settings_ahead(&self, ids: &[u16]) -> Result<()> {
+        let wanted = ids.to_vec();
+        let values = self.link.run(move |client| client.settings(&wanted))?;
+        lock(&self.read_ahead).extend(ids.iter().copied().zip(values));
+        Ok(())
+    }
+
+    /// Ends the read-ahead: later reads ask the board again.
+    pub(crate) fn forget_settings_read_ahead(&self) {
+        lock(&self.read_ahead).clear();
     }
 
     /// Every setting id the board serves.
@@ -316,6 +339,7 @@ impl RynkSession {
     }
 
     pub(crate) fn set_setting(&self, qsid: u16, value: Vec<u8>) -> Result<()> {
+        lock(&self.read_ahead).remove(&qsid);
         Ok(self
             .link
             .run(move |client| client.set_setting(qsid, &value))?)
@@ -848,6 +872,38 @@ mod tests {
         device.set_macro_buffer(&buffer).unwrap();
 
         assert_eq!(state.lock().unwrap().macros[0], vec![MacroOp::Delay(10); 5]);
+    }
+
+    #[test]
+    fn settings_read_ahead_serve_the_connect_until_written_or_forgotten() {
+        let mut stored = Stored::new(1, 2, 1);
+        stored.settings.insert(7, vec![1]);
+        stored.settings.insert(8, vec![2]);
+        let (session, state) = session("read-ahead", stored);
+        let asked = |state: &Mutex<Stored>| {
+            let state = state.lock().unwrap();
+            state
+                .received
+                .iter()
+                .filter(|cmd| **cmd == Cmd::GetSetting)
+                .count()
+        };
+
+        session.read_settings_ahead(&[7, 8]).unwrap();
+        state.lock().unwrap().settings.insert(7, vec![9]);
+        assert_eq!(session.setting(7).unwrap(), [1], "as read ahead");
+        assert_eq!(session.setting(7).unwrap(), [1], "and again");
+        assert_eq!(asked(&state), 2, "both read once, ahead");
+
+        session.set_setting(8, vec![3]).unwrap();
+        assert_eq!(session.setting(8).unwrap(), [3], "a write is read back");
+        session.forget_settings_read_ahead();
+        assert_eq!(
+            session.setting(7).unwrap(),
+            [9],
+            "the board's own once forgotten"
+        );
+        assert_eq!(asked(&state), 4);
     }
 
     #[test]

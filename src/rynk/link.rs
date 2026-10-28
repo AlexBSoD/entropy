@@ -52,6 +52,14 @@ impl<T: RynkTransport + ?Sized> RynkTransport for Box<T> {
     fn recv(&mut self, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
         (**self).recv(buf, timeout)
     }
+
+    fn pipelines(&self) -> bool {
+        (**self).pipelines()
+    }
+
+    fn send_all(&mut self, frames: &[Vec<u8>]) -> io::Result<()> {
+        (**self).send_all(frames)
+    }
 }
 
 /// The client a link's owner holds, as [`RynkLink::run`] hands it out.
