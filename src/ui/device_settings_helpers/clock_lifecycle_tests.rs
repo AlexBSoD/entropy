@@ -610,3 +610,30 @@ fn failed_b_connection_and_picker_scan_keep_a_but_remove_disconnected_c() {
     assert!(app.qmk_hid_hosts.is_empty());
     assert_eq!(factory.starts.len(), 3);
 }
+
+#[test]
+fn dropping_a_mode_on_the_same_shared_owner_never_turns_the_host_off() {
+    let a = device("A", "src/qmk_hid_host.rs");
+    let mut app = EntropyApp::new_inert_for_test();
+    app.device_manager.replace_devices(vec![a.clone()]);
+    let recorder = attach(&mut app, 0, true);
+    app.layout.as_mut().unwrap().live_features.media = true;
+    // Media comes from a fixture source, never from an OS desktop query.
+    let mut start = |d, m, s, p| test_start_bridge(d, m, s, None, p, || None);
+    app.sync_qmk_hid_host_bridges_with(&mut start);
+    assert!(app.qmk_hid_hosts[&a.path].mode().media);
+    wait(&recorder, 0, 0xaf, None);
+    wait(&recorder, 0, 0xae, None);
+
+    // Stop wakes the old bridge at once; without the handoff its shutdown
+    // could switch the host off before the successor claims the owner.
+    app.layout.as_mut().unwrap().live_features.media = false;
+    let before = recorder.requests().len();
+    app.sync_qmk_hid_host_bridges_with(&mut start);
+    assert!(!app.qmk_hid_hosts[&a.path].mode().media);
+    // The successor clears the media it drops and keeps the host online.
+    wait(&recorder, before, 0xad, Some(0));
+    wait(&recorder, before, 0xae, Some(0));
+    wait(&recorder, before, 0xaf, None);
+    no_clear(&recorder);
+}

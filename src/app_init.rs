@@ -38,7 +38,7 @@ impl EntropyApp {
             text_expander_rules_signature(&app_settings.text_expander_rule_files);
         let mut typing_trainer = TypingTrainerState::from_settings(app_settings.typing_trainer);
         typing_trainer.set_symbol_stats(load_typing_trainer_symbol_stats());
-        Self::from_bootstrap(AppBootstrap {
+        let mut app = Self::from_bootstrap(AppBootstrap {
             app_settings,
             device_manager: DeviceManager::new(),
             typing_trainer,
@@ -46,12 +46,16 @@ impl EntropyApp {
             last_single_instance_signal: read_single_instance_signal(),
             layer_names: load_layer_names("default"),
             update_check: start_update_check(),
-        })
+        });
+        #[cfg(unix)]
+        app.start_console_export_server(&cc.egui_ctx);
+        app
     }
 
     /// The app without a window, for `--export-layout`. Reads the same
     /// settings as `new` (language, diagnostics) but starts none of the
-    /// desktop machinery: no text expander, no update check, no zoom.
+    /// desktop machinery: no text expander, no update check, no zoom, no
+    /// device scan of its own.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn new_headless() -> Self {
         let app_settings = load_app_settings();
@@ -59,7 +63,7 @@ impl EntropyApp {
         let mut app = Self::from_bootstrap(AppBootstrap {
             typing_trainer: TypingTrainerState::from_settings(app_settings.typing_trainer),
             app_settings,
-            device_manager: DeviceManager::new(),
+            device_manager: DeviceManager::empty(),
             text_expander_rules_signature: Vec::new(),
             last_single_instance_signal: String::new(),
             layer_names: Vec::new(),
@@ -75,7 +79,7 @@ impl EntropyApp {
         Self::from_bootstrap(AppBootstrap {
             typing_trainer: TypingTrainerState::from_settings(app_settings.typing_trainer),
             app_settings,
-            device_manager: DeviceManager::empty_for_test(),
+            device_manager: DeviceManager::empty(),
             text_expander_rules_signature: Vec::new(),
             last_single_instance_signal: String::new(),
             layer_names: Vec::new(),
@@ -116,6 +120,10 @@ impl EntropyApp {
             deferred_device_load: DeferredDeviceLoadState::default(),
             #[cfg(not(target_arch = "wasm32"))]
             deferred_full_layout_action: None,
+            #[cfg(unix)]
+            console_export_server: None,
+            #[cfg(unix)]
+            pending_console_export: None,
             settings_write_queue: SettingsWriteQueueState::default(),
             settings_write_generation: 0,
             #[cfg(not(target_arch = "wasm32"))]
@@ -350,8 +358,8 @@ impl EntropyApp {
             test_device_scan_requests: None,
             #[cfg(all(test, not(target_arch = "wasm32")))]
             test_connect_requests: None,
-            #[cfg(all(test, not(target_arch = "wasm32")))]
-            test_connect_hid: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            connect_hid: None,
             #[cfg(not(target_arch = "wasm32"))]
             device_scan_state: DeviceScanState::Idle,
         }

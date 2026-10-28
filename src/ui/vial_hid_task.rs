@@ -201,6 +201,15 @@ pub(super) enum VialHidOperation {
         slot: usize,
     },
     Deferred(super::device_deferred_load::DeferredLoadRequest),
+    /// `--export-layout` from the console: the standalone export's read-only
+    /// pipeline, run over this connection while it is lent.
+    #[cfg(unix)]
+    ConsoleExport {
+        device: crate::device::Device,
+        deadline: std::time::Instant,
+        /// The console request it answers.
+        request: u64,
+    },
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -247,6 +256,8 @@ enum VialHidOutcome {
     PictogramsLoaded(crate::app::PictogramLibrary),
     PictogramsUploaded(crate::app::PictogramLibrary),
     Deferred(super::device_deferred_load::DeferredLoadPayload),
+    #[cfg(unix)]
+    ConsoleExported(super::headless_export::Reply),
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -391,6 +402,12 @@ fn run_vial_hid_operation_with_progress(
             super::device_deferred_load::run_deferred_load(hid, &request)
                 .map(VialHidOutcome::Deferred)
         }
+        #[cfg(unix)]
+        VialHidOperation::ConsoleExport {
+            device, deadline, ..
+        } => Ok(VialHidOutcome::ConsoleExported(
+            super::headless_export::export_lent_keyboard(hid, device, deadline, cancel),
+        )),
     }
 }
 
@@ -498,6 +515,18 @@ impl EntropyApp {
         }
     }
 
+    /// Stops a console export whose console has gone; the connection comes
+    /// back as soon as the export notices.
+    #[cfg(unix)]
+    pub(super) fn cancel_console_export(&self) {
+        if let Some(task) = &self.vial_hid_task {
+            if matches!(task.operation, VialHidOperation::ConsoleExport { .. }) {
+                task.cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn standby_background_upload_progress(&self) -> Option<f32> {
         self.vial_hid_task.as_ref().and_then(|task| {
@@ -587,7 +616,12 @@ impl EntropyApp {
                 "Display operation started: {label} generation={generation} target={target:?}"
             );
         }
+        #[cfg(test)]
+        let config_root = super::app_storage::test_config_root();
         std::thread::spawn(move || {
+            // A console export runs a whole app here, which reads settings.
+            #[cfg(test)]
+            super::app_storage::adopt_test_config_root(config_root);
             let started = std::time::Instant::now();
             #[cfg(target_os = "macos")]
             let _hid_lock = hid_device.macos_hid_operation_lock();
@@ -598,11 +632,14 @@ impl EntropyApp {
                 &worker_progress,
                 &worker_cancel,
             );
-            let disconnected = outcome
-                .as_ref()
-                .err()
-                .map(crate::hid::is_disconnect_error)
-                .unwrap_or(false);
+            let disconnected = match &outcome {
+                Err(error) => crate::hid::is_disconnect_error(error),
+                // A lent export answers its console whatever became of the
+                // connection; whether the connection survived it is told here.
+                #[cfg(unix)]
+                Ok(VialHidOutcome::ConsoleExported(_)) => !hid_device.is_transport_available(),
+                Ok(_) => false,
+            };
             if let Some(label) = diagnostic_label {
                 match &outcome {
                     Ok(_) => log::debug!(
@@ -1023,6 +1060,21 @@ impl EntropyApp {
                 }
                 self.finish_deferred_device_load(payload);
             }
+            #[cfg(unix)]
+            Ok(VialHidOutcome::ConsoleExported(reply)) => {
+                if let VialHidOperation::ConsoleExport { request, .. } = result.operation {
+                    self.finish_console_export(request, reply);
+                }
+                if result.disconnected {
+                    // The export lost the connection it borrowed: recover it
+                    // as after any operation's disconnect.
+                    self.finish_vial_hid_error(
+                        result.operation,
+                        "HID device disconnected during a console export".to_owned(),
+                        true,
+                    );
+                }
+            }
             Err(error) => {
                 self.finish_vial_hid_error(result.operation, error, result.disconnected);
             }
@@ -1197,6 +1249,15 @@ impl EntropyApp {
                 pictograms.library = PictogramLibrary::default();
                 pictograms.upload_due = None;
             }
+            #[cfg(unix)]
+            VialHidOperation::ConsoleExport { request, .. } => {
+                self.finish_console_export(
+                    *request,
+                    super::headless_export::Reply::Failed {
+                        message: format!("The export stopped: {error}"),
+                    },
+                );
+            }
             _ => {}
         }
 
@@ -1331,6 +1392,9 @@ impl EntropyApp {
                 }
                 self.fail_deferred_device_load(&request, error);
             }
+            // Answered before the disconnect handling.
+            #[cfg(unix)]
+            VialHidOperation::ConsoleExport { .. } => {}
         }
     }
 

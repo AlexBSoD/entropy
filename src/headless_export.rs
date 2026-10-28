@@ -7,7 +7,16 @@
 
 use super::*;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+#[path = "headless_export_ipc.rs"]
+mod running_instance;
+#[cfg(unix)]
+pub(crate) use running_instance::{
+    export_lent_keyboard, export_via_running_instance, ExportServer, PendingConsoleExport, Reply,
+};
 
 /// Everything went through; the layout is at the requested destination.
 pub(crate) const EXIT_OK: i32 = 0;
@@ -16,7 +25,7 @@ pub(crate) const EXIT_OK: i32 = 0;
 pub(crate) const EXIT_FAILED: i32 = 1;
 /// No keyboard matched, or several did and `--device` did not settle it.
 pub(crate) const EXIT_NO_DEVICE: i32 = 2;
-/// Another Entropy instance owns the keyboards; the GUI export still works.
+/// Another Entropy instance owns the keyboards and did not export for us.
 pub(crate) const EXIT_INSTANCE_RUNNING: i32 = 3;
 /// The keyboard loaded, but some of its layers or sections did not; nothing
 /// was written.
@@ -43,8 +52,10 @@ Usage: entropy --export-layout <PATH> [--device <FILTER>] [--timeout <SECONDS>]
                           finished loading by then (default: 60)
 
 Exit status: 0 exported, 1 export failed, 2 no (or ambiguous) keyboard,
-3 another Entropy instance is running, 4 incomplete (the missing sections
-are listed), 64 usage error. A file is replaced only by a complete export.";
+3 another Entropy instance is running and did not answer, 4 incomplete
+(the missing sections are listed), 64 usage error. A file is replaced only
+by a complete export. A running Entropy exports for this command on Linux
+and macOS.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ExportDestination {
@@ -346,12 +357,13 @@ fn missing_sections(app: &EntropyApp, session: &crate::hid::ReadOnlyHidSession) 
 }
 
 /// Connects to `device_idx` and returns its `.entlayout` once one connection
-/// has delivered every section.
+/// has delivered every section, unless `cancelled` is set first.
 fn export_entlayout(
     app: &mut EntropyApp,
     device_idx: usize,
     session: &crate::hid::ReadOnlyHidSession,
     deadline: Instant,
+    cancelled: &AtomicBool,
 ) -> Result<String, ExportError> {
     // A window-less context still carries the repaint requests and input
     // state the connect and deferred-load pollers consult.
@@ -372,6 +384,9 @@ fn export_entlayout(
         if app.status_msg != last_status {
             last_status = app.status_msg.clone();
             log::info!("{last_status}");
+        }
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(ExportError::Failed("The export was cancelled".to_owned()));
         }
         if connection.step(app, &ctx)? {
             break;
@@ -476,7 +491,13 @@ pub(crate) fn run_headless_export(request: HeadlessExportRequest) -> i32 {
     log::info!("Exporting layout of {}", describe(&devices[device_idx]));
     app.device_manager.replace_devices(devices);
 
-    let exported = export_entlayout(&mut app, device_idx, &session, deadline);
+    let exported = export_entlayout(
+        &mut app,
+        device_idx,
+        &session,
+        deadline,
+        &AtomicBool::new(false),
+    );
     let refused = session.refused_requests().len();
     if refused > 0 {
         log::info!("Refused {refused} keyboard write(s) during the export");
@@ -691,7 +712,8 @@ mod tests {
         app.app_settings
             .application_layouts
             .insert("vial-0000000000000000-m4cr0pad-v2".into(), profiles);
-        let json = export_entlayout(&mut app, 0, &session, deadline()).unwrap();
+        let json =
+            export_entlayout(&mut app, 0, &session, deadline(), &AtomicBool::default()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["version"], 9);
         assert_eq!(value["application_layouts"].as_object().unwrap().len(), 2);
@@ -715,7 +737,9 @@ mod tests {
             "vial-0000000000000000-m4cr0pad-v2".into(),
             crate::application_layouts::DeviceApplicationLayouts::default(),
         );
-        assert!(export_entlayout(&mut app, 0, &session, deadline()).is_err());
+        assert!(
+            export_entlayout(&mut app, 0, &session, deadline(), &AtomicBool::default()).is_err()
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -802,7 +826,7 @@ mod tests {
         scripted_keyboard(&recorder, |request| {
             (request[0] == 0xe6).then(|| "HID timeout on capability probe".into())
         });
-        app.test_connect_hid = Some(hid);
+        app.connect_hid = Some(hid);
         let mut profiles = crate::application_layouts::DeviceApplicationLayouts::default();
         profiles.create_for_application(&crate::application_layouts::DetectedApplication {
             executable: "vial".into(),
@@ -816,7 +840,14 @@ mod tests {
         app.app_settings = crate::app::app_storage::load_app_settings();
         let (mut backup_app, backup_session, _) = scripted_export_app(|_| None);
         backup_app.app_settings = app.app_settings.clone();
-        let previous = export_entlayout(&mut backup_app, 0, &backup_session, deadline()).unwrap();
+        let previous = export_entlayout(
+            &mut backup_app,
+            0,
+            &backup_session,
+            deadline(),
+            &AtomicBool::default(),
+        )
+        .unwrap();
         let ctx = egui::Context::default();
         app.start_connect(0);
         let mut connection = ExportConnection::default();
@@ -901,7 +932,7 @@ mod tests {
                 },
                 Some(reply),
             );
-            app.test_connect_hid = Some(hid);
+            app.connect_hid = Some(hid);
             let mut profiles = crate::application_layouts::DeviceApplicationLayouts::default();
             profiles.create_for_application(&crate::application_layouts::DetectedApplication {
                 executable: "vial".into(),
@@ -964,7 +995,10 @@ mod tests {
             app.app_settings
                 .application_layouts
                 .insert("vial-0000000000000000-m4cr0pad-v2".into(), profiles);
-            assert!(export_entlayout(&mut app, 0, &session, deadline()).is_err());
+            assert!(
+                export_entlayout(&mut app, 0, &session, deadline(), &AtomicBool::default())
+                    .is_err()
+            );
             assert!(recorder.requests().iter().all(|request| !is_write(request)));
             assert!(!crate::app::app_storage::app_settings_path().exists());
         }
@@ -982,6 +1016,21 @@ mod tests {
     fn scripted_keyboard_with_capability(
         recorder: &crate::hid::TestHidRecorder,
         fail: impl Fn(&[u8; 32]) -> Option<String> + Send + 'static,
+        capability_reply: Option<[u8; 32]>,
+    ) {
+        scripted_keyboard_answering(
+            recorder,
+            move |request| fail(request).map(Err),
+            capability_reply,
+        );
+    }
+
+    /// The scripted keyboard, with `answer` replying first to (or failing)
+    /// whatever it returns `Some` for.
+    #[cfg(target_os = "linux")]
+    fn scripted_keyboard_answering(
+        recorder: &crate::hid::TestHidRecorder,
+        answer: impl Fn(&[u8; 32]) -> Option<Result<[u8; 32], String>> + Send + 'static,
         capability_reply: Option<[u8; 32]>,
     ) {
         let definition = serde_json::json!({
@@ -1003,8 +1052,8 @@ mod tests {
             crate::app::pictograms::test_pictogram_read_responses(&library),
         );
         recorder.respond_by(move |request| {
-            if let Some(error) = fail(request) {
-                return Some(Err(error));
+            if let Some(answer) = answer(request) {
+                return Some(answer);
             }
             if matches!(request[0], 0xc0 | 0xca | 0xcb) {
                 return Some(Ok(pictograms
@@ -1077,7 +1126,7 @@ mod tests {
         let mut app = EntropyApp::new_inert_for_test();
         app.headless = true;
         app.device_manager.replace_devices(vec![device]);
-        app.test_connect_hid = Some(hid);
+        app.connect_hid = Some(hid);
         (app, session, recorder)
     }
 
@@ -1112,7 +1161,8 @@ mod tests {
     fn export_reads_the_whole_keyboard_without_a_single_write() {
         let (mut app, session, recorder) = scripted_export_app(|_| None);
 
-        let json = export_entlayout(&mut app, 0, &session, deadline()).unwrap();
+        let json =
+            export_entlayout(&mut app, 0, &session, deadline(), &AtomicBool::default()).unwrap();
 
         let requests = recorder.requests();
         assert!(requests.len() > 10, "{requests:02x?}");
@@ -1163,7 +1213,8 @@ mod tests {
                 .then(|| "HID timeout".to_owned())
         });
 
-        let error = export_entlayout(&mut app, 0, &session, deadline()).unwrap_err();
+        let error = export_entlayout(&mut app, 0, &session, deadline(), &AtomicBool::default())
+            .unwrap_err();
 
         assert_eq!(
             error,
@@ -1179,7 +1230,8 @@ mod tests {
             (request[0] == 0x11).then(|| "HID device disconnected".to_owned())
         });
 
-        let error = export_entlayout(&mut app, 0, &session, deadline()).unwrap_err();
+        let error = export_entlayout(&mut app, 0, &session, deadline(), &AtomicBool::default())
+            .unwrap_err();
 
         assert!(matches!(error, ExportError::Failed(_)), "{error:?}");
         assert_eq!(error.exit_code(), EXIT_FAILED);
@@ -1217,7 +1269,7 @@ mod tests {
 
         let (mut app, ctx, mut connection) = connected_export_app();
         let (replacement, _) = crate::hid::HidDevice::test_device();
-        app.test_connect_hid = Some(replacement);
+        app.connect_hid = Some(replacement);
         app.start_connect(0);
         assert!(matches!(
             connection.step(&mut app, &ctx),
@@ -1237,6 +1289,525 @@ mod tests {
         assert_eq!(
             connection.step(&mut app, &ctx),
             Err(ExportError::Incomplete(vec!["TapDance".to_owned()]))
+        );
+    }
+
+    /// A GUI instance connected to the scripted keyboard, its console export
+    /// channel listening at a temporary socket.
+    #[cfg(target_os = "linux")]
+    fn running_instance() -> (
+        EntropyApp,
+        crate::hid::TestHidRecorder,
+        tempfile::TempDir,
+        PathBuf,
+        egui::Context,
+    ) {
+        running_instance_with(|recorder| scripted_keyboard(recorder, |_| None))
+    }
+
+    /// The same with the keyboard `script` sets up. A plain keyboard, so
+    /// the GUI runs no display host data of its own.
+    #[cfg(target_os = "linux")]
+    fn running_instance_with(
+        script: impl FnOnce(&crate::hid::TestHidRecorder),
+    ) -> (
+        EntropyApp,
+        crate::hid::TestHidRecorder,
+        tempfile::TempDir,
+        PathBuf,
+        egui::Context,
+    ) {
+        let (mut app, _, _) = scripted_export_app(|_| None);
+        app.headless = false;
+        let mut device = crate::device::test_usb_device("3-4", 6, 0x0030);
+        device.name = "Export fixture".into();
+        app.device_manager.replace_devices(vec![device]);
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        script(&recorder);
+        app.connect_hid = Some(hid);
+        let ctx = egui::Context::default();
+        app.start_connect(0);
+        let started = Instant::now();
+        while !(matches!(app.connect_state, ConnectState::Idle) && app.layout.is_some()) {
+            assert!(started.elapsed() < Duration::from_secs(20), "connect hung");
+            app.poll_vial_hid_task(&ctx);
+            app.poll_connect(&ctx);
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("entropy").join("export.sock");
+        app.console_export_server = Some(ExportServer::start(&socket, ctx.clone()).unwrap());
+        (app, recorder, dir, socket, ctx)
+    }
+
+    /// One frame of the GUI: its background work and the editor's pending
+    /// Key Override write.
+    #[cfg(target_os = "linux")]
+    fn frame(app: &mut EntropyApp, ctx: &egui::Context, started: Instant) {
+        app.tick_layout_import_lifecycle_for_test(ctx, started.elapsed().as_secs_f64());
+        app.flush_pending_key_override_writes();
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    /// A console export against `app`, answered on another thread.
+    #[cfg(target_os = "linux")]
+    fn start_console_export(
+        socket: &Path,
+        request: HeadlessExportRequest,
+    ) -> std::thread::JoinHandle<Option<i32>> {
+        let socket = socket.to_owned();
+        std::thread::spawn(move || running_instance::export_via_socket(&socket, &request))
+    }
+
+    /// Pumps `app`'s frames until the console has its answer.
+    #[cfg(target_os = "linux")]
+    fn finish_console_export(
+        app: &mut EntropyApp,
+        ctx: &egui::Context,
+        client: std::thread::JoinHandle<Option<i32>>,
+    ) -> Option<i32> {
+        let started = Instant::now();
+        while !client.is_finished() {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "console export hung"
+            );
+            frame(app, ctx, started);
+        }
+        client.join().unwrap()
+    }
+
+    /// One console export against `app`, pumping its frames meanwhile.
+    #[cfg(target_os = "linux")]
+    fn console_export(
+        app: &mut EntropyApp,
+        ctx: &egui::Context,
+        socket: &Path,
+        request: HeadlessExportRequest,
+    ) -> Option<i32> {
+        let client = start_console_export(socket, request);
+        finish_console_export(app, ctx, client)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn export_to(path: &Path, device: &str) -> HeadlessExportRequest {
+        HeadlessExportRequest {
+            destination: ExportDestination::File(path.to_owned()),
+            device: Some(device.into()),
+            timeout: Duration::from_secs(20),
+        }
+    }
+
+    /// A keyboard with one Key Override, enabled and triggered by a
+    /// modifier: loading it, the editor disables the rule and writes that
+    /// repair back.
+    #[cfg(target_os = "linux")]
+    fn modifier_triggered_key_override(request: &[u8; 32]) -> Option<Result<[u8; 32], String>> {
+        let mut response = [0u8; 32];
+        match request[..3] {
+            [0xFE, 0x0D, 0x00] => response[..3].copy_from_slice(&[1, 1, 1]),
+            [0xFE, 0x0D, 0x05] => {
+                response[1..3].copy_from_slice(&0x00E1u16.to_le_bytes());
+                response[3..5].copy_from_slice(&0x0004u16.to_le_bytes());
+                response[5..7].copy_from_slice(&u16::MAX.to_le_bytes());
+                response[10] = 0x80 | 0x01;
+            }
+            _ => return None,
+        }
+        Some(Ok(response))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn writes_since(recorder: &crate::hid::TestHidRecorder, before: usize) -> Vec<[u8; 32]> {
+        recorder.requests()[before..]
+            .iter()
+            .filter(|request| is_write(request))
+            .copied()
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn console_export_never_writes_the_repair_its_load_would_make() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (mut app, recorder, dir, socket, ctx) = running_instance_with(|recorder| {
+            recorder.set_bluetooth();
+            scripted_keyboard_answering(recorder, modifier_triggered_key_override, None);
+        });
+        assert!(app.deferred_device_load.is_staged());
+        assert_eq!(
+            app.deferred_device_load
+                .section_status(DeferredLoadSection::KeyOverrides),
+            DeferredLoadStatus::NotLoaded
+        );
+        let before = recorder.requests().len();
+        let path = dir.path().join("backup.entlayout");
+
+        let code = console_export(&mut app, &ctx, &socket, export_to(&path, "export fixture"));
+        let started = Instant::now();
+        for _ in 0..10 {
+            frame(&mut app, &ctx, started);
+        }
+
+        assert_eq!(code, Some(EXIT_OK));
+        assert!(path.exists());
+        let writes = writes_since(&recorder, before);
+        assert!(writes.is_empty(), "the console export wrote: {writes:02x?}");
+        assert_eq!(
+            app.deferred_device_load
+                .section_status(DeferredLoadSection::KeyOverrides),
+            DeferredLoadStatus::NotLoaded,
+            "the export loaded into the editor"
+        );
+        assert!(!app.key_override_dirty);
+    }
+
+    /// Holds the first definition read after `arm` until `open`: the GUI has
+    /// read its own by then, so it is an export's connect that waits here.
+    #[cfg(target_os = "linux")]
+    struct DefinitionGate {
+        armed: std::sync::Arc<AtomicBool>,
+        entered: std::sync::mpsc::Receiver<()>,
+        release: std::sync::mpsc::Sender<()>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl DefinitionGate {
+        /// The gate, and the keyboard's side of it to run on every request.
+        fn new() -> (Self, impl Fn(&[u8; 32]) + Send + 'static) {
+            let armed = std::sync::Arc::new(AtomicBool::new(false));
+            let (entered_tx, entered) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let hold = armed.clone();
+            let keyboard = move |request: &[u8; 32]| {
+                if request[..2] == [0xFE, 0x01] && hold.swap(false, Ordering::AcqRel) {
+                    entered_tx.send(()).unwrap();
+                    released.recv().unwrap();
+                }
+            };
+            let gate = Self {
+                armed,
+                entered,
+                release,
+            };
+            (gate, keyboard)
+        }
+
+        fn arm(&self) {
+            self.armed.store(true, Ordering::Release);
+        }
+
+        /// Pumps `app`'s frames until an export waits at the gate.
+        fn wait(&self, app: &mut EntropyApp, ctx: &egui::Context, started: Instant) {
+            while self.entered.try_recv().is_err() {
+                assert!(
+                    started.elapsed() < Duration::from_secs(20),
+                    "export never ran"
+                );
+                frame(app, ctx, started);
+            }
+        }
+
+        fn open(&self) {
+            self.release.send(()).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_edit_made_while_the_export_runs_is_written_after_it() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (gate, at_gate) = DefinitionGate::new();
+        let (mut app, recorder, dir, socket, ctx) = running_instance_with(move |recorder| {
+            scripted_keyboard_answering(
+                recorder,
+                move |request| {
+                    at_gate(request);
+                    let mut response = [0u8; 32];
+                    match request[..3] {
+                        [0xFE, 0x0D, 0x00] => response[..3].copy_from_slice(&[1, 1, 1]),
+                        [0xFE, 0x0D, 0x05] => {
+                            response[1..3].copy_from_slice(&0x0004u16.to_le_bytes());
+                            response[3..5].copy_from_slice(&0x0005u16.to_le_bytes());
+                        }
+                        _ => return None,
+                    }
+                    Some(Ok(response))
+                },
+                None,
+            );
+        });
+        gate.arm();
+        let before = recorder.requests().len();
+        let path = dir.path().join("backup.entlayout");
+        let client = start_console_export(&socket, export_to(&path, "export fixture"));
+        let started = Instant::now();
+        gate.wait(&mut app, &ctx, started);
+
+        // The user edits the Key Override while the export has the keyboard.
+        app.key_override_entries[0].replacement = 0x0006;
+        app.key_override_dirty = true;
+        for _ in 0..5 {
+            frame(&mut app, &ctx, started);
+        }
+        assert!(
+            writes_since(&recorder, before).is_empty(),
+            "the edit reached the keyboard while the export had it"
+        );
+        assert!(app.key_override_dirty, "the edit was dropped");
+
+        gate.open();
+        assert_eq!(finish_console_export(&mut app, &ctx, client), Some(EXIT_OK));
+        while app.key_override_dirty {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "edit never written"
+            );
+            frame(&mut app, &ctx, started);
+        }
+        let writes = writes_since(&recorder, before);
+        assert!(
+            writes
+                .iter()
+                .any(|request| request[..4] == [0xFE, 0x0D, 0x06, 0] && request[6] == 0x06),
+            "the edit was not written: {writes:02x?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_console_that_hangs_up_gives_the_gui_its_connection_back() {
+        use std::io::Write;
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (gate, at_gate) = DefinitionGate::new();
+        let (mut app, recorder, dir, socket, ctx) = running_instance_with(move |recorder| {
+            scripted_keyboard_answering(
+                recorder,
+                move |request| {
+                    at_gate(request);
+                    None
+                },
+                None,
+            );
+        });
+        gate.arm();
+        let mut console = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        console
+            .write_all(b"{\"command\":\"export-layout\",\"version\":1,\"device\":null,\"timeout_ms\":20000}\n")
+            .unwrap();
+        let started = Instant::now();
+        gate.wait(&mut app, &ctx, started);
+
+        // The export is stuck on the keyboard when its console goes away.
+        drop(console);
+        while app.pending_console_export.is_some() || app.hid_device.is_none() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the abandoned export kept the connection"
+            );
+            frame(&mut app, &ctx, started);
+        }
+        let before = recorder.requests().len();
+        gate.open();
+        for _ in 0..10 {
+            frame(&mut app, &ctx, started);
+        }
+        assert!(
+            recorder.requests()[before..]
+                .iter()
+                .all(|request| request[0] != 0x12),
+            "the abandoned export went on reading the keymap"
+        );
+
+        let path = dir.path().join("backup.entlayout");
+        let code = console_export(&mut app, &ctx, &socket, export_to(&path, "export fixture"));
+        assert_eq!(code, Some(EXIT_OK));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hung_up_export_never_answers_the_next_console() {
+        use std::io::Write;
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (gate, at_gate) = DefinitionGate::new();
+        let (mut app, _, dir, socket, ctx) = running_instance_with(move |recorder| {
+            scripted_keyboard_answering(
+                recorder,
+                move |request| {
+                    at_gate(request);
+                    None
+                },
+                None,
+            );
+        });
+        gate.arm();
+        let mut first = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        first
+            .write_all(b"{\"command\":\"export-layout\",\"version\":1,\"device\":null,\"timeout_ms\":20000}\n")
+            .unwrap();
+        let started = Instant::now();
+        gate.wait(&mut app, &ctx, started);
+
+        // A second console asks while the first export holds the keyboard,
+        // and the first hangs up: its export is cancelled with the second
+        // one already queued behind it.
+        let path = dir.path().join("backup.entlayout");
+        let second = start_console_export(&socket, export_to(&path, "export fixture"));
+        drop(first);
+        std::thread::sleep(Duration::from_millis(500));
+        for _ in 0..5 {
+            frame(&mut app, &ctx, started);
+        }
+        gate.open();
+
+        assert_eq!(
+            finish_console_export(&mut app, &ctx, second),
+            Some(EXIT_OK),
+            "the second console got the first export's answer"
+        );
+        assert!(path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_export_that_loses_the_connection_hands_it_to_recovery() {
+        for bluetooth in [false, true] {
+            let _storage = crate::app::app_storage::ScopedTempConfig::new();
+            let lose = std::sync::Arc::new(AtomicBool::new(false));
+            let armed = lose.clone();
+            let (mut app, _, dir, socket, ctx) = running_instance_with(move |recorder| {
+                if bluetooth {
+                    recorder.set_bluetooth();
+                }
+                let transport = recorder.clone();
+                scripted_keyboard_answering(
+                    recorder,
+                    move |_| {
+                        // The helper times out under the export, retiring the
+                        // connection the GUI lent; the keyboard stays listed.
+                        armed.swap(false, Ordering::AcqRel).then(|| {
+                            transport.retire_transport();
+                            Err("HID helper timed out".to_owned())
+                        })
+                    },
+                    None,
+                );
+            });
+            lose.store(true, Ordering::Release);
+            let path = dir.path().join("backup.entlayout");
+
+            let code = console_export(&mut app, &ctx, &socket, export_to(&path, "export fixture"));
+
+            assert_ne!(code, Some(EXIT_OK), "bluetooth: {bluetooth}");
+            assert!(!path.exists());
+            assert!(
+                app.hid_device.is_none(),
+                "the retired connection stayed installed, bluetooth: {bluetooth}"
+            );
+            // The fixture's device is a USB one: its recovery is the cleanup
+            // after which the next scan opens it again.
+            assert!(
+                app.layout.is_none(),
+                "the lost connection was kept, bluetooth: {bluetooth}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn running_instance_answers_a_console_export_without_writes() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (mut app, recorder, dir, socket, ctx) = running_instance();
+        let before = recorder.requests().len();
+        let path = dir.path().join("backup.entlayout");
+
+        let code = console_export(
+            &mut app,
+            &ctx,
+            &socket,
+            HeadlessExportRequest {
+                destination: ExportDestination::File(path.clone()),
+                device: Some("export fixture".into()),
+                timeout: Duration::from_secs(20),
+            },
+        );
+
+        assert_eq!(code, Some(EXIT_OK));
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["format"], "entropy.layout");
+        let writes: Vec<_> = recorder.requests()[before..]
+            .iter()
+            .filter(|request| is_write(request))
+            .copied()
+            .collect();
+        assert!(writes.is_empty(), "the console export wrote: {writes:02x?}");
+        assert!(app.pending_console_export.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn console_export_keeps_the_backup_when_a_section_read_fails() {
+        for bluetooth in [false, true] {
+            let _storage = crate::app::app_storage::ScopedTempConfig::new();
+            // A combo read fails while the keyboard stays connected: both the
+            // connect and the staged load fill in an empty combo and go on.
+            let (mut app, _, dir, socket, ctx) = running_instance_with(move |recorder| {
+                if bluetooth {
+                    recorder.set_bluetooth();
+                }
+                scripted_keyboard(recorder, |request| {
+                    (request[..3] == [0xFE, 0x0D, 0x03]).then(|| "HID timeout".to_owned())
+                });
+            });
+            let path = dir.path().join("backup.entlayout");
+            std::fs::write(&path, "previous backup").unwrap();
+
+            let code = console_export(&mut app, &ctx, &socket, export_to(&path, "export fixture"));
+
+            assert_eq!(code, Some(EXIT_INCOMPLETE), "bluetooth: {bluetooth}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "previous backup",
+                "bluetooth: {bluetooth}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn console_export_of_another_keyboard_reports_no_device() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (mut app, _, dir, socket, ctx) = running_instance();
+        let path = dir.path().join("backup.entlayout");
+
+        let code = console_export(
+            &mut app,
+            &ctx,
+            &socket,
+            HeadlessExportRequest {
+                destination: ExportDestination::File(path.clone()),
+                device: Some("e126:0071".into()),
+                timeout: Duration::from_secs(20),
+            },
+        );
+
+        assert_eq!(code, Some(EXIT_NO_DEVICE));
+        assert!(!path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn console_export_without_a_listening_instance_keeps_the_old_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let request = HeadlessExportRequest {
+            destination: ExportDestination::Stdout,
+            device: None,
+            timeout: Duration::from_secs(1),
+        };
+        assert_eq!(
+            running_instance::export_via_socket(&dir.path().join("export.sock"), &request),
+            None
         );
     }
 }
