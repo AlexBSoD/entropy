@@ -1113,6 +1113,30 @@ impl EntropyApp {
         );
     }
 
+    /// Keeps a key or encoder the board went away under, to write once it is
+    /// back. The editor shows what the board holds until then.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn keep_unsaved_single_write(&mut self, operation: &VialHidOperation) {
+        let Some(edits) = self.unsaved_edits_mut() else {
+            return;
+        };
+        match *operation {
+            VialHidOperation::KeyWrite {
+                layer,
+                key_index,
+                binding,
+                ..
+            } => edits.keep_key(layer, key_index, binding),
+            VialHidOperation::EncoderWrite {
+                layer,
+                encoder_visual_index,
+                keycode,
+                ..
+            } => edits.keep_encoder(layer, encoder_visual_index, keycode),
+            _ => {}
+        }
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     fn rollback_single_write(&mut self, operation: &VialHidOperation) {
         match operation {
@@ -1245,6 +1269,9 @@ impl EntropyApp {
             &operation,
             VialHidOperation::KeyWrite { .. } | VialHidOperation::EncoderWrite { .. }
         ) {
+            if disconnected {
+                self.keep_unsaved_single_write(&operation);
+            }
             self.rollback_single_write(&operation);
             self.status_msg = match operation {
                 VialHidOperation::EncoderWrite { .. } => {

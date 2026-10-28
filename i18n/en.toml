@@ -32,6 +32,7 @@ show_hide_keys_exit = "Right click or Esc to finish"
 
 [layer_actions]
 save_default_to_device = "Save Default to Macropad"
+unsaved_edits = "Unsaved edits"
 menu = "Layer operations"
 menu_tooltip = "Layer actions"
 copy = "Copy layer"

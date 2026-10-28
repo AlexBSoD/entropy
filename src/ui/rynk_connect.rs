@@ -933,11 +933,14 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             app.poll_settings_write(&ctx);
+            app.poll_vial_hid_task(&ctx);
+            app.poll_layer_write(&ctx);
             app.flush_pending_tap_hold_numeric_writes();
+            app.maybe_rewrite_unsaved_layer();
             // Without the board, what waits keeps waiting.
-            if !app.hid_write_task_active()
-                && (app.pending_tap_hold_numeric_writes.is_empty() || app.hid_device.is_none())
-            {
+            let waiting =
+                !app.pending_tap_hold_numeric_writes.is_empty() || app.unsaved_edits.is_some();
+            if !app.hid_write_task_active() && (!waiting || app.hid_device.is_none()) {
                 return;
             }
             assert!(
@@ -987,6 +990,62 @@ mod tests {
         assert_eq!(stored.settings[&6], 190u16.to_le_bytes(), "the one waiting");
         assert_eq!(stored.settings[&121], [9], "the debounced one");
         assert_eq!(app.touchpad_settings.sniper_sens, 9);
+        assert!(app.unsaved_edits.is_none());
+    }
+
+    #[test]
+    fn keys_the_board_never_confirmed_are_written_once_it_is_back() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (board, state) = board(stored());
+        let path = "hid:unsaved-keys";
+        let first = link(path, &board);
+        let mut app = connected_over_bluetooth(path);
+        let ctx = egui::Context::default();
+
+        board.go_away();
+        assert!(app.assign_key_binding(&ctx, 0, 0, KeyBinding::Vial(0x06)));
+        settle_writes(&mut app);
+        let layout = app.layout.as_ref().unwrap();
+        assert_eq!(
+            layout.get_key_binding(0, 0),
+            KeyBinding::Vial(0x04),
+            "the editor shows what the board holds meanwhile"
+        );
+        drop(first);
+
+        let _second = reconnect(&mut app, path, &board);
+        settle_writes(&mut app);
+        assert_eq!(state.lock().unwrap().keymap[0], key(HidKeyCode::C));
+        let layout = app.layout.as_ref().unwrap();
+        assert_eq!(layout.get_key_binding(0, 0), KeyBinding::Vial(0x06));
+        assert!(app.unsaved_edits.is_none());
+    }
+
+    #[test]
+    fn a_layer_write_the_board_dropped_out_of_is_finished_once_it_is_back() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (board, state) = board(stored());
+        let path = "hid:unsaved-layer";
+        let first = link(path, &board);
+        let mut app = connected_over_bluetooth(path);
+
+        board.go_away();
+        app.apply_layer_snapshot(
+            1,
+            crate::app::layer_operations::LayerSnapshot {
+                keycodes: vec![KeyBinding::Vial(0x06), KeyBinding::Vial(0x07)],
+                encoder_keycodes: Vec::new(),
+            },
+            "layer_actions.paste",
+        );
+        settle_writes(&mut app);
+        drop(first);
+
+        let _second = reconnect(&mut app, path, &board);
+        settle_writes(&mut app);
+        let stored = state.lock().unwrap();
+        assert_eq!(stored.keymap[2], key(HidKeyCode::C));
+        assert_eq!(stored.keymap[3], key(HidKeyCode::D));
         assert!(app.unsaved_edits.is_none());
     }
 

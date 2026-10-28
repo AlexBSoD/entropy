@@ -272,6 +272,7 @@ impl EntropyApp {
         self.poll_ibus_reload(ctx);
         self.maybe_start_pending_layout_undo(ctx);
         self.maybe_start_pending_layer_write();
+        self.maybe_rewrite_unsaved_layer();
         self.maybe_start_combo_write(ctx);
         self.finish_deferred_exit_after_hid_write(ctx);
         self.poll_text_expander_deferred_save(now);
