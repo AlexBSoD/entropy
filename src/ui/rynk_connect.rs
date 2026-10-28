@@ -11,7 +11,7 @@ use super::device_connect_task::{
     use_device_name_for_unnamed_layout,
 };
 use super::*;
-use crate::rynk::client::RynkClientError;
+use crate::rynk::client::{fnv1a, RynkClientError};
 use crate::rynk::dynamic::{DynamicLoss, DynamicSlot};
 use crate::rynk::link::{PhysicalId, RynkLink};
 use crate::rynk::session::RynkSession;
@@ -42,10 +42,7 @@ impl EntropyApp {
         let capabilities = *session.capabilities();
 
         progress("Reading keyboard definition…")?;
-        let hash = info.definition_hash;
-        let definition = session
-            .link()
-            .run(move |client| client.read_board_definition(hash))
+        let definition = board_definition(&session, rynk_cache_dir().as_deref())
             .map_err(|error| rynk_failed("Definition read", error))?;
         let json = crate::hid::decode_vial_definition(&definition)
             .map_err(failed(language, "Definition decode"))?;
@@ -376,6 +373,54 @@ impl EntropyApp {
 
 const QK_REPEAT_KEY: u16 = 0x7C79;
 
+/// Where board definitions are kept by hash, beside the Vial cache. Tests
+/// read their boards' definitions every time.
+fn rynk_cache_dir() -> Option<std::path::PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    let dir = dirs::config_dir()?.join("entropy").join("rynk_cache");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// The board's definition: the copy kept in `cache` under the hash the board
+/// reports on every connect, or else read from the board and kept there. A
+/// changed definition has another hash, and a copy that does not hash to its
+/// name is read again.
+fn board_definition(
+    session: &RynkSession,
+    cache: Option<&std::path::Path>,
+) -> Result<Vec<u8>, RynkClientError> {
+    let hash = session.info().definition_hash;
+    let path = cache.map(|dir| dir.join(format!("definition_{hash:08x}.xz")));
+    if let Some(kept) = path.as_ref().and_then(|path| std::fs::read(path).ok()) {
+        if fnv1a(&kept) == hash {
+            return Ok(kept);
+        }
+    }
+    let definition = session
+        .link()
+        .run(move |client| client.read_board_definition(hash))?;
+    if let Some(path) = path {
+        if let Err(error) = keep(&path, &definition) {
+            log::warn!("Rynk definition not kept at {}: {error}", path.display());
+        }
+    }
+    Ok(definition)
+}
+
+/// Writes `bytes` to `path` through a file beside it, so a crash leaves no
+/// half of a definition behind.
+fn keep(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let mut file = tempfile::NamedTempFile::new_in(dir)?;
+    file.write_all(bytes)?;
+    file.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
 /// What the editor shows of an entry. What it cannot show goes to the report
 /// after connect, since editing the entry replaces it.
 fn shown<T>(
@@ -581,6 +626,56 @@ mod tests {
             .count();
         assert_eq!(settings, 3, "each read once, ahead");
         assert_eq!(state.writes(), [], "loading writes nothing");
+    }
+
+    fn definition_reads(state: &std::sync::Mutex<Stored>) -> usize {
+        let state = state.lock().unwrap();
+        state
+            .received
+            .iter()
+            .filter(|cmd| **cmd == rmk_types_rynk::protocol::rynk::Cmd::GetBoardDefinition)
+            .count()
+    }
+
+    #[test]
+    fn a_kept_definition_is_not_read_again() {
+        let cache = tempfile::tempdir().unwrap();
+        let (board, state) = board(stored());
+        let session = RynkSession::new(link("definition-kept", &board));
+        let definition = state.lock().unwrap().definition.clone();
+
+        assert_eq!(
+            board_definition(&session, Some(cache.path())).unwrap(),
+            definition
+        );
+        assert_eq!(definition_reads(&state), 1);
+        assert_eq!(
+            board_definition(&session, Some(cache.path())).unwrap(),
+            definition
+        );
+        assert_eq!(definition_reads(&state), 1, "the kept copy served");
+
+        assert_eq!(board_definition(&session, None).unwrap(), definition);
+        assert_eq!(definition_reads(&state), 2, "nowhere to keep it");
+    }
+
+    #[test]
+    fn a_kept_definition_that_does_not_hash_to_its_name_is_read_again() {
+        let cache = tempfile::tempdir().unwrap();
+        let (board, state) = board(stored());
+        let session = RynkSession::new(link("definition-damaged", &board));
+        let definition = state.lock().unwrap().definition.clone();
+        let kept = cache
+            .path()
+            .join(format!("definition_{:08x}.xz", fnv1a(&definition)));
+        std::fs::write(&kept, b"half a definition").unwrap();
+
+        assert_eq!(
+            board_definition(&session, Some(cache.path())).unwrap(),
+            definition
+        );
+        assert_eq!(definition_reads(&state), 1);
+        assert_eq!(std::fs::read(&kept).unwrap(), definition, "kept whole now");
     }
 
     #[test]
