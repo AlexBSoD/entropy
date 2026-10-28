@@ -846,7 +846,8 @@ impl EntropyApp {
             Ok(VialHidOutcome::Battery(battery)) => {
                 if let Some(info) = self.device_about_info.as_mut() {
                     info.battery_halves = battery;
-                    crate::battery_log::record(info.keyboard_id, battery);
+                    let keyboard_id = info.keyboard_id;
+                    self.log_battery(keyboard_id, battery);
                 }
                 self.schedule_battery_refresh_for_result(battery);
             }
