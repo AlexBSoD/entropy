@@ -6,6 +6,8 @@ mod app;
 mod app_discovery;
 pub(crate) mod app_icon;
 mod application_layouts;
+#[cfg(not(target_arch = "wasm32"))]
+mod battery_log;
 mod device;
 #[cfg(not(target_arch = "wasm32"))]
 mod device_session;

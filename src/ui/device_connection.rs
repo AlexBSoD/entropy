@@ -130,6 +130,7 @@ impl EntropyApp {
         self.pending_layout_indicator_open_after_unlock = false;
         self.reset_matrix_tester_state();
         self.next_battery_refresh_at = None;
+        crate::battery_log::gap();
 
         self.status_msg = crate::i18n::tr_catalog_format(
             self.app_settings.language,
@@ -223,6 +224,7 @@ impl EntropyApp {
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.next_battery_refresh_at = None;
+            crate::battery_log::gap();
         }
         self.supported_qmk_settings.clear();
         self.undo_stack.clear();
