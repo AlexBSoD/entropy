@@ -159,6 +159,8 @@ impl EntropyApp {
             application_categories_selected_id: None,
             application_categories_name: String::new(),
             pending_device_connect: None,
+            remembered_device: None,
+            pending_takeover: None,
             #[cfg(not(target_arch = "wasm32"))]
             headless: false,
             firmware: FirmwareProtocol::Vial,
@@ -235,6 +237,12 @@ impl EntropyApp {
             linux_background_since: None,
             #[cfg(target_os = "linux")]
             linux_background_focus_left: false,
+            #[cfg(target_os = "linux")]
+            linux_tray: None,
+            #[cfg(target_os = "linux")]
+            linux_hidden_to_tray: false,
+            #[cfg(target_os = "linux")]
+            linux_start_hidden_to_tray_pending: false,
             close_to_tray_prompt_open: false,
             close_to_tray_prompt_remember: false,
             force_close_requested: false,

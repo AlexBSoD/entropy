@@ -1,7 +1,7 @@
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub(crate) static TRAY_QUIT_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub(crate) static TRAY_RESTORE_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -5460,6 +5460,12 @@ pub struct EntropyApp {
     pub(super) settings_write_generation: u64,
     pub(super) qmk_settings_write_queue: QmkSettingsWriteQueue,
     pub(super) pending_device_connect: Option<DeviceIdentity>,
+    /// The board the user picked last: it is connected again when it comes
+    /// back, however many others are listed. Picking another replaces it.
+    pub(super) remembered_device: Option<DeviceIdentity>,
+    /// The remembered board's takeover while it waits in
+    /// `pending_device_connect`: it lapses with the memory.
+    pub(super) pending_takeover: Option<DeviceIdentity>,
     /// Built-in qmk-hid-host bridges for displays/presets that need host data
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) qmk_hid_hosts:
@@ -5574,6 +5580,12 @@ pub struct EntropyApp {
     pub(crate) linux_background_since: Option<f64>,
     #[cfg(target_os = "linux")]
     pub(crate) linux_background_focus_left: bool,
+    #[cfg(target_os = "linux")]
+    pub(crate) linux_tray: Option<crate::linux_tray::LinuxTray>,
+    #[cfg(target_os = "linux")]
+    pub(crate) linux_hidden_to_tray: bool,
+    #[cfg(target_os = "linux")]
+    pub(crate) linux_start_hidden_to_tray_pending: bool,
     pub(crate) close_to_tray_prompt_open: bool,
     pub(crate) close_to_tray_prompt_remember: bool,
     pub(crate) force_close_requested: bool,
