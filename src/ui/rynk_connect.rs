@@ -1165,6 +1165,29 @@ mod tests {
     }
 
     #[test]
+    fn a_setting_dragged_over_many_steps_writes_the_one_in_flight_and_the_last() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let mut stored = stored();
+        stored.settings.insert(317, vec![10]);
+        let (board, state) = board(stored);
+        let path = "hid:dragged-setting";
+        let _held = link(path, &board);
+        let mut app = connected_over_bluetooth(path);
+        let before = board.sent().len();
+
+        for value in 11..=60 {
+            app.queue_layer_led_setting_write("LED timeout".into(), 317, 1, value - 1, value);
+        }
+        settle_writes(&mut app);
+        let writes = board.sent()[before..]
+            .iter()
+            .filter(|header| header.cmd == rmk_types_rynk::protocol::rynk::Cmd::SetSetting)
+            .count();
+        assert!(writes <= 2, "{writes} writes for one drag");
+        assert_eq!(state.lock().unwrap().settings[&317], [60]);
+    }
+
+    #[test]
     fn a_key_set_again_after_the_board_is_back_wins_over_the_kept_one() {
         let _storage = crate::app::app_storage::ScopedTempConfig::new();
         let (board, state) = board(stored());

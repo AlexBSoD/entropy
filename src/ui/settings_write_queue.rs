@@ -340,16 +340,17 @@ impl SettingsWriteQueueState {
         );
         let id = request.id;
 
-        if request.target.is_display() {
-            if let Some(existing) = self
-                .pending
-                .iter_mut()
-                .find(|existing| existing.qsid == request.qsid && existing.target.is_display())
-            {
-                request.old_value = existing.old_value;
-                *existing = request;
-                return id;
-            }
+        // A value not sent yet gives way to a newer one of its setting, in
+        // its place: a slider dragged over a hundred steps writes the one in
+        // flight and the last, not every step behind it.
+        if let Some(existing) = self
+            .pending
+            .iter_mut()
+            .find(|existing| existing.qsid == request.qsid)
+        {
+            request.old_value = existing.old_value;
+            *existing = request;
+            return id;
         }
 
         self.pending.push_back(request);
@@ -1283,6 +1284,28 @@ mod tests {
         assert_eq!(request.old_value, 84);
         assert_eq!(request.requested, 140);
         assert_eq!(queue.pending_value(320), Some(140));
+    }
+
+    #[test]
+    fn a_pending_write_of_any_setting_gives_way_to_its_latest_value() {
+        let mut queue = SettingsWriteQueueState::default();
+        let in_flight = queue.enqueue(request(317, 10));
+        assert_eq!(queue.pop_front().map(|request| request.id), Some(in_flight));
+        let other = queue.enqueue(request(316, 50));
+        for step in 11..=60 {
+            queue.enqueue(request(317, step));
+        }
+
+        assert_eq!(
+            queue.pending.len(),
+            2,
+            "the other setting and the last step"
+        );
+        assert_eq!(queue.pending_value(317), Some(60));
+        assert_eq!(queue.pop_front().map(|request| request.id), Some(other));
+        let last = queue.pop_front().expect("the last step");
+        assert_eq!((last.qsid, last.requested), (317, 60));
+        assert!(queue.pop_front().is_none());
     }
 
     #[test]
