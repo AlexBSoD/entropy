@@ -367,6 +367,8 @@ impl EntropyApp {
             #[cfg(not(target_arch = "wasm32"))]
             connect_hid: None,
             #[cfg(not(target_arch = "wasm32"))]
+            connect_rynk: None,
+            #[cfg(not(target_arch = "wasm32"))]
             device_scan_state: DeviceScanState::Idle,
         }
     }

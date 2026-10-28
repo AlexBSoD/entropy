@@ -324,32 +324,41 @@ fn connect_until(path: &Path, deadline: Instant) -> Option<std::io::Result<UnixS
         .ok()
 }
 
-/// Runs the standalone export over `hid`, the running instance's own
-/// connection, lent for the duration through a read-only view: every write
-/// is refused at the transport, failed reads are listed instead of exported,
-/// and what the export loads stays in its own app. It ends early once
-/// `cancelled` is set.
+/// Runs the standalone export over `connection`, the running instance's own,
+/// lent for the duration through a read-only view: every write is refused at
+/// the transport, failed reads are listed instead of exported, and what the
+/// export loads stays in its own app. It ends early once `cancelled` is set.
 pub(crate) fn export_lent_keyboard(
-    hid: &crate::hid::HidDevice,
+    connection: &crate::device_session::DeviceSession,
     device: Device,
     deadline: Instant,
     cancelled: &AtomicBool,
 ) -> Reply {
+    use crate::device_session::DeviceSession;
+
     let session = ReadOnlySessions::default();
-    let Some(view) = hid.read_only_view(session.hid.clone()) else {
-        return Reply::Failed {
-            message: "This keyboard's connection cannot be lent to an export".to_owned(),
-        };
-    };
-    log::info!("Exporting layout of {} for the console", describe(&device));
     let mut app = EntropyApp::new_headless();
+    match connection {
+        DeviceSession::Vial(hid) => {
+            let Some(view) = hid.read_only_view(session.hid.clone()) else {
+                return Reply::Failed {
+                    message: "This keyboard's connection cannot be lent to an export".to_owned(),
+                };
+            };
+            app.connect_hid = Some(view);
+        }
+        DeviceSession::Rynk(rynk) => {
+            app.connect_rynk = Some(rynk.link().read_only_view(session.rynk.clone()));
+        }
+    }
+    log::info!("Exporting layout of {} for the console", describe(&device));
     app.device_manager.replace_devices(vec![device]);
-    app.connect_hid = Some(view);
     let exported = export_entlayout(&mut app, 0, &session, deadline, cancelled);
     // A worker the export leaves behind must not reach the keyboard once the
     // GUI has it back.
     session.hid.close();
-    let refused = session.hid.refused_requests().len();
+    session.rynk.close();
+    let refused = session.hid.refused_requests().len() + session.rynk.refused_requests().len();
     if refused > 0 {
         log::info!("Refused {refused} keyboard write(s) during the console export");
     }

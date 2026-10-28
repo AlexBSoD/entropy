@@ -764,6 +764,7 @@ impl EntropyApp {
             return;
         }
         let supplied_hid = self.connect_hid.take();
+        let supplied_rynk = self.connect_rynk.take();
         let language = self.app_settings.language;
 
         std::thread::spawn(move || {
@@ -776,7 +777,7 @@ impl EntropyApp {
             };
             let result = (|| -> Result<ConnectResult, String> {
                 if dev.firmware == FirmwareProtocol::Rynk {
-                    return Self::connect_rynk(&dev, language, &progress);
+                    return Self::connect_rynk(&dev, supplied_rynk, language, &progress);
                 }
                 use crate::hid::HidDevice;
 

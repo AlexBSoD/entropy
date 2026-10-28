@@ -1338,11 +1338,68 @@ mod tests {
         );
     }
 
+    /// A two-key, two-layer Rynk board with a Rynk-only action, a macro, a
+    /// setting and halves to wake for a battery reading. Its layer 1 is named
+    /// as Entropy names it, or `unnamed`, so that a connect names it.
+    fn rynk_board(
+        unnamed: bool,
+    ) -> (
+        crate::rynk::client::testing::FakeBoard,
+        std::sync::Arc<std::sync::Mutex<crate::rynk::session::testing::Stored>>,
+    ) {
+        use rmk_types_rynk::action::{Action, KeyAction};
+        use rmk_types_rynk::keyboard_macros::MacroOp;
+        use rmk_types_rynk::keycode::{HidKeyCode, KeyCode};
+        use rmk_types_rynk::protocol::rynk::ergohaven::{caps, BatteryHalves};
+
+        let mut stored = crate::rynk::session::testing::Stored::new(1, 2, 2);
+        let definition = serde_json::json!({
+            "name": "Rynk fixture",
+            "matrix": {"rows": 1, "cols": 2},
+            "layouts": {"keymap": [["0,0", "0,1"]]}
+        })
+        .to_string();
+        lzma_rs::xz_compress(&mut definition.as_bytes(), &mut stored.definition).unwrap();
+        let key = |code| Action::Key(KeyCode::Hid(code));
+        stored.keymap = vec![
+            KeyAction::Single(key(HidKeyCode::A)),
+            KeyAction::Tap(key(HidKeyCode::A)),
+            KeyAction::Single(key(HidKeyCode::B)),
+            KeyAction::No,
+        ];
+        stored.capabilities.max_macros = 1;
+        stored.macros = vec![vec![MacroOp::Char(b'h'), MacroOp::Char(b'i')]];
+        stored.settings.insert(7, 300u16.to_le_bytes().to_vec());
+        stored.settings.insert(200, b"Base\0".to_vec());
+        let layer_1: &[u8] = if unnamed { b"\0" } else { b"1\0" };
+        stored.settings.insert(201, layer_1.to_vec());
+        stored.caps = caps::BATTERY_HALVES;
+        stored.battery = Some(BatteryHalves {
+            mask: 0b11,
+            left: 50,
+            right: 60,
+        });
+        crate::rynk::session::testing::board(stored)
+    }
+
+    fn rynk_device(path: &str) -> Device {
+        Device {
+            name: "Rynk fixture".into(),
+            vendor_id: 0xE126,
+            product_id: 0x0074,
+            manufacturer: "Ergohaven".into(),
+            serial_number: "rynk:010203".into(),
+            bus_type: "Usb".into(),
+            path: path.into(),
+            instance_token: String::new(),
+            firmware: FirmwareProtocol::Rynk,
+        }
+    }
+
     /// The export's own guard switches every Rynk link of the process to
     /// read-only for good, so the export runs in a child of this test.
     #[test]
     fn a_rynk_export_reads_the_board_without_a_single_write() {
-        use rmk_types_rynk::protocol::rynk::ergohaven::{caps, BatteryHalves};
         use rmk_types_rynk::protocol::rynk::Cmd;
 
         const CHILD_ENV: &str = "ENTROPY_TEST_RYNK_READ_ONLY_EXPORT";
@@ -1369,39 +1426,12 @@ mod tests {
         }
 
         let session = enforce_read_only();
-        let mut stored = crate::rynk::session::testing::Stored::new(1, 2, 2);
-        let definition = serde_json::json!({
-            "name": "Rynk fixture",
-            "matrix": {"rows": 1, "cols": 2},
-            "layouts": {"keymap": [["0,0", "0,1"]]}
-        })
-        .to_string();
-        lzma_rs::xz_compress(&mut definition.as_bytes(), &mut stored.definition).unwrap();
-        // Layer 1 is unnamed on the board, so the connect names it, and the
-        // halves wake for a battery reading.
-        stored.settings.insert(200, b"Base\0".to_vec());
-        stored.settings.insert(201, b"\0".to_vec());
-        stored.caps = caps::BATTERY_HALVES;
-        stored.battery = Some(BatteryHalves {
-            mask: 0b11,
-            left: 50,
-            right: 60,
-        });
-        let (board, state) = crate::rynk::session::testing::board(stored);
+        let (board, state) = rynk_board(true);
         let _held = crate::rynk::session::testing::link("headless-rynk", &board);
         let mut app = EntropyApp::new_inert_for_test();
         app.headless = true;
-        app.device_manager.replace_devices(vec![Device {
-            name: "Rynk fixture".into(),
-            vendor_id: 0xE126,
-            product_id: 0x0074,
-            manufacturer: "Ergohaven".into(),
-            serial_number: "rynk:010203".into(),
-            bus_type: "Usb".into(),
-            path: "headless-rynk".into(),
-            instance_token: String::new(),
-            firmware: FirmwareProtocol::Rynk,
-        }]);
+        app.device_manager
+            .replace_devices(vec![rynk_device("headless-rynk")]);
 
         let json = export_entlayout(
             &mut app,
@@ -1889,6 +1919,98 @@ mod tests {
             .collect();
         assert!(writes.is_empty(), "the console export wrote: {writes:02x?}");
         assert!(app.pending_console_export.is_none());
+    }
+
+    /// A GUI instance connected to `board` at `path`, its console export
+    /// channel listening at a temporary socket. The link stays held by the
+    /// test, so the GUI's connect finds it as it finds a live one.
+    #[cfg(target_os = "linux")]
+    fn rynk_running_instance(
+        path: &str,
+        board: &crate::rynk::client::testing::FakeBoard,
+    ) -> (
+        EntropyApp,
+        std::sync::Arc<crate::rynk::link::RynkLink>,
+        tempfile::TempDir,
+        PathBuf,
+        egui::Context,
+    ) {
+        let held = crate::rynk::session::testing::link(path, board);
+        let mut app = EntropyApp::new_inert_for_test();
+        app.device_manager.replace_devices(vec![rynk_device(path)]);
+        let ctx = egui::Context::default();
+        app.start_connect(0);
+        let started = Instant::now();
+        while !(matches!(app.connect_state, ConnectState::Idle) && app.layout.is_some()) {
+            assert!(started.elapsed() < Duration::from_secs(20), "connect hung");
+            app.poll_vial_hid_task(&ctx);
+            app.poll_connect(&ctx);
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        assert!(app
+            .hid_device
+            .as_ref()
+            .is_some_and(crate::device_session::DeviceSession::is_rynk));
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("entropy").join("export.sock");
+        app.console_export_server = Some(ExportServer::start(&socket, ctx.clone()).unwrap());
+        (app, held, dir, socket, ctx)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn running_instance_answers_a_console_export_of_its_rynk_board() {
+        use rmk_types_rynk::protocol::rynk::Cmd;
+
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (board, state) = rynk_board(false);
+        let (mut app, _held, dir, socket, ctx) = rynk_running_instance("console-rynk", &board);
+        let (received, written) = {
+            let state = state.lock().unwrap();
+            (state.received.len(), state.writes().len())
+        };
+        let path = dir.path().join("backup.entlayout");
+
+        let code = console_export(&mut app, &ctx, &socket, export_to(&path, "rynk fixture"));
+
+        assert_eq!(code, Some(EXIT_OK));
+        let state_now = state.lock().unwrap();
+        let sent = &state_now.received[received..];
+        assert!(!sent.is_empty(), "the export read the board itself");
+        assert_eq!(
+            state_now.writes()[written..],
+            [],
+            "the console export sent more than reads"
+        );
+        // Its connect wakes the halves for a battery reading, as the GUI's
+        // did; through the lent link that is refused too.
+        assert!(!sent.contains(&Cmd::GetBatteryHalves), "{sent:?}");
+        drop(state_now);
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let data = &value["data"];
+        assert_eq!(data["keymap"].as_array().unwrap().len(), 2, "{value}");
+        assert!(data["rynk_keymap"][0][1].is_object(), "{value}");
+        assert_eq!(data["layer_names"], serde_json::json!(["Base", "1"]));
+        assert_eq!(data["macros"]["bytecode_base64"][0], "aGk=", "the macro");
+        assert!(
+            data["portable_settings"]
+                .as_array()
+                .is_some_and(|settings| settings
+                    .iter()
+                    .any(|setting| setting["qsid"] == 7 && setting["value"] == 300)),
+            "{value}"
+        );
+        assert!(app.pending_console_export.is_none());
+
+        // The link the export borrowed is the GUI's again, writes and all.
+        let rynk = app
+            .hid_device
+            .as_ref()
+            .and_then(crate::device_session::DeviceSession::as_rynk)
+            .unwrap();
+        rynk.set_setting(7, 400u16.to_le_bytes().to_vec()).unwrap();
+        assert_eq!(state.lock().unwrap().writes()[written..], [Cmd::SetSetting]);
     }
 
     #[cfg(target_os = "linux")]

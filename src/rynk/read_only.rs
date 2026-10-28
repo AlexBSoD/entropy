@@ -1,6 +1,7 @@
 //! Read-only Rynk sessions for `--export-layout`, the Rynk side of
 //! `hid::enforce_read_only_hid`: once enforced, every frame the process sends
-//! must be a known read, or it never reaches the transport.
+//! must be a known read, or it never reaches the transport. A running instance
+//! lends one link the same way, through `RynkLink::read_only_view`.
 
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
@@ -15,6 +16,7 @@ pub(crate) struct ReadOnlyRynkSession {
 struct ReadOnlyRynkLedger {
     refused: Vec<u16>,
     failed_reads: Vec<u16>,
+    closed: bool,
 }
 
 static READ_ONLY_RYNK_SESSION: OnceLock<ReadOnlyRynkSession> = OnceLock::new();
@@ -37,11 +39,15 @@ impl ReadOnlyRynkSession {
     }
 
     /// `false` for a command that is not a known read, which is then
-    /// recorded as refused.
+    /// recorded as refused, and for any command once the session is closed.
     pub(super) fn admit(&self, cmd: Cmd) -> bool {
+        let mut ledger = self.ledger();
+        if ledger.closed {
+            return false;
+        }
         let admitted = is_read_cmd(cmd);
         if !admitted {
-            self.ledger().refused.push(cmd.raw());
+            ledger.refused.push(cmd.raw());
         }
         admitted
     }
@@ -58,6 +64,12 @@ impl ReadOnlyRynkSession {
     /// Reads that were sent and failed.
     pub(crate) fn failed_reads(&self) -> Vec<u16> {
         self.ledger().failed_reads.clone()
+    }
+
+    /// From now on nothing in this session reaches the board, so a worker
+    /// left behind cannot reach a board lent back to its owner.
+    pub(crate) fn close(&self) {
+        self.ledger().closed = true;
     }
 }
 
