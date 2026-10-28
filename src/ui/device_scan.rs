@@ -99,16 +99,35 @@ impl EntropyApp {
     /// alone is remembered: same-model boards without distinct serials cannot
     /// be told apart once one of them is gone.
     pub(super) fn connect_picked_device(&mut self, device_idx: usize) {
+        self.remember_picked_device(device_idx);
+        self.start_connect(device_idx);
+    }
+
+    /// A board picked in the device menu: connected unless it already is,
+    /// and remembered either way.
+    pub(super) fn pick_device(&mut self, device_idx: usize) {
+        if self.selected_device != Some(device_idx) || self.pending_device_connect.is_some() {
+            self.connect_picked_device(device_idx);
+        } else {
+            self.remember_picked_device(device_idx);
+        }
+    }
+
+    /// Remembers the board the user picked, connected already or not: the
+    /// pick replaces any board remembered before, and any takeover queued for
+    /// it.
+    fn remember_picked_device(&mut self, device_idx: usize) {
         let devices = self.device_manager.devices();
         self.remembered_device = devices
             .get(device_idx)
             .map(Device::stable_identity)
             .filter(|identity| devices.iter().filter(|d| identity.matches(d)).count() == 1);
-        self.start_connect(device_idx);
+        self.pending_takeover = None;
     }
 
     /// Forgets the picked board once a scan lists two boards its identity
-    /// names: from then on neither proves to be the one picked.
+    /// names: from then on neither proves to be the one picked, and a
+    /// takeover still queued for it lapses. A request the user made stays.
     fn forget_ambiguous_remembered_device(&mut self) {
         let ambiguous = self.remembered_device.as_ref().is_some_and(|identity| {
             let devices = self.device_manager.devices();
@@ -116,6 +135,13 @@ impl EntropyApp {
         });
         if ambiguous {
             self.remembered_device = None;
+            if self
+                .pending_takeover
+                .take()
+                .is_some_and(|takeover| self.pending_device_connect.as_ref() == Some(&takeover))
+            {
+                self.pending_device_connect = None;
+            }
         }
     }
 
@@ -456,6 +482,8 @@ impl EntropyApp {
                         .position(|dev| dev.display_name_cache_key() == *key)
                 });
                 self.start_connect(index);
+                // Queued behind a write, it is still the remembered board's.
+                self.pending_takeover = self.pending_device_connect.clone();
                 return;
             }
         }
@@ -874,6 +902,112 @@ mod tests {
         assert!(
             requests.try_recv().is_err(),
             "the manual choice was overridden"
+        );
+    }
+
+    #[test]
+    fn picking_the_connected_board_makes_it_the_one_remembered() {
+        let mut app = EntropyApp::new_inert_for_test();
+        let (launch_tx, requests) = mpsc::channel();
+        app.test_connect_requests = Some(launch_tx);
+        let a = scan_test_device("A");
+        let b = scan_test_device("B");
+        app.device_manager
+            .replace_devices(vec![a.clone(), b.clone()]);
+        app.pick_device(0);
+        assert_eq!(requests.try_recv().unwrap().0.name, "A");
+        connected_to(&mut app, 0);
+        app.apply_device_scan_result(vec![b.clone()]);
+        assert_eq!(requests.try_recv().unwrap().0.name, "B");
+        connected_to(&mut app, 0);
+
+        // Picked as it is: nothing to open, but it is the choice now.
+        app.pick_device(0);
+        assert!(
+            requests.try_recv().is_err(),
+            "the connected board was reopened"
+        );
+        app.apply_device_scan_result(vec![b, a]);
+
+        assert!(requests.try_recv().is_err(), "the earlier pick took over");
+        assert_eq!(app.selected_device, Some(0));
+    }
+
+    /// The same model with the same serial: as indistinct as no serial.
+    fn duplicate_serial_twin(path: &str) -> Device {
+        let mut twin = scan_test_device("Twin");
+        twin.path = format!("/nonexistent/entropy-test-{path}");
+        twin.instance_token = format!("{path}-instance");
+        twin
+    }
+
+    /// Holds the connection the way a combo write does, until it is dropped.
+    fn busy_with_a_write(app: &mut EntropyApp) {
+        let (_, receiver) = mpsc::channel();
+        app.combo_write_task = Some(ComboWriteTask {
+            receiver,
+            revision: 0,
+        });
+    }
+
+    #[test]
+    fn a_queued_takeover_lapses_once_its_board_has_a_twin() {
+        for twin in [serial_less_twin, duplicate_serial_twin] {
+            let mut app = EntropyApp::new_inert_for_test();
+            let (launch_tx, requests) = mpsc::channel();
+            app.test_connect_requests = Some(launch_tx);
+            let a = twin("a");
+            let b = twin("b");
+            let other = scan_test_device("Other");
+            app.device_manager
+                .replace_devices(vec![a.clone(), other.clone()]);
+            app.pick_device(0);
+            assert_eq!(requests.try_recv().unwrap().0.path, a.path);
+            connected_to(&mut app, 0);
+            app.apply_device_scan_result(vec![other.clone()]);
+            assert_eq!(requests.try_recv().unwrap().0.name, "Other");
+            connected_to(&mut app, 0);
+
+            // A comes back while a write holds Other: its takeover waits.
+            busy_with_a_write(&mut app);
+            app.apply_device_scan_result(vec![other.clone(), a.clone()]);
+            assert_eq!(app.pending_device_connect, Some(a.stable_identity()));
+            app.apply_device_scan_result(vec![other.clone(), a, b.clone()]);
+            app.apply_device_scan_result(vec![other.clone()]);
+            app.combo_write_task = None;
+            app.resume_pending_device_connect();
+            app.apply_device_scan_result(vec![other, b]);
+
+            assert!(
+                requests.try_recv().is_err(),
+                "the twin was opened as the pick"
+            );
+            assert!(app.pending_device_connect.is_none());
+        }
+    }
+
+    #[test]
+    fn a_queued_pick_outlives_its_board_getting_a_twin() {
+        let mut app = EntropyApp::new_inert_for_test();
+        let (launch_tx, requests) = mpsc::channel();
+        app.test_connect_requests = Some(launch_tx);
+        let a = serial_less_twin("a");
+        let b = serial_less_twin("b");
+        let other = scan_test_device("Other");
+        app.device_manager
+            .replace_devices(vec![other.clone(), a.clone()]);
+        connected_to(&mut app, 0);
+        busy_with_a_write(&mut app);
+
+        app.pick_device(1);
+        app.apply_device_scan_result(vec![other, a.clone(), b]);
+
+        assert!(requests.try_recv().is_err());
+        assert!(app.remembered_device.is_none());
+        assert_eq!(
+            app.pending_device_connect,
+            Some(a.stable_identity()),
+            "the user's request was dropped"
         );
     }
 
