@@ -54,6 +54,11 @@ impl EntropyApp {
         let supported_qmk_settings = session
             .setting_keys()
             .map_err(failed(language, "Setting list read"))?;
+        // A failure here only costs time: each read below then asks on its own
+        // and reports what fails, as before.
+        if let Err(error) = session.read_settings_ahead(&supported_qmk_settings) {
+            log::warn!("Rynk settings read ahead failed: {error:#}");
+        }
         let has_qmk_setting = |qsid: u16| supported_qmk_settings.contains(&qsid);
 
         progress("Parsing keyboard layout…")?;
@@ -152,19 +157,22 @@ impl EntropyApp {
         if !layout.encoders.is_empty() {
             progress("Reading encoders…")?;
             layout.encoder_layers = vec![vec![0u16; layout.encoders.len()]; layer_count];
-            for layer in 0..layer_count {
-                let mut keycodes = Vec::with_capacity(layout.encoder_count());
-                for index in 0..layout.encoder_count() {
-                    let action = session
-                        .encoder(layer as u8, index as u8)
-                        .map_err(failed(language, "Encoder read"))?;
-                    keycodes.push(shown(
-                        &mut read_losses,
-                        DynamicSlot::Encoder { layer: layer as u8 },
-                        index as u8,
-                        dynamic::encoder_keycodes(action),
-                    ));
-                }
+            let encoders = session
+                .encoders(layer_count as u8, layout.encoder_count() as u8)
+                .map_err(failed(language, "Encoder read"))?;
+            for (layer, actions) in encoders.into_iter().enumerate() {
+                let keycodes: Vec<_> = actions
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, action)| {
+                        shown(
+                            &mut read_losses,
+                            DynamicSlot::Encoder { layer: layer as u8 },
+                            index as u8,
+                            dynamic::encoder_keycodes(action),
+                        )
+                    })
+                    .collect();
                 for (visual, encoder) in layout.encoders.iter().enumerate() {
                     if let Some([ccw, cw]) = keycodes.get(encoder.encoder_idx as usize) {
                         layout.encoder_layers[layer][visual] =
@@ -250,6 +258,7 @@ impl EntropyApp {
         let module_settings = Self::read_module_settings(&json, &supported_qmk_settings, &session);
         let layer_led_settings =
             Self::read_layer_led_settings(&json, &supported_qmk_settings, layer_count, &session);
+        session.forget_settings_read_ahead();
 
         let supports_battery_halves = info.caps & caps::BATTERY_HALVES != 0;
         let battery_halves = if supports_battery_halves {
@@ -538,6 +547,40 @@ mod tests {
             "nothing is left for later"
         );
         assert_eq!(state.lock().unwrap().writes(), [], "loading writes nothing");
+    }
+
+    #[test]
+    fn a_board_that_takes_requests_back_to_back_loads_the_same() {
+        let (one_by_one, _) = board(stored());
+        let _held = link("connect-one-by-one", &one_by_one);
+        let expected = connect("connect-one-by-one").unwrap();
+        let (board, state) = board(stored());
+        let board = board.pipelining();
+        let _held = link("connect-pipelined", &board);
+
+        let result = connect("connect-pipelined").unwrap();
+
+        assert_eq!(result.layout.layers, expected.layout.layers);
+        assert_eq!(result.layout.layer_names, expected.layout.layer_names);
+        assert_eq!(result.combo_entries, expected.combo_entries);
+        assert_eq!(result.tap_dance_entries, expected.tap_dance_entries);
+        assert_eq!(result.key_override_entries, expected.key_override_entries);
+        assert_eq!(result.macro_texts, expected.macro_texts);
+        assert_eq!(result.combo_term, expected.combo_term);
+        assert_eq!(result.rynk_read_losses, expected.rynk_read_losses);
+        assert!(
+            board.batches().contains(&3),
+            "the three settings in one go: {:?}",
+            board.batches()
+        );
+        let state = state.lock().unwrap();
+        let settings = state
+            .received
+            .iter()
+            .filter(|cmd| **cmd == rmk_types_rynk::protocol::rynk::Cmd::GetSetting)
+            .count();
+        assert_eq!(settings, 3, "each read once, ahead");
+        assert_eq!(state.writes(), [], "loading writes nothing");
     }
 
     #[test]

@@ -530,6 +530,27 @@ pub(crate) struct BleTransport {
 
 impl RynkTransport for BleTransport {
     fn send(&mut self, frame: &[u8]) -> io::Result<()> {
+        self.write(frame)
+    }
+
+    fn recv(&mut self, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
+        self.inbox.recv(buf, timeout)
+    }
+
+    /// The board's BLE writes land in a pipe it reads while it answers.
+    fn pipelines(&self) -> bool {
+        true
+    }
+
+    /// The frames in as few writes as the MTU allows: each write waits for
+    /// the board's acknowledgement, and the stream needs no boundaries.
+    fn send_all(&mut self, frames: &[Vec<u8>]) -> io::Result<()> {
+        self.write(&frames.concat())
+    }
+}
+
+impl BleTransport {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
         if self.inbox.gone {
             return Err(gone());
         }
@@ -537,7 +558,7 @@ impl RynkTransport for BleTransport {
             characteristic_proxy(&self.connection, &self.endpoints.output).map_err(io_error)?;
         let mut options = HashMap::<&str, Value<'_>>::new();
         options.insert("type", Value::from(self.endpoints.write_type));
-        for chunk in frame.chunks(self.endpoints.chunk) {
+        for chunk in bytes.chunks(self.endpoints.chunk) {
             output
                 .call::<_, _, ()>("WriteValue", &(chunk, &options))
                 .map_err(|error| match error {
@@ -550,10 +571,6 @@ impl RynkTransport for BleTransport {
                 })?;
         }
         Ok(())
-    }
-
-    fn recv(&mut self, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
-        self.inbox.recv(buf, timeout)
     }
 }
 
