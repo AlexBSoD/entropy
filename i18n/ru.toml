@@ -165,7 +165,7 @@ key_legends_russian = "Английская + русская"
 close_to_tray_label = "Закрывать в трей"
 close_to_tray_tooltip = "Прятать Entropy в системный трей вместо выхода при закрытии окна"
 run_in_background_label = "Работать в фоне"
-run_in_background_tooltip = "Оставлять Entropy работать в фоне вместо выхода при закрытии окна"
+run_in_background_tooltip = "Оставлять Entropy работать в фоне вместо выхода при закрытии окна. Если панель показывает значок в трее, окно прячется туда и значок возвращает его"
 launch_at_startup_label = "Запускать при входе"
 launch_at_startup_tooltip = "Автоматически запускать Entropy при входе в систему"
 launch_minimized_label = "Запускать свёрнутой"
@@ -411,6 +411,10 @@ volume = "Громкость"
 media = "Медиа"
 default = "По умолчанию"
 unknown = "Неизвестно"
+
+[tray]
+open = "Открыть Entropy"
+quit = "Выйти из Entropy"
 
 [status_messages]
 macros_saved = "Макросы сохранены"
