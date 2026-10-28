@@ -135,6 +135,10 @@ one connection: if a section fails to load or the keyboard reconnects midway,
 nothing is written. A file destination is replaced atomically, so a failed run
 keeps the previous backup.
 
+A Rynk keyboard can hold entries the file has no place for, such as a combo key
+without a keycode. The export still succeeds and logs each of them; restoring
+the file loses them.
+
 Exit status: `0` exported, `1` export failed, `2` no or ambiguous keyboard,
 `3` another Entropy instance is running and did not answer, `4` incomplete (the missing sections
 are logged), `64` usage error.

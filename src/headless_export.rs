@@ -275,6 +275,103 @@ impl ExportError {
     }
 }
 
+/// An entry the keyboard holds that the exported file cannot, as the Rynk
+/// connect read it. Restoring the file loses it; the export still succeeds,
+/// so a daily backup of a board that ships such an entry keeps running.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ExportLoss {
+    /// `combo`, `tap-dance`, `key-override` or `encoder`.
+    pub(crate) entry: String,
+    /// The encoder's layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) layer: Option<u8>,
+    pub(crate) index: u8,
+    /// `key`, `combo-keys`, `morse-pattern`, `negative-output`,
+    /// `state-match`, `bindable` or `layers`.
+    pub(crate) loss: String,
+    /// The same, for a person.
+    pub(crate) message: String,
+}
+
+impl ExportLoss {
+    fn of(
+        (slot, index, loss): (
+            crate::rynk::dynamic::DynamicSlot,
+            u8,
+            crate::rynk::dynamic::DynamicLoss,
+        ),
+    ) -> Self {
+        use crate::rynk::dynamic::{DynamicLoss, DynamicSlot};
+        let (entry, layer, place) = match slot {
+            DynamicSlot::Combo => ("combo", None, format!("combo {index}")),
+            DynamicSlot::TapDance => ("tap-dance", None, format!("Tap Dance {index}")),
+            DynamicSlot::KeyOverride => ("key-override", None, format!("Key Override {index}")),
+            DynamicSlot::Encoder { layer } => (
+                "encoder",
+                Some(layer),
+                format!("layer {layer}, encoder {index}"),
+            ),
+        };
+        let (kind, detail) = match loss {
+            DynamicLoss::Key(action) => (
+                "key",
+                format!("{action:?} has no keycode, the file holds an empty key"),
+            ),
+            DynamicLoss::ComboKeys(count) => (
+                "combo-keys",
+                format!("{count} keys, the file keeps the first 4"),
+            ),
+            DynamicLoss::MorsePattern(pattern) => (
+                "morse-pattern",
+                format!(
+                    "pattern {:#b} has no tap dance field, the file leaves it out",
+                    pattern.to_u16()
+                ),
+            ),
+            DynamicLoss::NegativeOutput(action) => (
+                "negative-output",
+                format!("outputs {action:?} outside the condition, the file outputs the trigger"),
+            ),
+            DynamicLoss::StateMatch => (
+                "state-match",
+                "matches LED or mouse button state, the file only modifiers".to_owned(),
+            ),
+            DynamicLoss::Bindable => (
+                "bindable",
+                "triggers other key overrides, the file does not".to_owned(),
+            ),
+            DynamicLoss::Layers(_) => (
+                "layers",
+                "also works on layers above 15, the file keeps layers 0–15".to_owned(),
+            ),
+        };
+        Self {
+            entry: entry.to_owned(),
+            layer,
+            index,
+            loss: kind.to_owned(),
+            message: format!("{place}: {detail}"),
+        }
+    }
+}
+
+impl EntropyApp {
+    /// What an export of the current connection's keyboard leaves out.
+    pub(crate) fn export_losses(&self) -> Vec<ExportLoss> {
+        self.rynk_read_losses
+            .iter()
+            .copied()
+            .map(ExportLoss::of)
+            .collect()
+    }
+}
+
+fn report_losses(losses: &[ExportLoss]) {
+    for loss in losses {
+        log::warn!("Lost in the export: {}", loss.message);
+    }
+}
+
 /// Follows one connection from connect to a fully loaded layout. Everything
 /// in the bundle must come from the connection the connect produced: a
 /// reconnect, or any other replacement, ends the export instead of mixing
@@ -552,6 +649,7 @@ pub(crate) fn run_headless_export(request: HeadlessExportRequest) -> i32 {
     match write_export(&request.destination, &json) {
         Ok(destination) => {
             log::info!("Exported layout to {destination}");
+            report_losses(&app.export_losses());
             EXIT_OK
         }
         Err(error) => {
@@ -1338,9 +1436,10 @@ mod tests {
         );
     }
 
-    /// A two-key, two-layer Rynk board with a Rynk-only action, a macro, a
-    /// setting and halves to wake for a battery reading. Its layer 1 is named
-    /// as Entropy names it, or `unnamed`, so that a connect names it.
+    /// A two-key, two-layer Rynk board with a Rynk-only action, a combo on
+    /// one, a macro, a setting and halves to wake for a battery reading. Its
+    /// layer 1 is named as Entropy names it, or `unnamed`, so that a connect
+    /// names it.
     fn rynk_board(
         unnamed: bool,
     ) -> (
@@ -1348,6 +1447,7 @@ mod tests {
         std::sync::Arc<std::sync::Mutex<crate::rynk::session::testing::Stored>>,
     ) {
         use rmk_types_rynk::action::{Action, KeyAction};
+        use rmk_types_rynk::combo::Combo;
         use rmk_types_rynk::keyboard_macros::MacroOp;
         use rmk_types_rynk::keycode::{HidKeyCode, KeyCode};
         use rmk_types_rynk::protocol::rynk::ergohaven::{caps, BatteryHalves};
@@ -1367,6 +1467,16 @@ mod tests {
             KeyAction::Single(key(HidKeyCode::B)),
             KeyAction::No,
         ];
+        // `Tap` has no keycode, so an `.entlayout` cannot hold this combo.
+        stored.capabilities.max_combos = 1;
+        stored.combos = vec![Combo::new(
+            [
+                KeyAction::Tap(key(HidKeyCode::A)),
+                KeyAction::Single(key(HidKeyCode::B)),
+            ],
+            KeyAction::Single(key(HidKeyCode::C)),
+            None,
+        )];
         stored.capabilities.max_macros = 1;
         stored.macros = vec![vec![MacroOp::Char(b'h'), MacroOp::Char(b'i')]];
         stored.settings.insert(7, 300u16.to_le_bytes().to_vec());
@@ -1450,6 +1560,16 @@ mod tests {
         assert!(session.rynk.failed_reads().is_empty());
         let bundle: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(bundle["data"]["keymap"].is_array(), "{bundle}");
+        let losses: Vec<_> = app
+            .export_losses()
+            .into_iter()
+            .map(|loss| (loss.entry, loss.index, loss.loss))
+            .collect();
+        assert_eq!(
+            losses,
+            [("combo".to_owned(), 0, "key".to_owned())],
+            "what the export reports as lost"
+        );
         println!("{COMPLETION}");
     }
 
@@ -2011,6 +2131,139 @@ mod tests {
             .unwrap();
         rynk.set_setting(7, 400u16.to_le_bytes().to_vec()).unwrap();
         assert_eq!(state.lock().unwrap().writes()[written..], [Cmd::SetSetting]);
+    }
+
+    /// The running instance's answer to an export asked the way a backup
+    /// script asks: one line in, one line out, any board.
+    #[cfg(target_os = "linux")]
+    fn raw_console_reply(
+        app: &mut EntropyApp,
+        ctx: &egui::Context,
+        socket: &Path,
+    ) -> serde_json::Value {
+        use std::io::{BufRead, Write};
+
+        let socket = socket.to_owned();
+        let client = std::thread::spawn(move || {
+            let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+            stream
+                .write_all(
+                    b"{\"command\":\"export-layout\",\"version\":1,\"device\":null,\
+                      \"timeout_ms\":20000}\n",
+                )
+                .unwrap();
+            let mut answer = String::new();
+            std::io::BufReader::new(&stream)
+                .read_line(&mut answer)
+                .unwrap();
+            answer
+        });
+        let started = Instant::now();
+        while !client.is_finished() {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "console export hung"
+            );
+            frame(app, ctx, started);
+        }
+        serde_json::from_str(&client.join().unwrap()).unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_console_export_lists_what_its_file_lacks() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (board, _) = rynk_board(false);
+        let (mut app, _held, _dir, socket, ctx) = rynk_running_instance("console-lossy", &board);
+
+        let reply = raw_console_reply(&mut app, &ctx, &socket);
+
+        assert_eq!(reply["status"], "exported", "a loss fails nothing");
+        assert_eq!(
+            reply["losses"],
+            serde_json::json!([{
+                "entry": "combo",
+                "index": 0,
+                "loss": "key",
+                "message": "combo 0: Tap(Key(Hid(A))) has no keycode, \
+                            the file holds an empty key",
+            }])
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_console_export_of_a_vial_board_lists_no_losses() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (mut app, _, _dir, socket, ctx) = running_instance();
+
+        let reply = raw_console_reply(&mut app, &ctx, &socket);
+
+        assert_eq!(reply["status"], "exported");
+        assert_eq!(reply["losses"], serde_json::json!([]), "sent all the same");
+    }
+
+    #[test]
+    fn every_rynk_read_loss_names_what_the_file_lacks() {
+        use crate::rynk::dynamic::{DynamicLoss, DynamicSlot};
+        use rmk_types_rynk::action::{Action, KeyAction};
+        use rmk_types_rynk::morse::MorsePattern;
+
+        let user = KeyAction::Single(Action::User(90));
+        let mut app = EntropyApp::new_inert_for_test();
+        app.rynk_read_losses = vec![
+            (DynamicSlot::Combo, 0, DynamicLoss::Key(user)),
+            (DynamicSlot::Combo, 1, DynamicLoss::ComboKeys(6)),
+            (
+                DynamicSlot::TapDance,
+                2,
+                DynamicLoss::MorsePattern(MorsePattern::from_u16(0b1001)),
+            ),
+            (
+                DynamicSlot::KeyOverride,
+                3,
+                DynamicLoss::NegativeOutput(user),
+            ),
+            (DynamicSlot::KeyOverride, 4, DynamicLoss::StateMatch),
+            (DynamicSlot::KeyOverride, 5, DynamicLoss::Bindable),
+            (DynamicSlot::KeyOverride, 6, DynamicLoss::Layers(1 << 20)),
+            (DynamicSlot::Encoder { layer: 1 }, 0, DynamicLoss::Key(user)),
+        ];
+
+        let losses = app.export_losses();
+
+        let kinds: Vec<_> = losses
+            .iter()
+            .map(|loss| {
+                (
+                    loss.entry.as_str(),
+                    loss.layer,
+                    loss.index,
+                    loss.loss.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("combo", None, 0, "key"),
+                ("combo", None, 1, "combo-keys"),
+                ("tap-dance", None, 2, "morse-pattern"),
+                ("key-override", None, 3, "negative-output"),
+                ("key-override", None, 4, "state-match"),
+                ("key-override", None, 5, "bindable"),
+                ("key-override", None, 6, "layers"),
+                ("encoder", Some(1), 0, "key"),
+            ]
+        );
+        assert_eq!(
+            losses[2].message,
+            "Tap Dance 2: pattern 0b1001 has no tap dance field, the file leaves it out"
+        );
+        assert_eq!(
+            losses[7].message,
+            "layer 1, encoder 0: Single(User(90)) has no keycode, the file holds an empty key"
+        );
     }
 
     #[cfg(target_os = "linux")]

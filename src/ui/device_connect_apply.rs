@@ -1461,13 +1461,14 @@ impl EntropyApp {
                 self.hid_device = r.hid_device;
                 self.supported_qmk_settings = r.supported_qmk_settings;
                 self.deferred_device_load = r.deferred_load;
-                if !r.rynk_read_losses.is_empty() {
+                self.rynk_read_losses = r.rynk_read_losses;
+                if !self.rynk_read_losses.is_empty() {
                     let language = self.app_settings.language;
                     self.import_report_title =
                         crate::i18n::tr_catalog(language, "rynk_read.title").into();
                     self.import_report_body = crate::rynk::dynamic::describe_dynamic_losses(
                         language,
-                        &r.rynk_read_losses,
+                        &self.rynk_read_losses,
                     );
                     self.import_report_open = true;
                 }

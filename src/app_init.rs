@@ -120,6 +120,8 @@ impl EntropyApp {
             deferred_device_load: DeferredDeviceLoadState::default(),
             #[cfg(not(target_arch = "wasm32"))]
             deferred_full_layout_action: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            rynk_read_losses: Vec::new(),
             #[cfg(unix)]
             console_export_server: None,
             #[cfg(unix)]
