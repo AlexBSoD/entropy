@@ -408,6 +408,23 @@ impl<T: RynkTransport> RynkClient<T> {
         }
     }
 
+    /// Runs `operation` inside `session`, when there is one, as a client of
+    /// `enforce_read_only_rynk` runs everything: a read-only view's request on
+    /// the link's own client.
+    pub(crate) fn within<R>(
+        &mut self,
+        session: Option<&ReadOnlyRynkSession>,
+        operation: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let Some(session) = session else {
+            return operation(self);
+        };
+        let own = self.read_only.replace(session.clone());
+        let result = operation(self);
+        self.read_only = own;
+        result
+    }
+
     /// Checks the protocol version and the ergohaven revision, then reads the
     /// board's identity and capabilities; the capabilities size every later
     /// request. The revision is checked before anything else is decoded, since

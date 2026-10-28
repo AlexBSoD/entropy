@@ -40,10 +40,22 @@ enum Request {
 #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "status", rename_all = "kebab-case")]
 pub(crate) enum Reply {
-    Exported { entlayout: String },
-    NoDevice { message: String },
-    Incomplete { missing: Vec<String> },
-    Failed { message: String },
+    Exported {
+        entlayout: String,
+        /// What the keyboard holds that `entlayout` cannot. Always sent,
+        /// empty or not; instances that predate it leave it out.
+        #[serde(default)]
+        losses: Vec<ExportLoss>,
+    },
+    NoDevice {
+        message: String,
+    },
+    Incomplete {
+        missing: Vec<String>,
+    },
+    Failed {
+        message: String,
+    },
 }
 
 /// `$XDG_RUNTIME_DIR/entropy/export.sock`, or the config directory where the
@@ -286,16 +298,19 @@ pub(super) fn export_via_socket(path: &Path, request: &HeadlessExportRequest) ->
         }
     };
     Some(match reply {
-        Reply::Exported { entlayout } => match write_export(&request.destination, &entlayout) {
-            Ok(destination) => {
-                log::info!("Exported layout to {destination}");
-                EXIT_OK
+        Reply::Exported { entlayout, losses } => {
+            match write_export(&request.destination, &entlayout) {
+                Ok(destination) => {
+                    log::info!("Exported layout to {destination}");
+                    report_losses(&losses);
+                    EXIT_OK
+                }
+                Err(error) => {
+                    log::error!("Writing the layout failed: {error}");
+                    EXIT_FAILED
+                }
             }
-            Err(error) => {
-                log::error!("Writing the layout failed: {error}");
-                EXIT_FAILED
-            }
-        },
+        }
         Reply::NoDevice { message } => {
             log::error!("{message}");
             EXIT_NO_DEVICE
@@ -324,37 +339,49 @@ fn connect_until(path: &Path, deadline: Instant) -> Option<std::io::Result<UnixS
         .ok()
 }
 
-/// Runs the standalone export over `hid`, the running instance's own
-/// connection, lent for the duration through a read-only view: every write
-/// is refused at the transport, failed reads are listed instead of exported,
-/// and what the export loads stays in its own app. It ends early once
-/// `cancelled` is set.
+/// Runs the standalone export over `connection`, the running instance's own,
+/// lent for the duration through a read-only view: every write is refused at
+/// the transport, failed reads are listed instead of exported, and what the
+/// export loads stays in its own app. It ends early once `cancelled` is set.
 pub(crate) fn export_lent_keyboard(
-    hid: &crate::hid::HidDevice,
+    connection: &crate::device_session::DeviceSession,
     device: Device,
     deadline: Instant,
     cancelled: &AtomicBool,
 ) -> Reply {
+    use crate::device_session::DeviceSession;
+
     let session = ReadOnlySessions::default();
-    let Some(view) = hid.read_only_view(session.hid.clone()) else {
-        return Reply::Failed {
-            message: "This keyboard's connection cannot be lent to an export".to_owned(),
-        };
-    };
-    log::info!("Exporting layout of {} for the console", describe(&device));
     let mut app = EntropyApp::new_headless();
+    match connection {
+        DeviceSession::Vial(hid) => {
+            let Some(view) = hid.read_only_view(session.hid.clone()) else {
+                return Reply::Failed {
+                    message: "This keyboard's connection cannot be lent to an export".to_owned(),
+                };
+            };
+            app.connect_hid = Some(view);
+        }
+        DeviceSession::Rynk(rynk) => {
+            app.connect_rynk = Some(rynk.link().read_only_view(session.rynk.clone()));
+        }
+    }
+    log::info!("Exporting layout of {} for the console", describe(&device));
     app.device_manager.replace_devices(vec![device]);
-    app.connect_hid = Some(view);
     let exported = export_entlayout(&mut app, 0, &session, deadline, cancelled);
     // A worker the export leaves behind must not reach the keyboard once the
     // GUI has it back.
     session.hid.close();
-    let refused = session.hid.refused_requests().len();
+    session.rynk.close();
+    let refused = session.hid.refused_requests().len() + session.rynk.refused_requests().len();
     if refused > 0 {
         log::info!("Refused {refused} keyboard write(s) during the console export");
     }
     match exported {
-        Ok(entlayout) => Reply::Exported { entlayout },
+        Ok(entlayout) => Reply::Exported {
+            entlayout,
+            losses: app.export_losses(),
+        },
         Err(ExportError::Incomplete(missing)) => Reply::Incomplete { missing },
         Err(ExportError::Failed(message)) => Reply::Failed { message },
     }
@@ -525,6 +552,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_answer_of_an_older_instance_lists_no_losses() {
+        let reply: Reply =
+            serde_json::from_str(r#"{"status":"exported","entlayout":"{}"}"#).unwrap();
+
+        assert_eq!(
+            reply,
+            Reply::Exported {
+                entlayout: "{}".to_owned(),
+                losses: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
     fn the_channel_answers_nothing_but_an_export() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("export.sock");
@@ -672,6 +713,7 @@ mod tests {
         job.reply
             .send(Reply::Exported {
                 entlayout: "x".repeat(16 << 20),
+                losses: Vec::new(),
             })
             .unwrap();
 

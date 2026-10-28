@@ -214,6 +214,7 @@ impl EntropyApp {
         self.pending_layout_undo = false;
         self.deferred_device_load = DeferredDeviceLoadState::default();
         self.deferred_full_layout_action = None;
+        self.rynk_read_losses.clear();
         self.reset_settings_write_context();
         self.cancel_pending_qmk_setting_writes();
         self.qmk_settings_write_queue.clear();

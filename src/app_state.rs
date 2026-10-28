@@ -5490,6 +5490,10 @@ pub struct EntropyApp {
     /// instance lends to a console export.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) connect_hid: Option<crate::hid::HidDevice>,
+    /// The same for a Rynk board: the link the next connect takes in place of
+    /// the board's own, the read-only view a running instance lends.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) connect_rynk: Option<std::sync::Arc<crate::rynk::link::RynkLink>>,
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) device_scan_state: DeviceScanState,
     /// Persistent open HID device for real-time writes (Vial)
@@ -5525,6 +5529,14 @@ pub struct EntropyApp {
     /// User action waiting for every staged Bluetooth layer to become complete.
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) deferred_full_layout_action: Option<DeferredFullLayoutAction>,
+    /// What the editor could not show of the Rynk board the current
+    /// connection read; its exports lack the same.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) rynk_read_losses: Vec<(
+        crate::rynk::dynamic::DynamicSlot,
+        u8,
+        crate::rynk::dynamic::DynamicLoss,
+    )>,
     /// Listens for `--export-layout` runs while this instance owns the keyboards.
     #[cfg(unix)]
     pub(super) console_export_server: Option<super::headless_export::ExportServer>,

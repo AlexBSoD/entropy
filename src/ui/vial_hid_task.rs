@@ -407,12 +407,7 @@ fn run_vial_hid_operation_with_progress(
         VialHidOperation::ConsoleExport {
             device, deadline, ..
         } => Ok(VialHidOutcome::ConsoleExported(
-            super::headless_export::export_lent_keyboard(
-                hid.require_vial()?,
-                device,
-                deadline,
-                cancel,
-            ),
+            super::headless_export::export_lent_keyboard(hid, device, deadline, cancel),
         )),
     }
 }

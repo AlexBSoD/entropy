@@ -19,8 +19,11 @@ use crate::rynk::{dynamic, keycode};
 use rmk_types_rynk::protocol::rynk::ergohaven::caps;
 
 impl EntropyApp {
+    /// Through `supplied` when given, the link a running instance lends;
+    /// otherwise through the board's own.
     pub(super) fn connect_rynk(
         dev: &Device,
+        supplied: Option<std::sync::Arc<RynkLink>>,
         language: crate::i18n::Language,
         progress: &dyn Fn(&str) -> Result<(), String>,
     ) -> Result<ConnectResult, String> {
@@ -29,14 +32,17 @@ impl EntropyApp {
         };
         progress("Opening Rynk link…")?;
         log::info!("Opening Rynk board {} at {}", dev.name, dev.path);
-        let link = RynkLink::open(&PhysicalId(dev.path.clone())).map_err(|error| {
-            log::warn!(
-                "Rynk board {} at {} did not open: {error}",
-                dev.name,
-                dev.path
-            );
-            rynk_failed("Open", error)
-        })?;
+        let link = match supplied {
+            Some(link) => link,
+            None => RynkLink::open(&PhysicalId(dev.path.clone())).map_err(|error| {
+                log::warn!(
+                    "Rynk board {} at {} did not open: {error}",
+                    dev.name,
+                    dev.path
+                );
+                rynk_failed("Open", error)
+            })?,
+        };
         let session = RynkSession::new(link);
         let info = session.info().clone();
         let capabilities = *session.capabilities();
@@ -487,9 +493,12 @@ mod tests {
     }
 
     fn connect(path: &str) -> Result<ConnectResult, String> {
-        EntropyApp::connect_rynk(&rynk_device(path), crate::i18n::Language::English, &|_| {
-            Ok(())
-        })
+        EntropyApp::connect_rynk(
+            &rynk_device(path),
+            None,
+            crate::i18n::Language::English,
+            &|_| Ok(()),
+        )
     }
 
     #[test]

@@ -16,6 +16,7 @@ use rmk_types_rynk::protocol::rynk::command::Endpoint;
 use rmk_types_rynk::protocol::rynk::Cmd;
 
 use super::client::{RynkBoard, RynkClient, RynkClientError, RynkTimeouts, RynkTransport};
+use super::read_only::ReadOnlyRynkSession;
 use super::transport;
 
 /// How long a post may wait behind other requests before it goes first, so
@@ -73,6 +74,8 @@ pub(crate) struct RynkLink {
     board: RynkBoard,
     events: mpsc::Sender<Event>,
     closed: Arc<Closed>,
+    /// Set on a read-only view: everything it sends runs inside this session.
+    read_only: Option<ReadOnlyRynkSession>,
 }
 
 /// Set by the owner thread once the client, and with it the claim, is gone.
@@ -176,6 +179,7 @@ impl RynkLink {
             board,
             events: sender,
             closed: closed.clone(),
+            read_only: None,
         });
         let name = format!("entropy-rynk-{}", id.0);
         std::thread::Builder::new()
@@ -207,6 +211,20 @@ impl RynkLink {
         &self.board
     }
 
+    /// Another handle on this link whose requests run inside `session`, so it
+    /// can only read whatever asks: a running instance lends it to a console
+    /// export. It keeps the link open while held, as any handle does, but is
+    /// not handed out by [`RynkLink::open`].
+    pub(crate) fn read_only_view(&self, session: ReadOnlyRynkSession) -> Arc<Self> {
+        Arc::new(Self {
+            id: self.id.clone(),
+            board: self.board.clone(),
+            events: self.events.clone(),
+            closed: self.closed.clone(),
+            read_only: Some(session),
+        })
+    }
+
     /// A request for the editor: runs before posts.
     pub(crate) fn request<E>(&self, request: E::Request) -> Result<E::Response, RynkClientError>
     where
@@ -227,8 +245,9 @@ impl RynkLink {
         R: Send + 'static,
     {
         let (reply, answer) = mpsc::channel();
+        let read_only = self.read_only.clone();
         let job: Job = Box::new(move |client| {
-            let result = operation(client);
+            let result = client.within(read_only.as_ref(), operation);
             let failed = result.as_ref().err().map(link_failed).unwrap_or(false);
             let _ = reply.send(result);
             if failed {
@@ -256,10 +275,18 @@ impl RynkLink {
         // The owner still reads the reply: over USB the board takes no frame
         // while its last reply waits for the host. What it answers matters to
         // no one; only a link that broke ends the owner.
-        let job: Job = Box::new(move |client| match client.request::<E>(&request) {
-            Err(error) if link_failed(&error) => Err(error),
-            _ => Ok(()),
+        let read_only = self.read_only.clone();
+        let job: Job = Box::new(move |client| {
+            match client.within(read_only.as_ref(), |client| client.request::<E>(&request)) {
+                Err(error) if link_failed(&error) => Err(error),
+                _ => Ok(()),
+            }
         });
+        // The slots belong to the owner's posts: a view's post, refused or
+        // not, must not take the place of one not sent yet.
+        if self.read_only.is_some() {
+            return self.send(Event::Request(job));
+        }
         self.send(Event::Post {
             key: PostKey { cmd: E::CMD, slot },
             queued: Instant::now(),
@@ -274,6 +301,11 @@ impl RynkLink {
 
 impl Drop for RynkLink {
     fn drop(&mut self) {
+        // A view was never registered; the owner closes once the last
+        // handle, view or not, lets go.
+        if self.read_only.is_some() {
+            return;
+        }
         let mut registry = registry().lock().unwrap_or_else(|e| e.into_inner());
         if registry
             .live
@@ -774,5 +806,63 @@ mod tests {
         assert!(!Arc::ptr_eq(&broken, &fresh));
         assert_eq!(opened.load(Ordering::SeqCst), 2);
         assert_eq!(fresh.request::<command::GetCurrentLayer>(()).unwrap(), 3);
+    }
+
+    #[test]
+    fn a_read_only_view_reads_through_the_owner_and_sends_nothing_else() {
+        let (board, log) = layer_board();
+        let link = RynkLink::acquire(id("view"), quick(), open(&board)).unwrap();
+        let session = ReadOnlyRynkSession::default();
+        let view = link.read_only_view(session.clone());
+
+        assert_eq!(view.request::<command::GetCurrentLayer>(()).unwrap(), 3);
+        let refused = view.request::<command::SetDefaultLayer>(1);
+        assert!(
+            matches!(refused, Err(RynkClientError::ReadOnly { .. })),
+            "{refused:?}"
+        );
+        view.post::<command::SetDefaultLayer>(0, 2).unwrap();
+        link.request::<command::SetDefaultLayer>(4).unwrap();
+
+        assert_eq!(
+            commands(&log),
+            [(Cmd::GetCurrentLayer, 0), (Cmd::SetDefaultLayer, 4)],
+            "the owner's own requests stay its own"
+        );
+        let set = Cmd::SetDefaultLayer.raw();
+        assert_eq!(session.refused_requests(), [set, set]);
+        let again = RynkLink::acquire(id("view"), quick(), open(&board)).unwrap();
+        assert!(Arc::ptr_eq(&again, &link), "a view is not handed out");
+
+        session.close();
+        assert!(view.request::<command::GetCurrentLayer>(()).is_err());
+        assert_eq!(link.request::<command::GetCurrentLayer>(()).unwrap(), 3);
+        drop((link, again));
+        assert_eq!(board.dropped(), 0, "a view holds the link as well");
+        drop(view);
+        eventually("the last handle releases the claim", || {
+            board.dropped() == 1
+        });
+    }
+
+    #[test]
+    fn a_post_of_a_view_leaves_the_owner_post_in_its_slot() {
+        let (board, log, release, held) = gated_board();
+        let link = RynkLink::acquire(id("view-post"), quick(), open(&board)).unwrap();
+        let view = link.read_only_view(ReadOnlyRynkSession::default());
+        let blocker = {
+            let link = link.clone();
+            std::thread::spawn(move || link.request::<command::GetDefaultLayer>(()))
+        };
+        held.recv_timeout(Duration::from_secs(3)).unwrap();
+        link.post::<command::SetDefaultLayer>(0, 5).unwrap();
+        view.post::<command::SetDefaultLayer>(0, 6).unwrap();
+        release.send(()).unwrap();
+        blocker.join().unwrap().unwrap();
+        eventually("the owner's post is sent", || commands(&log).len() == 2);
+
+        assert_eq!(commands(&log)[1..], [(Cmd::SetDefaultLayer, 5)]);
+        assert_eq!(view.request::<command::GetCurrentLayer>(()).unwrap(), 3);
+        assert_eq!(commands(&log).len(), 3, "nothing else reached the board");
     }
 }
