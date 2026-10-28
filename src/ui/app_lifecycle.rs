@@ -1777,7 +1777,7 @@ mod tests {
         let (scans, _) = std::sync::mpsc::channel();
         app.test_device_scan_requests = Some(scans);
         let (hid, recorder) = crate::hid::HidDevice::test_device();
-        app.hid_device = Some(hid);
+        app.hid_device = Some(hid.into());
         app.keycode_picker.macro_texts = vec![Vec::new(); 32];
         app.keycode_picker.mark_macros_dirty();
         app.maybe_start_macro_write(&ctx);
