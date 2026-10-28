@@ -4587,12 +4587,39 @@ fn assert_gated_application_output_ui_progress(keepalive: bool) {
             release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         }
     });
-    let mut bridge = test_start_bridge(target, Default::default(), hid.shared_output(), None,
-        HostProtocol::Selected(false), || None);
+    // The worker acquires its endpoint only once the owner is bound, supported
+    // and published. None of those setters wakes it, so a worker that ran
+    // ahead of them would select the long test idle before sending anything.
+    let (open_tx, open_rx) = std::sync::mpsc::channel::<()>();
+    let mut open_gate = Some(open_rx);
+    let mut bridge = QmkHidHostBridge::start_with_sources(
+        target,
+        Default::default(),
+        hid.shared_output(),
+        HostProtocol::Selected(false),
+        || None,
+        move |target, shared| {
+            // A failed setup drops the sender, which releases the worker too.
+            if let Some(gate) = open_gate.take() {
+                let _ = gate.recv();
+            }
+            anyhow::ensure!(
+                shared.is_some(),
+                "test shared owner required; no hardware fallback"
+            );
+            open_host_data_hid(target, shared)
+        },
+    );
     bridge.bind_selected_application_layout_device("vial-0000000000000042".into());
     bridge.set_selected_application_layout_support(true);
     let generation = bridge.application_layout_publication_generation().unwrap();
     bridge.set_application_layout_snapshot(snapshot.clone());
+    assert_eq!(
+        bridge.control.wake.waits.load(Ordering::Relaxed),
+        0,
+        "worker waited before its fixture was set up"
+    );
+    open_tx.send(()).unwrap();
     entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let (progress_tx, progress_rx) = std::sync::mpsc::channel();
     let ui = thread::spawn(move || {
