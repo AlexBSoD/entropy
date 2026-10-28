@@ -1,7 +1,7 @@
-# Evaluation checks for the NixOS and home-manager modules, run by
-# `nix flake check`.
+# Evaluation checks for the NixOS and home-manager modules, plus a look at the
+# packaged wrapper, run by `nix flake check`.
 #
-# Everything here is decided at evaluation time: each `assertMsg` aborts the
+# The module checks are decided at evaluation time: each `assertMsg` aborts the
 # build of the marker derivation below, so a regression fails CI rather than
 # silently shipping a module that enables an input method behind the user's
 # back or collides with the Entropy module nixpkgs itself ships.
@@ -160,4 +160,17 @@ in
   home-manager-module-eval =
     assert lib.all lib.id homeManagerAssertions;
     pkgs.runCommand "entropy-home-manager-module-eval" { } "touch $out";
+
+  # The media lane spawns playerctl, then gdbus. Read the packaged wrapper
+  # rather than run the app: both directories have to be on its PATH.
+  package-media-tools = pkgs.runCommand "entropy-package-media-tools" { } ''
+    for tool in ${lib.getExe pkgs.playerctl} ${lib.getBin pkgs.glib}/bin/gdbus; do
+      test -x "$tool"
+      grep -qF "$(dirname "$tool")" ${self.packages.${system}.entropy}/bin/entropy || {
+        echo "the packaged entropy wrapper does not put $tool on PATH" >&2
+        exit 1
+      }
+    done
+    touch $out
+  '';
 }

@@ -60,6 +60,15 @@
           libxcb
         ];
 
+      # Programs the host-data media lane runs on Linux: playerctl, and gdbus
+      # (glib's bin output) when playerctl finds nothing. A plain NixOS desktop
+      # has neither on PATH. nix/checks.nix greps the wrapper for both.
+      runtimeTools =
+        pkgs: with pkgs; [
+          playerctl
+          glib
+        ];
+
       # Upstream ships no icon for Linux (only assets/entropy.ico for Windows);
       # scripts/build_linux_appimage.sh generates this SVG inline. Same artwork.
       iconSvg =
@@ -104,6 +113,8 @@
             # Unit tests are pure (i18n catalogs, layout parsing, bundled script
             # contents) — no keyboard, X server or network needed.
             doCheck = true;
+            # Runs the KWin script in tests.
+            nativeCheckInputs = [ pkgs.nodejs ];
             # Sandboxed builders have a non-writable HOME. Keep all test outputs
             # local to this check, without disabling persistence tests.
             preCheck = ''
@@ -142,6 +153,7 @@
             preFixup = ''
               gappsWrapperArgs+=(
                 --prefix LD_LIBRARY_PATH : "${lib.makeLibraryPath (runtimeLibs pkgs)}"
+                --prefix PATH : "${lib.makeBinPath (runtimeTools pkgs)}"
               )
             '';
 
@@ -258,6 +270,8 @@
               pkg-config
               # scripts/check_i18n.py
               python3
+              # Runs the KWin script in tests.
+              nodejs
             ];
 
             buildInputs = commonNativeDeps pkgs;

@@ -596,6 +596,10 @@ const KDE_LAYOUT_PATH: &str = "/Layouts";
 #[cfg(target_os = "linux")]
 const KDE_LAYOUT_INTERFACE: &str = "org.kde.KeyboardLayouts";
 #[cfg(target_os = "linux")]
+const KDE_LAYOUT_LIST_REFRESH: Duration = Duration::from_secs(1);
+#[cfg(target_os = "linux")]
+const LAYOUT_DBUS_CALL_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(target_os = "linux")]
 const IBUS_DESTINATION: &str = "org.freedesktop.IBus";
 #[cfg(target_os = "linux")]
 const IBUS_PATH: &str = "/org/freedesktop/IBus";
@@ -2830,6 +2834,94 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn kde_layout_list(codes: &[&str], read_at: Instant) -> KdeLayoutList {
+        KdeLayoutList {
+            codes: codes.iter().map(|code| (*code).to_owned()).collect(),
+            read_at,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn kde_layouts(codes: &[&str]) -> Option<Vec<String>> {
+        Some(codes.iter().map(|code| (*code).to_owned()).collect())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kde_layout_list_follows_a_reorder_in_the_running_session() {
+        let start = Instant::now();
+        let mut list = kde_layout_list(&["us", "ru"], start);
+
+        let fresh = start + KDE_LAYOUT_LIST_REFRESH / 2;
+        let unread = list.code_index(0, fresh, || panic!("a fresh list is not read again"));
+        assert_eq!(unread, Some(0));
+
+        // Same length, so the index alone cannot tell the order changed.
+        let due = start + KDE_LAYOUT_LIST_REFRESH;
+        let reordered = list.code_index(0, due, || kde_layouts(&["ru", "us"]));
+        assert_eq!(reordered, Some(1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kde_layout_list_is_read_at_once_for_an_index_past_its_end() {
+        let start = Instant::now();
+        let mut list = kde_layout_list(&["us"], start);
+
+        let added = list.code_index(1, start, || kde_layouts(&["us", "ru"]));
+        assert_eq!(added, Some(1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kde_layout_list_keeps_the_last_list_when_kde_does_not_answer() {
+        let start = Instant::now();
+        let mut list = kde_layout_list(&["us", "ru"], start);
+
+        let due = start + KDE_LAYOUT_LIST_REFRESH;
+        assert_eq!(list.code_index(1, due, || None), Some(1));
+        assert_eq!(list.code_index(1, due, || Some(Vec::new())), Some(1));
+        // The failed read counts as the refresh; the next one waits its turn.
+        let soon = due + KDE_LAYOUT_LIST_REFRESH / 2;
+        let unread = list.code_index(1, soon, || panic!("a failed read is not retried at once"));
+        assert_eq!(unread, Some(1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn layout_bus_calls_give_up_on_a_peer_that_never_answers() {
+        let (client, server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        let guid = zbus::Guid::generate();
+        // A peer with no object server reads the call and never replies.
+        let server = thread::spawn(move || {
+            zbus::blocking::connection::Builder::unix_stream(server)
+                .server(guid)
+                .expect("server guid")
+                .p2p()
+                .build()
+        });
+        let timeout = Duration::from_millis(200);
+        let client = layout_bus(
+            Ok(zbus::blocking::connection::Builder::unix_stream(client).p2p()),
+            timeout,
+        )
+        .expect("client connection");
+        let _server = server
+            .join()
+            .expect("server thread")
+            .expect("server connection");
+
+        let started = Instant::now();
+        let reply = client.call_method(None::<&str>, "/", Some("org.example.Silent"), "Never", &());
+
+        assert!(
+            matches!(&reply, Err(zbus::Error::InputOutput(error)) if error.kind() == std::io::ErrorKind::TimedOut),
+            "expected a timeout, got {reply:?}"
+        );
+        assert!(started.elapsed() < timeout * 10);
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn gnome_desktop_names_are_recognized_without_matching_other_desktops() {
         assert!(desktop_list_has_gnome("GNOME"));
@@ -3051,37 +3143,37 @@ impl LayoutTracker {
     }
 }
 
+/// Builds a layout tracker connection whose method calls give up after
+/// `timeout`. zbus applies no reply timeout of its own, so a wedged KWin or
+/// IBus daemon would otherwise park the layout lane for good.
+#[cfg(target_os = "linux")]
+fn layout_bus(
+    builder: zbus::Result<zbus::blocking::connection::Builder<'_>>,
+    timeout: Duration,
+) -> Option<zbus::blocking::Connection> {
+    builder.ok()?.method_timeout(timeout).build().ok()
+}
+
 #[cfg(target_os = "linux")]
 struct KdeLayoutTracker {
     connection: zbus::blocking::Connection,
-    layout_codes: Vec<String>,
+    layout_codes: KdeLayoutList,
 }
 
 #[cfg(target_os = "linux")]
 impl KdeLayoutTracker {
     fn new() -> Option<Self> {
-        let connection = zbus::blocking::Connection::session().ok()?;
-        let layout_codes = {
-            let proxy = zbus::blocking::Proxy::new(
-                &connection,
-                KDE_LAYOUT_DESTINATION,
-                KDE_LAYOUT_PATH,
-                KDE_LAYOUT_INTERFACE,
-            )
-            .ok()?;
-            proxy
-                .call::<_, _, Vec<(String, String, String)>>("getLayoutsList", &())
-                .ok()?
-                .into_iter()
-                .map(|(short_name, _, _)| short_name)
-                .collect::<Vec<_>>()
-        };
-        if layout_codes.is_empty() {
-            return None;
-        }
+        let connection = layout_bus(
+            zbus::blocking::connection::Builder::session(),
+            LAYOUT_DBUS_CALL_TIMEOUT,
+        )?;
+        let layout_codes = kde_layout_list(&connection).filter(|codes| !codes.is_empty())?;
         Some(Self {
             connection,
-            layout_codes,
+            layout_codes: KdeLayoutList {
+                codes: layout_codes,
+                read_at: Instant::now(),
+            },
         })
     }
 
@@ -3094,7 +3186,61 @@ impl KdeLayoutTracker {
         )
         .ok()?;
         let layout = proxy.call::<_, _, u32>("getLayout", &()).ok()?;
-        kde_layout_code_index(layout, &self.layout_codes)
+        let connection = &self.connection;
+        self.layout_codes
+            .code_index(layout, Instant::now(), || kde_layout_list(connection))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn kde_layout_list(connection: &zbus::blocking::Connection) -> Option<Vec<String>> {
+    let proxy = zbus::blocking::Proxy::new(
+        connection,
+        KDE_LAYOUT_DESTINATION,
+        KDE_LAYOUT_PATH,
+        KDE_LAYOUT_INTERFACE,
+    )
+    .ok()?;
+    let layouts = proxy
+        .call::<_, _, Vec<(String, String, String)>>("getLayoutsList", &())
+        .ok()?;
+    Some(
+        layouts
+            .into_iter()
+            .map(|(short_name, _, _)| short_name)
+            .collect(),
+    )
+}
+
+/// KDE's layout list as last read. `getLayout` answers with a position in it,
+/// and a running session adds, removes and reorders layouts without telling
+/// the tracker, so the list is read again rather than kept for good.
+#[cfg(target_os = "linux")]
+struct KdeLayoutList {
+    codes: Vec<String>,
+    read_at: Instant,
+}
+
+#[cfg(target_os = "linux")]
+impl KdeLayoutList {
+    fn code_index(
+        &mut self,
+        layout: u32,
+        now: Instant,
+        read: impl FnOnce() -> Option<Vec<String>>,
+    ) -> Option<u8> {
+        // An index past the end means the list grew: read it now rather than
+        // after the refresh interval.
+        let past_end = usize::try_from(layout).map_or(true, |index| index >= self.codes.len());
+        if past_end || now.duration_since(self.read_at) >= KDE_LAYOUT_LIST_REFRESH {
+            // Stamp the attempt: a list KDE cannot return right now keeps the
+            // last one and is asked for again at the next refresh.
+            self.read_at = now;
+            if let Some(codes) = read().filter(|codes| !codes.is_empty()) {
+                self.codes = codes;
+            }
+        }
+        kde_layout_code_index(layout, &self.codes)
     }
 }
 
@@ -3112,10 +3258,10 @@ struct IbusLayoutTracker {
 #[cfg(target_os = "linux")]
 impl IbusLayoutTracker {
     fn new() -> Option<Self> {
-        let connection = zbus::blocking::connection::Builder::ibus()
-            .ok()?
-            .build()
-            .ok()?;
+        let connection = layout_bus(
+            zbus::blocking::connection::Builder::ibus(),
+            LAYOUT_DBUS_CALL_TIMEOUT,
+        )?;
         Some(Self { connection })
     }
 
