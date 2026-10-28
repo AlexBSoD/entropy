@@ -60,6 +60,15 @@
           libxcb
         ];
 
+      # Programs the host-data media lane runs on Linux: playerctl, and gdbus
+      # (glib's bin output) when playerctl finds nothing. A plain NixOS desktop
+      # has neither on PATH. nix/checks.nix greps the wrapper for both.
+      runtimeTools =
+        pkgs: with pkgs; [
+          playerctl
+          glib
+        ];
+
       # Upstream ships no icon for Linux (only assets/entropy.ico for Windows);
       # scripts/build_linux_appimage.sh generates this SVG inline. Same artwork.
       iconSvg =
@@ -144,6 +153,7 @@
             preFixup = ''
               gappsWrapperArgs+=(
                 --prefix LD_LIBRARY_PATH : "${lib.makeLibraryPath (runtimeLibs pkgs)}"
+                --prefix PATH : "${lib.makeBinPath (runtimeTools pkgs)}"
               )
             '';
 

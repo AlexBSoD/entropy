@@ -326,11 +326,14 @@ impl EntropyApp {
             ) {
                 // The device changed between choosing the file and this deferred
                 // write; do not program the new device with the old one's import.
-                self.status_msg = crate::i18n::tr_catalog(
-                    self.app_settings.language,
-                    "status_messages.file_dialog_device_changed",
-                )
-                .into();
+                self.report_import_failure(
+                    "status_messages.layout_import_failed_title",
+                    crate::i18n::tr_catalog(
+                        self.app_settings.language,
+                        "status_messages.file_dialog_device_changed",
+                    )
+                    .into(),
+                );
                 self.import_progress_started_at = None;
                 return;
             }
@@ -349,13 +352,14 @@ impl EntropyApp {
                     self.import_report_body = report;
                     self.import_report_open = true;
                 }
-                Err(e) => {
-                    self.status_msg = crate::i18n::tr_catalog_format(
+                Err(e) => self.report_import_failure(
+                    "status_messages.layout_import_failed_title",
+                    crate::i18n::tr_catalog_format(
                         self.app_settings.language,
                         "status_messages.import_failed",
-                        &[("error", &e.to_string())],
-                    )
-                }
+                        &[("error", &format!("{e:#}"))],
+                    ),
+                ),
             }
         }
         if let Some(path) = self.pending_entsettings_import_path.take() {
@@ -374,16 +378,29 @@ impl EntropyApp {
                     self.import_report_body = report;
                     self.import_report_open = true;
                 }
-                Err(e) => {
-                    self.status_msg = crate::i18n::tr_catalog_format(
+                Err(e) => self.report_import_failure(
+                    "status_messages.app_settings_import_failed_title",
+                    crate::i18n::tr_catalog_format(
                         self.app_settings.language,
                         "status_messages.import_app_settings_failed",
-                        &[("error", &e.to_string())],
-                    )
-                }
+                        &[("error", &format!("{e:#}"))],
+                    ),
+                ),
             }
         }
         self.import_progress_started_at = None;
+    }
+
+    /// A failed import says why in the report window and the log: with a
+    /// layout on screen the status message is drawn nowhere.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn report_import_failure(&mut self, title_key: &'static str, message: String) {
+        log::warn!("{message}");
+        self.import_report_title =
+            crate::i18n::tr_catalog(self.app_settings.language, title_key).into();
+        self.import_report_body = message.clone();
+        self.import_report_open = true;
+        self.status_msg = message;
     }
 
     fn draw_import_report_text(ui: &mut egui::Ui, body: &str) {
@@ -628,6 +645,48 @@ mod tests {
             "hidden tray runtime stopped ticking while Macropad is connected: {delay:?}"
         );
         assert_eq!(app.selected_device, Some(1));
+    }
+
+    #[test]
+    fn a_failed_layout_import_says_why_in_the_report_window() {
+        let storage = crate::app::app_storage::ScopedTempConfig::new();
+        let mut app = EntropyApp::new_inert_for_test();
+        let ctx = egui::Context::default();
+        let title = crate::i18n::tr_catalog(
+            app.app_settings.language,
+            "status_messages.layout_import_failed_title",
+        );
+        // With a layout on screen the status message is drawn nowhere.
+        let missing = storage.path().join("missing.entlayout");
+        app.begin_entlayout_import(missing.clone());
+        app.handle_pending_imports(&ctx, 1.0);
+        app.handle_pending_imports(&ctx, 1.1);
+        assert!(!app.import_pending());
+        assert!(app.import_report_open);
+        assert_eq!(app.import_report_title, title);
+        assert!(
+            app.import_report_body
+                .contains(&missing.display().to_string()),
+            "{}",
+            app.import_report_body
+        );
+
+        app.import_report_open = false;
+        app.begin_entlayout_import(missing);
+        app.connection_generation += 1;
+        app.handle_pending_imports(&ctx, 2.0);
+        app.handle_pending_imports(&ctx, 2.1);
+        assert!(
+            app.import_report_open,
+            "a device change stops the import too"
+        );
+        assert_eq!(
+            app.import_report_body,
+            crate::i18n::tr_catalog(
+                app.app_settings.language,
+                "status_messages.file_dialog_device_changed"
+            )
+        );
     }
 
     #[test]
