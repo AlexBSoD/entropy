@@ -11,7 +11,7 @@ use super::device_connect_task::{
     use_device_name_for_unnamed_layout,
 };
 use super::*;
-use crate::rynk::client::RynkClientError;
+use crate::rynk::client::{fnv1a, RynkClientError};
 use crate::rynk::dynamic::{DynamicLoss, DynamicSlot};
 use crate::rynk::link::{PhysicalId, RynkLink};
 use crate::rynk::session::RynkSession;
@@ -42,10 +42,7 @@ impl EntropyApp {
         let capabilities = *session.capabilities();
 
         progress("Reading keyboard definition…")?;
-        let hash = info.definition_hash;
-        let definition = session
-            .link()
-            .run(move |client| client.read_board_definition(hash))
+        let definition = board_definition(&session, rynk_cache_dir().as_deref())
             .map_err(|error| rynk_failed("Definition read", error))?;
         let json = crate::hid::decode_vial_definition(&definition)
             .map_err(failed(language, "Definition decode"))?;
@@ -54,6 +51,11 @@ impl EntropyApp {
         let supported_qmk_settings = session
             .setting_keys()
             .map_err(failed(language, "Setting list read"))?;
+        // A failure here only costs time: each read below then asks on its own
+        // and reports what fails, as before.
+        if let Err(error) = session.read_settings_ahead(&supported_qmk_settings) {
+            log::warn!("Rynk settings read ahead failed: {error:#}");
+        }
         let has_qmk_setting = |qsid: u16| supported_qmk_settings.contains(&qsid);
 
         progress("Parsing keyboard layout…")?;
@@ -152,19 +154,22 @@ impl EntropyApp {
         if !layout.encoders.is_empty() {
             progress("Reading encoders…")?;
             layout.encoder_layers = vec![vec![0u16; layout.encoders.len()]; layer_count];
-            for layer in 0..layer_count {
-                let mut keycodes = Vec::with_capacity(layout.encoder_count());
-                for index in 0..layout.encoder_count() {
-                    let action = session
-                        .encoder(layer as u8, index as u8)
-                        .map_err(failed(language, "Encoder read"))?;
-                    keycodes.push(shown(
-                        &mut read_losses,
-                        DynamicSlot::Encoder { layer: layer as u8 },
-                        index as u8,
-                        dynamic::encoder_keycodes(action),
-                    ));
-                }
+            let encoders = session
+                .encoders(layer_count as u8, layout.encoder_count() as u8)
+                .map_err(failed(language, "Encoder read"))?;
+            for (layer, actions) in encoders.into_iter().enumerate() {
+                let keycodes: Vec<_> = actions
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, action)| {
+                        shown(
+                            &mut read_losses,
+                            DynamicSlot::Encoder { layer: layer as u8 },
+                            index as u8,
+                            dynamic::encoder_keycodes(action),
+                        )
+                    })
+                    .collect();
                 for (visual, encoder) in layout.encoders.iter().enumerate() {
                     if let Some([ccw, cw]) = keycodes.get(encoder.encoder_idx as usize) {
                         layout.encoder_layers[layer][visual] =
@@ -250,6 +255,7 @@ impl EntropyApp {
         let module_settings = Self::read_module_settings(&json, &supported_qmk_settings, &session);
         let layer_led_settings =
             Self::read_layer_led_settings(&json, &supported_qmk_settings, layer_count, &session);
+        session.forget_settings_read_ahead();
 
         let supports_battery_halves = info.caps & caps::BATTERY_HALVES != 0;
         let battery_halves = if supports_battery_halves {
@@ -370,6 +376,54 @@ impl EntropyApp {
 }
 
 const QK_REPEAT_KEY: u16 = 0x7C79;
+
+/// Where board definitions are kept by hash, beside the Vial cache. Tests
+/// read their boards' definitions every time.
+fn rynk_cache_dir() -> Option<std::path::PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    let dir = dirs::config_dir()?.join("entropy").join("rynk_cache");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// The board's definition: the copy kept in `cache` under the hash the board
+/// reports on every connect, or else read from the board and kept there. A
+/// changed definition has another hash, and a copy that does not hash to its
+/// name is read again.
+fn board_definition(
+    session: &RynkSession,
+    cache: Option<&std::path::Path>,
+) -> Result<Vec<u8>, RynkClientError> {
+    let hash = session.info().definition_hash;
+    let path = cache.map(|dir| dir.join(format!("definition_{hash:08x}.xz")));
+    if let Some(kept) = path.as_ref().and_then(|path| std::fs::read(path).ok()) {
+        if fnv1a(&kept) == hash {
+            return Ok(kept);
+        }
+    }
+    let definition = session
+        .link()
+        .run(move |client| client.read_board_definition(hash))?;
+    if let Some(path) = path {
+        if let Err(error) = keep(&path, &definition) {
+            log::warn!("Rynk definition not kept at {}: {error}", path.display());
+        }
+    }
+    Ok(definition)
+}
+
+/// Writes `bytes` to `path` through a file beside it, so a crash leaves no
+/// half of a definition behind.
+fn keep(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let mut file = tempfile::NamedTempFile::new_in(dir)?;
+    file.write_all(bytes)?;
+    file.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
 
 /// What the editor shows of an entry. What it cannot show goes to the report
 /// after connect, since editing the entry replaces it.
@@ -550,6 +604,90 @@ mod tests {
             "nothing is left for later"
         );
         assert_eq!(state.lock().unwrap().writes(), [], "loading writes nothing");
+    }
+
+    #[test]
+    fn a_board_that_takes_requests_back_to_back_loads_the_same() {
+        let (one_by_one, _) = board(stored());
+        let _held = link("connect-one-by-one", &one_by_one);
+        let expected = connect("connect-one-by-one").unwrap();
+        let (board, state) = board(stored());
+        let board = board.pipelining();
+        let _held = link("connect-pipelined", &board);
+
+        let result = connect("connect-pipelined").unwrap();
+
+        assert_eq!(result.layout.layers, expected.layout.layers);
+        assert_eq!(result.layout.layer_names, expected.layout.layer_names);
+        assert_eq!(result.combo_entries, expected.combo_entries);
+        assert_eq!(result.tap_dance_entries, expected.tap_dance_entries);
+        assert_eq!(result.key_override_entries, expected.key_override_entries);
+        assert_eq!(result.macro_texts, expected.macro_texts);
+        assert_eq!(result.combo_term, expected.combo_term);
+        assert_eq!(result.rynk_read_losses, expected.rynk_read_losses);
+        assert!(
+            board.batches().contains(&3),
+            "the three settings in one go: {:?}",
+            board.batches()
+        );
+        let state = state.lock().unwrap();
+        let settings = state
+            .received
+            .iter()
+            .filter(|cmd| **cmd == rmk_types_rynk::protocol::rynk::Cmd::GetSetting)
+            .count();
+        assert_eq!(settings, 3, "each read once, ahead");
+        assert_eq!(state.writes(), [], "loading writes nothing");
+    }
+
+    fn definition_reads(state: &std::sync::Mutex<Stored>) -> usize {
+        let state = state.lock().unwrap();
+        state
+            .received
+            .iter()
+            .filter(|cmd| **cmd == rmk_types_rynk::protocol::rynk::Cmd::GetBoardDefinition)
+            .count()
+    }
+
+    #[test]
+    fn a_kept_definition_is_not_read_again() {
+        let cache = tempfile::tempdir().unwrap();
+        let (board, state) = board(stored());
+        let session = RynkSession::new(link("definition-kept", &board));
+        let definition = state.lock().unwrap().definition.clone();
+
+        assert_eq!(
+            board_definition(&session, Some(cache.path())).unwrap(),
+            definition
+        );
+        assert_eq!(definition_reads(&state), 1);
+        assert_eq!(
+            board_definition(&session, Some(cache.path())).unwrap(),
+            definition
+        );
+        assert_eq!(definition_reads(&state), 1, "the kept copy served");
+
+        assert_eq!(board_definition(&session, None).unwrap(), definition);
+        assert_eq!(definition_reads(&state), 2, "nowhere to keep it");
+    }
+
+    #[test]
+    fn a_kept_definition_that_does_not_hash_to_its_name_is_read_again() {
+        let cache = tempfile::tempdir().unwrap();
+        let (board, state) = board(stored());
+        let session = RynkSession::new(link("definition-damaged", &board));
+        let definition = state.lock().unwrap().definition.clone();
+        let kept = cache
+            .path()
+            .join(format!("definition_{:08x}.xz", fnv1a(&definition)));
+        std::fs::write(&kept, b"half a definition").unwrap();
+
+        assert_eq!(
+            board_definition(&session, Some(cache.path())).unwrap(),
+            definition
+        );
+        assert_eq!(definition_reads(&state), 1);
+        assert_eq!(std::fs::read(&kept).unwrap(), definition, "kept whole now");
     }
 
     #[test]
