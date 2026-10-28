@@ -1247,6 +1247,10 @@ impl EntropyApp {
                 if staged_bluetooth_load {
                     self.schedule_initial_battery_refresh();
                 } else {
+                    crate::battery_log::record(
+                        r.about_info.keyboard_id,
+                        r.about_info.battery_halves,
+                    );
                     self.schedule_battery_refresh_for_result(r.about_info.battery_halves);
                 }
                 self.current_encoder_visibility_id =
