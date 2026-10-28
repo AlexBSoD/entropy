@@ -118,7 +118,23 @@ fn root() -> Option<PathBuf> {
     }
 }
 
+// Counted per thread: the tests that drive the app run in parallel.
+#[cfg(test)]
+thread_local! {
+    static TEST_SENT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many rows and gaps `f` sent to the log on this thread.
+#[cfg(test)]
+pub(crate) fn sent_by_test(f: impl FnOnce()) -> usize {
+    let before = TEST_SENT.get();
+    f();
+    TEST_SENT.get() - before
+}
+
 fn with_log(f: impl FnOnce(&mut Log) -> Result<()>) {
+    #[cfg(test)]
+    TEST_SENT.set(TEST_SENT.get() + 1);
     // The GUI tests connect fake keyboards; they must not reach the user's logs.
     if cfg!(test) {
         return;
@@ -132,19 +148,28 @@ fn with_log(f: impl FnOnce(&mut Log) -> Result<()>) {
     }
 }
 
-/// Logs a battery read of the connected keyboard; a read with no levels is
-/// skipped.
-pub(crate) fn record(keyboard_id: u64, halves: Option<BatteryHalves>) {
-    let Some(halves) = halves else {
-        return;
-    };
-    with_log(|log| log.record(keyboard_id, halves, Instant::now()).map(|_| ()));
-}
+/// The log is the GUI's: a headless export connects a keyboard of its own,
+/// inside a running GUI too, and neither that connect nor its reads are the
+/// GUI's keyboard coming or going.
+impl crate::app::EntropyApp {
+    /// Logs a battery read of the connected keyboard; a read with no levels is
+    /// skipped.
+    pub(crate) fn log_battery(&self, keyboard_id: u64, halves: Option<BatteryHalves>) {
+        let Some(halves) = halves else {
+            return;
+        };
+        if !self.headless {
+            with_log(|log| log.record(keyboard_id, halves, Instant::now()).map(|_| ()));
+        }
+    }
 
-/// Breaks the log of the keyboard that was connected: it went away, another
-/// takes its place, or Entropy exits.
-pub(crate) fn gap() {
-    with_log(Log::gap);
+    /// Breaks the log of the keyboard that was connected: it went away,
+    /// another takes its place, or Entropy exits.
+    pub(crate) fn log_battery_gap(&self) {
+        if !self.headless {
+            with_log(Log::gap);
+        }
+    }
 }
 
 fn show(halves: BatteryHalves) -> String {

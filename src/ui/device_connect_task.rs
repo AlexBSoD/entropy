@@ -694,7 +694,7 @@ impl EntropyApp {
             self.undo_stack.clear();
             self.device_about_info = None;
             self.next_battery_refresh_at = None;
-            crate::battery_log::gap();
+            self.log_battery_gap();
             self.combo_visible_count = 1;
             self.combo_undo_stack.clear();
             self.combo_pick_target = None;

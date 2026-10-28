@@ -1894,7 +1894,7 @@ impl eframe::App for EntropyApp {
             self.fallback_entropy_display_presets_before_exit();
         }
         #[cfg(not(target_arch = "wasm32"))]
-        crate::battery_log::gap();
+        self.log_battery_gap();
         #[cfg(target_arch = "wasm32")]
         self.flush_pending_tap_hold_numeric_writes();
         self.flush_pending_text_expander_settings();

@@ -842,6 +842,24 @@ mod tests {
         crate::golden_frames::assert_vial_frames("connect_macropad", &recorder.requests());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_export_leaves_the_battery_log_to_the_gui() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        // Inside a running GUI the log follows that window's keyboard; the
+        // export connecting one of its own is not that keyboard going away.
+        let (mut app, session, _recorder) = scripted_export_app(|_| None);
+        let sent = crate::battery_log::sent_by_test(|| {
+            export_entlayout(&mut app, 0, &session, deadline(), &AtomicBool::default()).unwrap();
+        });
+        assert_eq!(sent, 0);
+
+        // The same connect from the window does break the log.
+        let (mut app, _session, _recorder) = scripted_export_app(|_| None);
+        app.headless = false;
+        assert_eq!(crate::battery_log::sent_by_test(|| app.start_connect(0)), 1);
+    }
+
     /// A scripted Vial keyboard: a two-key, two-layer definition, one macro,
     /// one combo and one tap dance. `fail` makes chosen requests fail on the
     /// wire the way a timeout or unplug would.
