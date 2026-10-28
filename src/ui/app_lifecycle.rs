@@ -427,6 +427,7 @@ impl EntropyApp {
         self.poll_ibus_reload(ctx);
         self.maybe_start_pending_layout_undo(ctx);
         self.maybe_start_pending_layer_write();
+        self.maybe_rewrite_unsaved_layer();
         self.maybe_start_combo_write(ctx);
         // Without a window the root gets no `ui` pass, where these start.
         #[cfg(target_os = "linux")]

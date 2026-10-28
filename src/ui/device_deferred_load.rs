@@ -1183,7 +1183,9 @@ impl EntropyApp {
                 .section_status(DeferredLoadSection::Combos),
             DeferredLoadStatus::Loaded
         ) {
-            result.combo_entries = self.combo_entries.clone();
+            // What the board confirmed: an edit it never saw is written
+            // again from the unsaved edits, not taken as saved.
+            result.combo_entries = self.combo_synced_entries.clone();
         }
         if matches!(
             result
@@ -1191,7 +1193,7 @@ impl EntropyApp {
                 .section_status(DeferredLoadSection::TapDance),
             DeferredLoadStatus::Loaded
         ) {
-            result.tap_dance_entries = self.keycode_picker.tap_dance_entries.clone();
+            result.tap_dance_entries = self.keycode_picker.tap_dance_synced_entries.clone();
         }
         if matches!(
             result

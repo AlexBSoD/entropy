@@ -60,6 +60,10 @@ impl<T: RynkTransport + ?Sized> RynkTransport for Box<T> {
     fn send_all(&mut self, frames: &[Vec<u8>]) -> io::Result<()> {
         (**self).send_all(frames)
     }
+
+    fn on_gone(&mut self, gone: Box<dyn FnOnce() + Send>) {
+        (**self).on_gone(gone)
+    }
 }
 
 /// The client a link's owner holds, as [`RynkLink::run`] hands it out.
@@ -74,13 +78,17 @@ enum Event {
         queued: Instant,
         job: Job,
     },
+    /// The transport heard the board go away: nothing queued can reach it.
+    Gone,
 }
 
 /// The shared handle of one board's link.
 pub(crate) struct RynkLink {
     id: PhysicalId,
     board: RynkBoard,
-    events: mpsc::Sender<Event>,
+    /// Held here alone: the transport's call on the board going away holds
+    /// it weakly, so letting go of the last handle still closes the link.
+    events: Arc<mpsc::Sender<Event>>,
     closed: Arc<Closed>,
     /// Set on a read-only view: everything it sends runs inside this session.
     read_only: Option<ReadOnlyRynkSession>,
@@ -168,9 +176,20 @@ impl RynkLink {
             closing.wait(BUSY_RETRY);
             registry = self::registry().lock().unwrap_or_else(|e| e.into_inner());
         }
+        let (sender, events) = mpsc::channel();
+        let sender = Arc::new(sender);
         let started = Instant::now();
         let (client, board) = loop {
             let opened = open()
+                .map(|mut transport| {
+                    let events = Arc::downgrade(&sender);
+                    transport.on_gone(Box::new(move || {
+                        if let Some(events) = events.upgrade() {
+                            let _ = events.send(Event::Gone);
+                        }
+                    }));
+                    transport
+                })
                 .map_err(RynkClientError::from)
                 .and_then(|transport| Client::connect(transport, timeouts));
             match opened {
@@ -180,7 +199,6 @@ impl RynkLink {
                 other => break other?,
             }
         };
-        let (sender, events) = mpsc::channel();
         let closed = Arc::new(Closed::default());
         let link = Arc::new(Self {
             id: id.clone(),
@@ -264,7 +282,12 @@ impl RynkLink {
             Ok(())
         });
         self.send(Event::Request(job))?;
-        let result = answer.recv().map_err(|_| closed_error())?;
+        let result = answer.recv().map_err(|_| {
+            // The owner dropped the request as the board went away; the link
+            // reads as closed once it is gone.
+            self.closed.wait(BUSY_RETRY);
+            closed_error()
+        })?;
         // The owner stops on a broken link; its caller hears of it only once
         // the link reads as closed, so the next step already sees it gone.
         if result.as_ref().err().is_some_and(link_failed) {
@@ -372,6 +395,7 @@ impl Owner {
                 events.recv().map_err(|_| true)
             };
             match event {
+                Ok(Event::Gone) => return,
                 Ok(event) => {
                     self.queue(event);
                     continue;
@@ -394,6 +418,7 @@ impl Owner {
     fn queue(&mut self, event: Event) {
         match event {
             Event::Request(job) => self.editor.push_back(job),
+            Event::Gone => {}
             // A newer value takes the slot but not its place in line: the
             // wait counts from the oldest value not sent yet.
             Event::Post { key, queued, job } => {
@@ -872,5 +897,27 @@ mod tests {
         assert_eq!(commands(&log)[1..], [(Cmd::SetDefaultLayer, 5)]);
         assert_eq!(view.request::<command::GetCurrentLayer>(()).unwrap(), 3);
         assert_eq!(commands(&log).len(), 3, "nothing else reached the board");
+    }
+
+    #[test]
+    fn a_board_that_goes_away_closes_its_link_before_any_request() {
+        let (board, log) = layer_board();
+        let link = RynkLink::acquire(id("gone"), quick(), open(&board)).unwrap();
+        let sent = log.lock().unwrap().len();
+
+        board.go_away();
+        eventually("the link closes with nothing sent", || !link.is_open());
+        assert_eq!(log.lock().unwrap().len(), sent, "nothing was asked of it");
+        let stopped = link
+            .request::<command::GetCurrentLayer>(())
+            .expect_err("the closed link answers nothing");
+        assert!(
+            crate::hid::is_disconnect_error(&anyhow::Error::new(stopped)),
+            "the UI sees the board gone"
+        );
+
+        let fresh = RynkLink::acquire(id("gone"), quick(), open(&board)).unwrap();
+        assert!(!Arc::ptr_eq(&link, &fresh));
+        assert_eq!(fresh.request::<command::GetCurrentLayer>(()).unwrap(), 3);
     }
 }

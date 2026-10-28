@@ -247,6 +247,14 @@ impl EntropyApp {
         if let Err(e) = hid.set_qmk_setting_u16(21, self.magic_settings.bits) {
             self.status_msg = format!("Failed to save Magic settings: {}", e);
             log::warn!("set_qmk_setting_u16(magic qsid 21) failed: {e}");
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let bits = self.magic_settings.bits;
+                self.keep_unsaved_rewrite(&e, "magic", 21, move |app| {
+                    app.magic_settings.bits = bits;
+                    app.write_magic_settings();
+                });
+            }
         }
     }
 }

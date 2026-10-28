@@ -170,6 +170,7 @@ impl EntropyApp {
                 if let Some(layout) = &mut self.layout {
                     layout.set_encoder_keycode(layer, encoder_visual_idx, kc_value);
                 }
+                self.forget_unsaved_encoder(layer, encoder_visual_idx);
                 self.status_msg = "Saving…".into();
                 true
             }
@@ -185,6 +186,7 @@ impl EntropyApp {
                 if let Some(layout) = &mut self.layout {
                     layout.set_encoder_keycode(layer, encoder_visual_idx, kc_value);
                 }
+                self.forget_unsaved_encoder(layer, encoder_visual_idx);
                 self.status_msg =
                     "Read-only: encoder changed locally, firmware write disabled for this device"
                         .into();
@@ -484,6 +486,7 @@ impl EntropyApp {
             if let Some(layout) = &mut this.layout {
                 layout.set_key_binding(layer, ki, binding);
             }
+            this.forget_unsaved_key(layer, ki);
             this.refresh_layer_picker_content_flags();
         };
 

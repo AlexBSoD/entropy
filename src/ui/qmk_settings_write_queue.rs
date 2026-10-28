@@ -3,8 +3,8 @@ use super::*;
 const QMK_SETTINGS_WRITE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(180);
 
 #[derive(Clone, Debug)]
-struct QmkSettingWriteRequest {
-    qsid: u16,
+pub(super) struct QmkSettingWriteRequest {
+    pub(super) qsid: u16,
     old_value: u16,
     requested: u16,
     due_at: std::time::Instant,
@@ -46,7 +46,7 @@ impl QmkSettingsWriteQueue {
             .collect()
     }
 
-    fn take_all(&mut self) -> Vec<QmkSettingWriteRequest> {
+    pub(super) fn take_all(&mut self) -> Vec<QmkSettingWriteRequest> {
         std::mem::take(&mut self.pending).into_values().collect()
     }
 
@@ -141,6 +141,18 @@ impl EntropyApp {
                 request.requested,
             );
         }
+    }
+
+    /// Shows the values the board never confirmed again and writes them.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn rewrite_unsaved_touchpad_values(
+        &mut self,
+        requests: Vec<QmkSettingWriteRequest>,
+    ) {
+        for request in &requests {
+            self.set_touchpad_numeric_value(request.qsid, request.requested);
+        }
+        self.enqueue_debounced_qmk_setting_writes(requests);
     }
 
     pub(super) fn cancel_pending_qmk_setting_writes(&mut self) {

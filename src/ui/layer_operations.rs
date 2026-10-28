@@ -1047,6 +1047,8 @@ impl EntropyApp {
             }
             return;
         }
+        // The layer as a whole is set anew: kept keys of an earlier edit are not.
+        self.forget_unsaved_layer(layer);
 
         let Some(layout) = self.layout.as_ref() else {
             self.report_layer_operation_error(LayerOperationError::MissingLayer);
@@ -1283,6 +1285,86 @@ impl EntropyApp {
         self.status_msg = saving_status;
     }
 
+    /// Keeps the keys and encoders `desired` sets on `layer` that the board
+    /// does not hold, to write once it is back.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn keep_unsaved_layer_snapshot(&mut self, layer: usize, desired: &LayerSnapshot) {
+        let Some(held) = self
+            .layout
+            .as_ref()
+            .and_then(|layout| capture_layer(layout, layer))
+        else {
+            return;
+        };
+        let Some(edits) = self.unsaved_edits_mut() else {
+            return;
+        };
+        for (index, (want, have)) in desired.keycodes.iter().zip(&held.keycodes).enumerate() {
+            if want != have {
+                edits.keep_key(layer, index, *want);
+            }
+        }
+        for (index, (want, have)) in desired
+            .encoder_keycodes
+            .iter()
+            .zip(&held.encoder_keycodes)
+            .enumerate()
+        {
+            if want != have {
+                edits.keep_encoder(layer, index, *want);
+            }
+        }
+    }
+
+    /// Keeps a layer write still waiting its turn as the connection drops.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn keep_unsaved_layer_write(&mut self) {
+        if let Some(pending) = self.pending_layer_write.take() {
+            self.keep_unsaved_layer_snapshot(pending.layer, &pending.desired);
+        }
+    }
+
+    /// Writes the next layer of edits the board missed while it was away,
+    /// once nothing else holds the board.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn maybe_rewrite_unsaved_layer(&mut self) {
+        if self.hid_device.is_none()
+            || !matches!(self.connect_state, ConnectState::Idle)
+            || self.pending_layer_write.is_some()
+            || !self.pending_middle_click_assignments.is_empty()
+            || self.vial_hid_background_layer_active()
+            || self.hid_write_task_active()
+        {
+            return;
+        }
+        let Some((layer, edits)) = self.take_unsaved_layer() else {
+            return;
+        };
+        let Some(mut desired) = self
+            .layout
+            .as_ref()
+            .and_then(|layout| capture_layer(layout, layer))
+        else {
+            return;
+        };
+        for (index, binding) in edits.keys {
+            if let Some(key) = desired.keycodes.get_mut(index) {
+                *key = binding;
+            }
+        }
+        for (index, keycode) in edits.encoders {
+            if let Some(encoder) = desired.encoder_keycodes.get_mut(index) {
+                *encoder = keycode;
+            }
+        }
+        self.apply_layer_snapshot_with_behavior(
+            layer,
+            desired,
+            "layer_actions.unsaved_edits",
+            LayerUndoBehavior::RecordOld,
+        );
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn maybe_start_pending_layer_write(&mut self) {
         if self.pending_layer_write.is_none()
@@ -1370,6 +1452,9 @@ impl EntropyApp {
                 &result.progress.key_updates,
                 &result.progress.encoder_updates,
             );
+        }
+        if result.progress.disconnect {
+            self.keep_unsaved_layer_snapshot(result.context.layer, &result.context.desired);
         }
 
         self.reconcile_layer_write_default(

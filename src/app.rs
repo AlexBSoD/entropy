@@ -227,6 +227,11 @@ mod touchpad_settings_ui;
 mod typing_trainer_ui;
 #[path = "ui/ui_scale.rs"]
 mod ui_scale;
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "ui/unsaved_edits.rs"]
+mod unsaved_edits;
+#[cfg(not(target_arch = "wasm32"))]
+use unsaved_edits::UnsavedEdits;
 #[path = "ui/vial_hid_task.rs"]
 mod vial_hid_task;
 #[cfg(not(target_arch = "wasm32"))]

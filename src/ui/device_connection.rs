@@ -107,6 +107,7 @@ impl EntropyApp {
         self.entlayout_losses_accepted = None;
         self.pending_entsettings_import_path = None;
         self.import_progress_started_at = None;
+        self.keep_unsaved_edits();
         self.reset_settings_write_context();
         self.cancel_pending_qmk_setting_writes();
         self.qmk_settings_write_queue.clear();
@@ -146,15 +147,23 @@ impl EntropyApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn maybe_begin_bluetooth_reconnect(&mut self) {
+        // A Rynk board over Bluetooth closes its link as it goes away, before
+        // anything is asked of it.
+        let link_lost = self
+            .hid_device
+            .as_ref()
+            .is_some_and(|session| session.link_lost() && session.is_bluetooth_transport());
         if !matches!(self.connect_state, ConnectState::Idle)
             || self.layout.is_none()
-            || self.hid_device.is_some()
+            || (self.hid_device.is_some() && !link_lost)
             || self.hid_write_task_owner_active()
         {
             return;
         }
 
-        let error = if self.status_msg.trim().is_empty() {
+        let error = if link_lost {
+            "the board is disconnected".to_owned()
+        } else if self.status_msg.trim().is_empty() {
             "Bluetooth HID transport became unavailable".to_owned()
         } else {
             self.status_msg.clone()

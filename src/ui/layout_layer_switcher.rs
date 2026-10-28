@@ -393,6 +393,7 @@ impl EntropyApp {
                                                 selected,
                                                 e
                                             );
+                                            self.keep_unsaved_layer_name(&e, selected, new_name);
                                         }
                                     }
                                 }

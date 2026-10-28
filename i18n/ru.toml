@@ -32,6 +32,7 @@ show_hide_keys_exit = "ПКМ или Esc — завершить"
 
 [layer_actions]
 save_default_to_device = "Запись Default в макропад"
+unsaved_edits = "Несохранённые правки"
 menu = "Операции со слоем"
 menu_tooltip = "Действия со слоем"
 copy = "Копировать слой"

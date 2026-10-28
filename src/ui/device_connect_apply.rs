@@ -1486,6 +1486,8 @@ impl EntropyApp {
                         // the current snapshot and explicitly request a full resend.
                         self.update_application_layout_runtime();
                         self.force_current_application_layout_resend();
+                        // Last: a queued write takes the board from the bridges.
+                        self.rewrite_unsaved_edits();
                     }
                 }
 
@@ -1781,6 +1783,77 @@ mod qa_followup_reconnect {
             .unwrap();
         app.poll_connect(ctx);
         assert!(matches!(app.connect_state, ConnectState::Idle));
+    }
+
+    #[test]
+    fn staged_reconnect_keeps_what_the_board_confirmed_not_an_unsaved_edit() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = EntropyApp::new(&cc);
+        app.device_manager.replace_devices(vec![device("a")]);
+        app.selected_device = Some(0);
+        app.layout = Some(layout());
+        app.current_keyboard_id = Some(7);
+        let context = DeferredDeviceLoadContext {
+            json: std::sync::Arc::new(serde_json::json!({})),
+            supported_qmk_settings: std::sync::Arc::new(Vec::new()),
+            definition_fingerprint: 7,
+            layer_count: 1,
+            rows: 1,
+            cols: 1,
+            encoder_count: 0,
+            macro_count: 0,
+            macro_memory_bytes: Some(0),
+            tap_dance_count: 1,
+            combo_count: 1,
+            key_override_count: 0,
+            alt_repeat_count: 0,
+            modules_supported: false,
+            touchpad_supported: false,
+            bluetooth_supported: false,
+            layer_leds_supported: false,
+            rgb_supported: false,
+            lighting_mode: None,
+            supports_rmk_native_key_actions: false,
+            supports_universal_symbols: false,
+            supports_universal_russian_letters: false,
+            supports_rmk_native_combo_output: false,
+            supports_rmk_native_tap_dance_actions: false,
+            supports_rmk_combo_layers: false,
+        };
+        app.deferred_device_load = DeferredDeviceLoadState::staged(context.clone());
+        for section in [DeferredLoadSection::Combos, DeferredLoadSection::TapDance] {
+            app.deferred_device_load
+                .set_section_status(section, DeferredLoadStatus::Loaded);
+        }
+        let confirmed = ComboEntry {
+            keys: [0x04, 0x05, 0, 0],
+            output: 0x06u16.into(),
+            layer: None,
+        };
+        app.combo_synced_entries = vec![confirmed.clone()];
+        app.combo_entries = vec![ComboEntry {
+            output: 0x07u16.into(),
+            ..confirmed.clone()
+        }];
+        let confirmed_tap_dance = crate::keycode_picker::TapDanceEntry {
+            on_tap: 0x04u16.into(),
+            ..Default::default()
+        };
+        app.keycode_picker.tap_dance_synced_entries = vec![confirmed_tap_dance.clone()];
+        app.keycode_picker.tap_dance_entries = vec![crate::keycode_picker::TapDanceEntry {
+            on_tap: 0x07u16.into(),
+            ..Default::default()
+        }];
+
+        let mut fresh = result(&device("a"), 7);
+        fresh.deferred_load = DeferredDeviceLoadState::staged(context);
+        let reconnect =
+            BluetoothReconnectState::new(device("a").stable_identity(), "Draft keyboard".into());
+        app.preserve_deferred_snapshot_on_reconnect(&mut fresh, &reconnect);
+        assert_eq!(fresh.combo_entries, [confirmed]);
+        assert_eq!(fresh.tap_dance_entries, [confirmed_tap_dance]);
     }
 
     #[test]

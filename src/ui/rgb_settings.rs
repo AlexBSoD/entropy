@@ -294,6 +294,10 @@ impl EntropyApp {
             Err(e) => {
                 self.status_msg = format!("Failed to update RGB effect: {}", e);
                 log::warn!("set_rgb_effect failed: {e}");
+                #[cfg(not(target_arch = "wasm32"))]
+                self.keep_unsaved_rewrite(&e, "rgb_effect", 0, move |app| {
+                    app.set_rgb_effect(effect)
+                });
             }
         }
     }
@@ -325,6 +329,10 @@ impl EntropyApp {
             Err(e) => {
                 self.status_msg = format!("Failed to update RGB brightness: {}", e);
                 log::warn!("set_rgb_brightness failed: {e}");
+                #[cfg(not(target_arch = "wasm32"))]
+                self.keep_unsaved_rewrite(&e, "rgb_brightness", 0, move |app| {
+                    app.set_rgb_brightness(brightness)
+                });
             }
         }
     }
@@ -357,6 +365,10 @@ impl EntropyApp {
             Err(e) => {
                 self.status_msg = format!("Failed to update RGB color: {}", e);
                 log::warn!("set_rgb_color failed: {e}");
+                #[cfg(not(target_arch = "wasm32"))]
+                self.keep_unsaved_rewrite(&e, "rgb_color", 0, move |app| {
+                    app.set_rgb_color(hue, saturation)
+                });
             }
         }
     }
@@ -388,6 +400,8 @@ impl EntropyApp {
             Err(e) => {
                 self.status_msg = format!("Failed to update RGB speed: {}", e);
                 log::warn!("set_rgb_speed failed: {e}");
+                #[cfg(not(target_arch = "wasm32"))]
+                self.keep_unsaved_rewrite(&e, "rgb_speed", 0, move |app| app.set_rgb_speed(speed));
             }
         }
     }
@@ -403,6 +417,8 @@ impl EntropyApp {
         if let Err(e) = hid.save_rgb() {
             self.status_msg = format!("Failed to save RGB settings: {}", e);
             log::warn!("save_rgb failed: {e}");
+            #[cfg(not(target_arch = "wasm32"))]
+            self.keep_unsaved_rewrite(&e, "rgb_save", 0, |app| app.autosave_rgb_settings());
         }
     }
 

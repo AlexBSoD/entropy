@@ -292,10 +292,10 @@ impl SettingsWriteTarget {
 }
 
 #[derive(Clone, Debug)]
-struct SettingsWriteRequest {
+pub(super) struct SettingsWriteRequest {
     id: u64,
     generation: u64,
-    qsid: u16,
+    pub(super) qsid: u16,
     width: u8,
     old_value: u16,
     requested: u16,
@@ -340,16 +340,17 @@ impl SettingsWriteQueueState {
         );
         let id = request.id;
 
-        if request.target.is_display() {
-            if let Some(existing) = self
-                .pending
-                .iter_mut()
-                .find(|existing| existing.qsid == request.qsid && existing.target.is_display())
-            {
-                request.old_value = existing.old_value;
-                *existing = request;
-                return id;
-            }
+        // A value not sent yet gives way to a newer one of its setting, in
+        // its place: a slider dragged over a hundred steps writes the one in
+        // flight and the last, not every step behind it.
+        if let Some(existing) = self
+            .pending
+            .iter_mut()
+            .find(|existing| existing.qsid == request.qsid)
+        {
+            request.old_value = existing.old_value;
+            *existing = request;
+            return id;
         }
 
         self.pending.push_back(request);
@@ -358,6 +359,10 @@ impl SettingsWriteQueueState {
 
     fn pop_front(&mut self) -> Option<SettingsWriteRequest> {
         self.pending.pop_front()
+    }
+
+    pub(super) fn pending_requests(&self) -> Vec<SettingsWriteRequest> {
+        self.pending.iter().cloned().collect()
     }
 
     fn status(&self, qsid: u16) -> Option<&SettingsWriteStatus> {
@@ -964,6 +969,7 @@ impl EntropyApp {
             return;
         }
         self.hid_device = hid_device;
+        let failed = result.is_err();
         let context = request.target.log_context();
         let newer_debounced_value = request
             .target
@@ -1063,6 +1069,12 @@ impl EntropyApp {
         self.sync_firmware_managed_layout_options();
 
         if disconnected {
+            // The board never confirmed these; they go again once it is back.
+            let mut unsaved = failed.then_some(request).into_iter().collect::<Vec<_>>();
+            unsaved.extend(self.settings_write_queue.pending_requests());
+            if let Some(edits) = self.unsaved_edits_mut() {
+                edits.keep_settings(unsaved);
+            }
             let error = crate::i18n::tr_catalog(
                 self.app_settings.language,
                 "settings_write.device_disconnected",
@@ -1080,11 +1092,31 @@ impl EntropyApp {
             return;
         }
 
+        // Queued behind a write the board went away under: they go once it
+        // is back.
+        let unsaved = self.settings_write_queue.pending_requests();
+        if !unsaved.is_empty() {
+            if let Some(edits) = self.unsaved_edits_mut() {
+                edits.keep_settings(unsaved);
+            }
+        }
         let error = crate::i18n::tr_catalog(
             self.app_settings.language,
             "settings_write.device_disconnected",
         );
         self.settings_write_queue.fail_pending(error);
+    }
+
+    /// Queues writes the board never confirmed again, as new ones.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn rewrite_unsaved_settings_writes(&mut self, requests: Vec<SettingsWriteRequest>) {
+        for request in requests {
+            self.queue_settings_write(SettingsWriteRequest {
+                id: 0,
+                generation: self.settings_write_generation,
+                ..request
+            });
+        }
     }
 
     pub(super) fn reset_settings_write_context(&mut self) {
@@ -1252,6 +1284,28 @@ mod tests {
         assert_eq!(request.old_value, 84);
         assert_eq!(request.requested, 140);
         assert_eq!(queue.pending_value(320), Some(140));
+    }
+
+    #[test]
+    fn a_pending_write_of_any_setting_gives_way_to_its_latest_value() {
+        let mut queue = SettingsWriteQueueState::default();
+        let in_flight = queue.enqueue(request(317, 10));
+        assert_eq!(queue.pop_front().map(|request| request.id), Some(in_flight));
+        let other = queue.enqueue(request(316, 50));
+        for step in 11..=60 {
+            queue.enqueue(request(317, step));
+        }
+
+        assert_eq!(
+            queue.pending.len(),
+            2,
+            "the other setting and the last step"
+        );
+        assert_eq!(queue.pending_value(317), Some(60));
+        assert_eq!(queue.pop_front().map(|request| request.id), Some(other));
+        let last = queue.pop_front().expect("the last step");
+        assert_eq!((last.qsid, last.requested), (317, 60));
+        assert!(queue.pop_front().is_none());
     }
 
     #[test]

@@ -860,6 +860,396 @@ mod tests {
     }
 
     #[test]
+    fn a_rynk_board_gone_over_bluetooth_is_reconnected_with_its_layout_kept() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (board, _) = board(stored());
+        // Reached over Bluetooth on every platform that has Rynk.
+        let path = "hid:link-gone";
+        let first = link(path, &board);
+        let mut app = EntropyApp::new_inert_for_test();
+        app.device_manager.replace_devices(vec![Device {
+            bus_type: "Bluetooth".into(),
+            ..rynk_device(path)
+        }]);
+        app.start_connect(0);
+        finish_connect(&mut app);
+        assert!(app.hid_device.is_some());
+
+        board.go_away();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while first.is_open() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the link never closed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        drop(first);
+        app.maybe_begin_bluetooth_reconnect();
+        assert!(
+            matches!(app.connect_state, ConnectState::Reconnecting(_)),
+            "nothing was asked of the board, yet the app reconnects"
+        );
+        assert!(app.layout.is_some(), "the layout stays on screen");
+
+        let second = link(path, &board);
+        let devices = app.device_manager.devices().to_vec();
+        app.apply_device_scan_result(devices);
+        finish_connect(&mut app);
+        let session = app
+            .hid_device
+            .as_ref()
+            .and_then(crate::device_session::DeviceSession::as_rynk)
+            .expect("the board is connected again");
+        assert!(std::sync::Arc::ptr_eq(session.link(), &second));
+    }
+
+    /// The board at `path`, connected as one reached over Bluetooth.
+    fn connected_over_bluetooth(path: &str) -> EntropyApp {
+        let mut app = EntropyApp::new_inert_for_test();
+        app.device_manager.replace_devices(vec![Device {
+            bus_type: "Bluetooth".into(),
+            ..rynk_device(path)
+        }]);
+        app.start_connect(0);
+        finish_connect(&mut app);
+        assert!(app.hid_device.is_some());
+        app
+    }
+
+    /// The app hears that its board went away, and connects it again.
+    fn reconnect(
+        app: &mut EntropyApp,
+        path: &str,
+        board: &crate::rynk::client::testing::FakeBoard,
+    ) -> std::sync::Arc<crate::rynk::link::RynkLink> {
+        app.maybe_begin_bluetooth_reconnect();
+        assert!(matches!(app.connect_state, ConnectState::Reconnecting(_)));
+        let link = link(path, board);
+        let devices = app.device_manager.devices().to_vec();
+        app.apply_device_scan_result(devices);
+        finish_connect(app);
+        assert!(
+            matches!(app.connect_state, ConnectState::Idle) && app.layout.is_some(),
+            "the board is connected again"
+        );
+        link
+    }
+
+    /// Runs the writes the app has started or queued to their end.
+    fn settle_writes(app: &mut EntropyApp) {
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            app.poll_settings_write(&ctx);
+            app.poll_vial_hid_task(&ctx);
+            app.poll_layer_write(&ctx);
+            app.poll_combo_write(&ctx);
+            app.flush_pending_tap_hold_numeric_writes();
+            app.maybe_rewrite_unsaved_layer();
+            app.maybe_start_combo_write(&ctx);
+            app.maybe_start_macro_write(&ctx);
+            // Without the board, what waits keeps waiting.
+            let waiting = !app.pending_tap_hold_numeric_writes.is_empty()
+                || app.unsaved_edits.is_some()
+                || app.combo_dirty
+                || app.keycode_picker.macros_dirty;
+            if !app.hid_write_task_active() && (!waiting || app.hid_device.is_none()) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writes never settled"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn settings_the_board_never_confirmed_are_written_once_it_is_back() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let mut stored = stored();
+        stored.settings.insert(7, 200u16.to_le_bytes().to_vec());
+        stored.settings.insert(6, 180u16.to_le_bytes().to_vec());
+        stored.settings.insert(121, vec![5]);
+        let (board, state) = board(stored);
+        let path = "hid:unsaved-settings";
+        let first = link(path, &board);
+        let mut app = connected_over_bluetooth(path);
+
+        // The board resets as the edits go out, before the app hears of it.
+        board.go_away();
+        app.queue_tap_hold_setting_write("Tapping term".into(), 7, 2, 200, 250);
+        app.pending_tap_hold_numeric_writes.insert(6, 190);
+        settle_writes(&mut app);
+        assert_eq!(state.lock().unwrap().settings[&7], 200u16.to_le_bytes());
+        // Still waiting out its debounce as the app hears of it.
+        app.debounce_touchpad_setting_write(
+            &egui::Context::default(),
+            "Sniper sensitivity".into(),
+            121,
+            5,
+            9,
+        );
+        drop(first);
+
+        let _second = reconnect(&mut app, path, &board);
+        settle_writes(&mut app);
+        let stored = state.lock().unwrap();
+        assert_eq!(
+            stored.settings[&7],
+            250u16.to_le_bytes(),
+            "the failed write"
+        );
+        assert_eq!(stored.settings[&6], 190u16.to_le_bytes(), "the one waiting");
+        assert_eq!(stored.settings[&121], [9], "the debounced one");
+        assert_eq!(app.touchpad_settings.sniper_sens, 9);
+        assert!(app.unsaved_edits.is_none());
+    }
+
+    #[test]
+    fn keys_the_board_never_confirmed_are_written_once_it_is_back() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (board, state) = board(stored());
+        let path = "hid:unsaved-keys";
+        let first = link(path, &board);
+        let mut app = connected_over_bluetooth(path);
+        let ctx = egui::Context::default();
+
+        board.go_away();
+        assert!(app.assign_key_binding(&ctx, 0, 0, KeyBinding::Vial(0x06)));
+        settle_writes(&mut app);
+        let layout = app.layout.as_ref().unwrap();
+        assert_eq!(
+            layout.get_key_binding(0, 0),
+            KeyBinding::Vial(0x04),
+            "the editor shows what the board holds meanwhile"
+        );
+        drop(first);
+
+        let _second = reconnect(&mut app, path, &board);
+        settle_writes(&mut app);
+        assert_eq!(state.lock().unwrap().keymap[0], key(HidKeyCode::C));
+        let layout = app.layout.as_ref().unwrap();
+        assert_eq!(layout.get_key_binding(0, 0), KeyBinding::Vial(0x06));
+        assert!(app.unsaved_edits.is_none());
+    }
+
+    #[test]
+    fn a_layer_write_the_board_dropped_out_of_is_finished_once_it_is_back() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (board, state) = board(stored());
+        let path = "hid:unsaved-layer";
+        let first = link(path, &board);
+        let mut app = connected_over_bluetooth(path);
+
+        board.go_away();
+        app.apply_layer_snapshot(
+            1,
+            crate::app::layer_operations::LayerSnapshot {
+                keycodes: vec![KeyBinding::Vial(0x06), KeyBinding::Vial(0x07)],
+                encoder_keycodes: Vec::new(),
+            },
+            "layer_actions.paste",
+        );
+        settle_writes(&mut app);
+        drop(first);
+
+        let _second = reconnect(&mut app, path, &board);
+        settle_writes(&mut app);
+        let stored = state.lock().unwrap();
+        assert_eq!(stored.keymap[2], key(HidKeyCode::C));
+        assert_eq!(stored.keymap[3], key(HidKeyCode::D));
+        assert!(app.unsaved_edits.is_none());
+    }
+
+    #[test]
+    fn combos_and_macros_the_board_never_confirmed_are_written_once_it_is_back() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (board, state) = board(stored());
+        let path = "hid:unsaved-tables";
+        let first = link(path, &board);
+        let mut app = connected_over_bluetooth(path);
+
+        board.go_away();
+        app.combo_entries[0].output = KeyBinding::Vial(0x07);
+        app.mark_combo_dirty();
+        settle_writes(&mut app);
+        // Edited after the write failed, before the app reconnects.
+        app.keycode_picker.macro_texts[0] = b"ok".to_vec();
+        app.keycode_picker.mark_macros_dirty();
+        settle_writes(&mut app);
+        assert_eq!(state.lock().unwrap().combos[0].output, key(HidKeyCode::C));
+        drop(first);
+
+        let _second = reconnect(&mut app, path, &board);
+        assert_eq!(app.combo_entries[0].output, KeyBinding::Vial(0x07));
+        settle_writes(&mut app);
+        let stored = state.lock().unwrap();
+        assert_eq!(stored.combos[0].output, key(HidKeyCode::D));
+        assert_eq!(stored.macros[0], [MacroOp::Char(b'o'), MacroOp::Char(b'k')]);
+        assert!(app.unsaved_edits.is_none());
+    }
+
+    #[test]
+    fn tap_dance_and_key_overrides_are_taken_back_and_marked_for_writing() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (board, _) = board(stored());
+        let path = "hid:unsaved-overrides";
+        let _held = link(path, &board);
+        let mut app = connected_over_bluetooth(path);
+        let board_tap_dance = app.keycode_picker.tap_dance_entries.clone();
+        let board_overrides = app.key_override_entries.clone();
+        app.keycode_picker.tap_dance_entries[0].on_tap = KeyBinding::Vial(0x07);
+        let tap_dance = app.keycode_picker.tap_dance_entries.clone();
+        app.key_override_entries[0].replacement = 0x07;
+        app.key_override_dirty = true;
+        let overrides = app.key_override_entries.clone();
+        app.keep_unsaved_edits();
+
+        // What the connect read back from the board.
+        app.keycode_picker.tap_dance_entries = board_tap_dance;
+        app.keycode_picker.tap_dance_dirty = false;
+        app.key_override_entries = board_overrides;
+        app.key_override_dirty = false;
+        app.rewrite_unsaved_edits();
+        assert_eq!(app.keycode_picker.tap_dance_entries, tap_dance);
+        assert!(app.keycode_picker.tap_dance_dirty);
+        assert_eq!(app.key_override_entries, overrides);
+        assert!(app.key_override_dirty);
+        assert!(app.unsaved_edits.is_none());
+    }
+
+    #[test]
+    fn a_write_made_outside_any_queue_goes_again_once_the_board_is_back() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (board, state) = board(stored());
+        let path = "hid:unsaved-rename";
+        let first = link(path, &board);
+        let mut app = connected_over_bluetooth(path);
+
+        board.go_away();
+        let error = app
+            .hid_device
+            .as_ref()
+            .unwrap()
+            .set_qmk_setting_string(201, "Fn")
+            .expect_err("the board is gone");
+        app.keep_unsaved_layer_name(&error, 1, "Fn".into());
+        app.keep_unsaved_rewrite(&anyhow::anyhow!("invalid value"), "other", 0, |app| {
+            app.status_msg = "written again".into();
+        });
+        drop(first);
+
+        let _second = reconnect(&mut app, path, &board);
+        settle_writes(&mut app);
+        assert!(state.lock().unwrap().settings[&201].starts_with(b"Fn"));
+        assert_eq!(app.layer_names[1], "Fn");
+        assert_ne!(
+            app.status_msg, "written again",
+            "a failure other than the board going away is not kept"
+        );
+        assert!(app.unsaved_edits.is_none());
+    }
+
+    #[test]
+    fn unsaved_edits_of_one_board_are_not_written_to_another() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (board, state) = board(stored());
+        let path = "hid:unsaved-other";
+        let _held = link(path, &board);
+        let mut app = connected_over_bluetooth(path);
+        app.pending_tap_hold_numeric_writes.insert(6, 190);
+        app.keep_unsaved_edits();
+        assert!(app.unsaved_edits.is_some());
+
+        // Another board of the same model: one keyboard id, another address.
+        let mut other = app.device_manager.devices()[0].clone();
+        other.serial_number = "another board".into();
+        app.device_manager.replace_devices(vec![other]);
+        app.rewrite_unsaved_edits();
+        settle_writes(&mut app);
+        assert!(app.unsaved_edits.is_none(), "another board drops them");
+        assert!(!state.lock().unwrap().settings.contains_key(&6));
+    }
+
+    #[test]
+    fn a_setting_dragged_over_many_steps_writes_the_one_in_flight_and_the_last() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let mut stored = stored();
+        stored.settings.insert(317, vec![10]);
+        let (board, state) = board(stored);
+        let path = "hid:dragged-setting";
+        let _held = link(path, &board);
+        let mut app = connected_over_bluetooth(path);
+        let before = board.sent().len();
+
+        for value in 11..=60 {
+            app.queue_layer_led_setting_write("LED timeout".into(), 317, 1, value - 1, value);
+        }
+        settle_writes(&mut app);
+        let writes = board.sent()[before..]
+            .iter()
+            .filter(|header| header.cmd == rmk_types_rynk::protocol::rynk::Cmd::SetSetting)
+            .count();
+        assert!(writes <= 2, "{writes} writes for one drag");
+        assert_eq!(state.lock().unwrap().settings[&317], [60]);
+    }
+
+    #[test]
+    fn a_key_set_again_after_the_board_is_back_wins_over_the_kept_one() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (board, state) = board(stored());
+        let path = "hid:unsaved-superseded";
+        let first = link(path, &board);
+        let mut app = connected_over_bluetooth(path);
+        let ctx = egui::Context::default();
+
+        board.go_away();
+        assert!(app.assign_key_binding(&ctx, 0, 0, KeyBinding::Vial(0x06)));
+        settle_writes(&mut app);
+        drop(first);
+        let _second = reconnect(&mut app, path, &board);
+        // Set again before the kept key's turn comes.
+        assert!(app.assign_key_binding(&ctx, 0, 0, KeyBinding::Vial(0x07)));
+        settle_writes(&mut app);
+        assert_eq!(state.lock().unwrap().keymap[0], key(HidKeyCode::D));
+        assert!(app.unsaved_edits.is_none());
+    }
+
+    #[test]
+    fn settings_queued_behind_a_layer_write_the_board_left_are_kept() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let mut stored = stored();
+        stored.settings.insert(7, 200u16.to_le_bytes().to_vec());
+        let (board, state) = board(stored);
+        let path = "hid:unsaved-behind-layer";
+        let first = link(path, &board);
+        let mut app = connected_over_bluetooth(path);
+
+        board.go_away();
+        app.apply_layer_snapshot(
+            1,
+            crate::app::layer_operations::LayerSnapshot {
+                keycodes: vec![KeyBinding::Vial(0x06), KeyBinding::Vial(0x07)],
+                encoder_keycodes: Vec::new(),
+            },
+            "layer_actions.paste",
+        );
+        // Queued while the layer write holds the board.
+        app.queue_tap_hold_setting_write("Tapping term".into(), 7, 2, 200, 250);
+        settle_writes(&mut app);
+        drop(first);
+
+        let _second = reconnect(&mut app, path, &board);
+        settle_writes(&mut app);
+        let stored = state.lock().unwrap();
+        assert_eq!(stored.settings[&7], 250u16.to_le_bytes());
+        assert_eq!(stored.keymap[2], key(HidKeyCode::C));
+        assert!(app.unsaved_edits.is_none());
+    }
+
+    #[test]
     fn a_locked_rynk_board_locks_its_matrix_but_not_its_edits() {
         let mut stored = stored();
         stored.lock = Some(rmk_types_rynk::protocol::rynk::LockStatus {
