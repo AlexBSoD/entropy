@@ -2,6 +2,9 @@ use super::qmk_settings_write_queue::QmkSettingWriteRequest;
 use super::settings_write_queue::SettingsWriteRequest;
 use super::*;
 
+/// Macro bytes and the actions they were edited as.
+type KeptMacros = (Vec<Vec<u8>>, Vec<Vec<crate::keycode_picker::MacroAction>>);
+
 /// Edits a board did not confirm before its connection dropped: the write
 /// that failed and the ones queued behind it. They wait while no other board
 /// connects, and are written again once the same board is back.
@@ -15,6 +18,13 @@ pub(super) struct UnsavedEdits {
     /// Keys and encoders by layer. They are written a layer at a time once
     /// the board is back, as each write owns the board while it runs.
     layers: std::collections::BTreeMap<usize, LayerEdits>,
+    /// Whole tables the editor writes as a diff or in full: the edited copy
+    /// replaces what the board sends on connect.
+    macros: Option<KeptMacros>,
+    combos: Option<Vec<ComboEntry>>,
+    combo_term: Option<u16>,
+    tap_dance: Option<Vec<crate::keycode_picker::TapDanceEntry>>,
+    key_overrides: Option<Vec<KeyOverrideEntry>>,
 }
 
 /// What a layer's keys and encoders should hold, by index.
@@ -32,6 +42,11 @@ impl UnsavedEdits {
             touchpad: Vec::new(),
             tap_hold_numeric: std::collections::BTreeMap::new(),
             layers: std::collections::BTreeMap::new(),
+            macros: None,
+            combos: None,
+            combo_term: None,
+            tap_dance: None,
+            key_overrides: None,
         }
     }
 
@@ -44,6 +59,11 @@ impl UnsavedEdits {
                 .values()
                 .map(|layer| layer.keys.len() + layer.encoders.len())
                 .sum::<usize>()
+            + usize::from(self.macros.is_some())
+            + usize::from(self.combos.is_some())
+            + usize::from(self.combo_term.is_some())
+            + usize::from(self.tap_dance.is_some())
+            + usize::from(self.key_overrides.is_some())
     }
 
     pub(super) fn keep_settings(&mut self, requests: Vec<SettingsWriteRequest>) {
@@ -100,6 +120,18 @@ impl EntropyApp {
         let settings = self.settings_write_queue.pending_requests();
         let touchpad = self.qmk_settings_write_queue.take_all();
         let tap_hold_numeric = std::mem::take(&mut self.pending_tap_hold_numeric_writes);
+        let picker = &self.keycode_picker;
+        let macros = picker
+            .macros_dirty
+            .then(|| (picker.macro_texts.clone(), picker.macro_actions.clone()));
+        let tap_dance = (picker.tap_dance_entries != picker.tap_dance_synced_entries)
+            .then(|| picker.tap_dance_entries.clone());
+        let combos =
+            (self.combo_entries != self.combo_synced_entries).then(|| self.combo_entries.clone());
+        let combo_term = self.combo_term.filter(|_| self.combo_term_dirty);
+        let key_overrides = self
+            .key_override_dirty
+            .then(|| self.key_override_entries.clone());
         let Some(edits) = self.unsaved_edits_mut() else {
             return;
         };
@@ -109,6 +141,11 @@ impl EntropyApp {
             edits.touchpad.push(request);
         }
         edits.tap_hold_numeric.extend(tap_hold_numeric);
+        edits.macros = macros.or(edits.macros.take());
+        edits.combos = combos.or(edits.combos.take());
+        edits.combo_term = combo_term.or(edits.combo_term);
+        edits.tap_dance = tap_dance.or(edits.tap_dance.take());
+        edits.key_overrides = key_overrides.or(edits.key_overrides.take());
         let kept = edits.len();
         if kept > 0 {
             log::info!(
@@ -138,6 +175,11 @@ impl EntropyApp {
         let settings = std::mem::take(&mut edits.settings);
         let touchpad = std::mem::take(&mut edits.touchpad);
         let tap_hold_numeric = std::mem::take(&mut edits.tap_hold_numeric);
+        let macros = edits.macros.take();
+        let combos = edits.combos.take();
+        let combo_term = edits.combo_term.take();
+        let tap_dance = edits.tap_dance.take();
+        let key_overrides = edits.key_overrides.take();
         if edits.layers.is_empty() {
             self.unsaved_edits = None;
         }
@@ -155,6 +197,36 @@ impl EntropyApp {
             self.pending_tap_hold_numeric_writes
                 .extend(tap_hold_numeric);
             self.tap_hold_numeric_write_due = Some(std::time::Instant::now());
+        }
+        // A table is taken back only while the board has as many entries as
+        // when it was edited; their writers then write what differs.
+        let picker = &mut self.keycode_picker;
+        if let Some((texts, actions)) =
+            macros.filter(|(texts, _)| texts.len() == picker.macro_texts.len())
+        {
+            picker.macro_texts = texts;
+            picker.macro_actions = actions;
+            picker.mark_macros_dirty();
+        }
+        if let Some(entries) =
+            tap_dance.filter(|entries| entries.len() == picker.tap_dance_entries.len())
+        {
+            picker.tap_dance_entries = entries;
+            picker.tap_dance_dirty = true;
+        }
+        if let Some(entries) = combos.filter(|entries| entries.len() == self.combo_entries.len()) {
+            self.combo_entries = entries;
+            self.mark_combo_dirty();
+        }
+        if let Some(term) = combo_term {
+            self.combo_term = Some(term);
+            self.combo_term_dirty = true;
+        }
+        if let Some(entries) =
+            key_overrides.filter(|entries| entries.len() == self.key_override_entries.len())
+        {
+            self.key_override_entries = entries;
+            self.key_override_dirty = true;
         }
     }
 

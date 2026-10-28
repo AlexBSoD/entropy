@@ -935,11 +935,16 @@ mod tests {
             app.poll_settings_write(&ctx);
             app.poll_vial_hid_task(&ctx);
             app.poll_layer_write(&ctx);
+            app.poll_combo_write(&ctx);
             app.flush_pending_tap_hold_numeric_writes();
             app.maybe_rewrite_unsaved_layer();
+            app.maybe_start_combo_write(&ctx);
+            app.maybe_start_macro_write(&ctx);
             // Without the board, what waits keeps waiting.
-            let waiting =
-                !app.pending_tap_hold_numeric_writes.is_empty() || app.unsaved_edits.is_some();
+            let waiting = !app.pending_tap_hold_numeric_writes.is_empty()
+                || app.unsaved_edits.is_some()
+                || app.combo_dirty
+                || app.keycode_picker.macros_dirty;
             if !app.hid_write_task_active() && (!waiting || app.hid_device.is_none()) {
                 return;
             }
@@ -1046,6 +1051,64 @@ mod tests {
         let stored = state.lock().unwrap();
         assert_eq!(stored.keymap[2], key(HidKeyCode::C));
         assert_eq!(stored.keymap[3], key(HidKeyCode::D));
+        assert!(app.unsaved_edits.is_none());
+    }
+
+    #[test]
+    fn combos_and_macros_the_board_never_confirmed_are_written_once_it_is_back() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (board, state) = board(stored());
+        let path = "hid:unsaved-tables";
+        let first = link(path, &board);
+        let mut app = connected_over_bluetooth(path);
+
+        board.go_away();
+        app.combo_entries[0].output = KeyBinding::Vial(0x07);
+        app.mark_combo_dirty();
+        settle_writes(&mut app);
+        // Edited after the write failed, before the app reconnects.
+        app.keycode_picker.macro_texts[0] = b"ok".to_vec();
+        app.keycode_picker.mark_macros_dirty();
+        settle_writes(&mut app);
+        assert_eq!(state.lock().unwrap().combos[0].output, key(HidKeyCode::C));
+        drop(first);
+
+        let _second = reconnect(&mut app, path, &board);
+        assert_eq!(app.combo_entries[0].output, KeyBinding::Vial(0x07));
+        settle_writes(&mut app);
+        let stored = state.lock().unwrap();
+        assert_eq!(stored.combos[0].output, key(HidKeyCode::D));
+        assert_eq!(stored.macros[0], [MacroOp::Char(b'o'), MacroOp::Char(b'k')]);
+        assert!(app.unsaved_edits.is_none());
+    }
+
+    #[test]
+    fn tap_dance_and_key_overrides_are_taken_back_and_marked_for_writing() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (board, _) = board(stored());
+        let path = "hid:unsaved-overrides";
+        let _held = link(path, &board);
+        let mut app = connected_over_bluetooth(path);
+        let keyboard_id = app.current_keyboard_id.unwrap();
+        let board_tap_dance = app.keycode_picker.tap_dance_entries.clone();
+        let board_overrides = app.key_override_entries.clone();
+        app.keycode_picker.tap_dance_entries[0].on_tap = KeyBinding::Vial(0x07);
+        let tap_dance = app.keycode_picker.tap_dance_entries.clone();
+        app.key_override_entries[0].replacement = 0x07;
+        app.key_override_dirty = true;
+        let overrides = app.key_override_entries.clone();
+        app.keep_unsaved_edits();
+
+        // What the connect read back from the board.
+        app.keycode_picker.tap_dance_entries = board_tap_dance;
+        app.keycode_picker.tap_dance_dirty = false;
+        app.key_override_entries = board_overrides;
+        app.key_override_dirty = false;
+        app.rewrite_unsaved_edits(keyboard_id);
+        assert_eq!(app.keycode_picker.tap_dance_entries, tap_dance);
+        assert!(app.keycode_picker.tap_dance_dirty);
+        assert_eq!(app.key_override_entries, overrides);
+        assert!(app.key_override_dirty);
         assert!(app.unsaved_edits.is_none());
     }
 
