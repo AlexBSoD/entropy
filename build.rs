@@ -9,6 +9,17 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={WINDOWS_ICON_PATH}");
 
+    // rmk-types takes its constants, the combo, morse and bulk sizes among
+    // them, from a keyboard config named here: a shell left from a firmware
+    // build would give Entropy that keyboard's constants.
+    for name in ["KEYBOARD_TOML_PATH", "VIAL_JSON_PATH"] {
+        println!("cargo:rerun-if-env-changed={name}");
+        assert!(
+            env::var_os(name).is_none(),
+            "{name} is set: rmk-types would build Entropy with that keyboard's constants; unset it"
+        );
+    }
+
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
