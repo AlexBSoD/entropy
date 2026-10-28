@@ -236,6 +236,12 @@ enum VialHidOutcome {
     KeyWritten,
     EncoderWritten,
     MacrosWritten,
+    /// Nothing was written: the macros need more than the `capacity` the
+    /// keyboard reported to this write.
+    MacrosOverMemory {
+        capacity: u16,
+        error: String,
+    },
     BackgroundUploaded(crate::app::standby_background::BackgroundUploadResult),
     BackgroundCleared,
     BackgroundCancelled {
@@ -343,7 +349,17 @@ fn run_vial_hid_operation_with_progress(
             .map(|()| VialHidOutcome::EncoderWritten),
         VialHidOperation::MacroWrite { macros, .. } => {
             let size = hid.get_macro_buffer_size()?;
-            let buffer = crate::hid::HidDevice::encode_macros(&macros, size)?;
+            // The size read here may be the first the editor learns: an
+            // overflow comes back with it instead of as a failed write.
+            let buffer = match crate::hid::HidDevice::encode_macros(&macros, size) {
+                Ok(buffer) => buffer,
+                Err(error) => {
+                    return Ok(VialHidOutcome::MacrosOverMemory {
+                        capacity: size,
+                        error: format!("{error:#}"),
+                    })
+                }
+            };
             hid.set_macro_buffer(&buffer)?;
             Ok(VialHidOutcome::MacrosWritten)
         }
@@ -895,6 +911,24 @@ impl EntropyApp {
                     "status_messages.macros_saved",
                 )
                 .into();
+            }
+            Ok(VialHidOutcome::MacrosOverMemory { capacity, error }) => {
+                let VialHidOperation::MacroWrite { revision, .. } = &result.operation else {
+                    unreachable!("macro outcome must come from a macro write operation");
+                };
+                // With the memory known, the edit reads as over it: it stays
+                // to be shortened and no longer counts as a pending write.
+                if let Some(info) = self.device_about_info.as_mut() {
+                    info.macro_memory_bytes = Some(capacity);
+                }
+                self.keycode_picker.macros_dirty = true;
+                self.keycode_picker.macro_attempted_revision =
+                    (self.keycode_picker.macro_edit_revision == *revision).then_some(*revision);
+                self.status_msg = crate::i18n::tr_catalog_format(
+                    self.app_settings.language,
+                    "status_messages.macro_write_error",
+                    &[("error", &error)],
+                );
             }
             Ok(VialHidOutcome::BackgroundUploaded(upload)) => {
                 self.app_settings.standby_background_source_path = Some(upload.source_path.clone());
