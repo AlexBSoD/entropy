@@ -617,6 +617,17 @@ pub(crate) struct DeviceAboutInfo {
     pub(crate) caps_word: bool,
     pub(crate) layer_lock: bool,
     pub(crate) qmk_settings: bool,
+    /// What a Rynk board told about itself; `None` over Vial.
+    pub(crate) rynk: Option<RynkAboutInfo>,
+}
+
+/// A Rynk board's `GetErgohavenInfo` as About Device shows it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RynkAboutInfo {
+    /// The firmware's Ergohaven revision of the Rynk table.
+    pub(crate) revision: u16,
+    /// `ErgohavenInfo::caps` bits.
+    pub(crate) caps: u32,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
