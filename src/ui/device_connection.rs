@@ -107,6 +107,7 @@ impl EntropyApp {
         self.entlayout_losses_accepted = None;
         self.pending_entsettings_import_path = None;
         self.import_progress_started_at = None;
+        self.keep_unsaved_edits();
         self.reset_settings_write_context();
         self.cancel_pending_qmk_setting_writes();
         self.qmk_settings_write_queue.clear();

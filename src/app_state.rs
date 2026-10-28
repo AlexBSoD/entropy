@@ -5527,6 +5527,10 @@ pub struct EntropyApp {
     pub(super) settings_write_queue: SettingsWriteQueueState,
     pub(super) settings_write_generation: u64,
     pub(super) qmk_settings_write_queue: QmkSettingsWriteQueue,
+    /// Edits the board had not confirmed when its connection dropped,
+    /// written again once the same board is back.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) unsaved_edits: Option<UnsavedEdits>,
     pub(super) pending_device_connect: Option<DeviceIdentity>,
     /// Built-in qmk-hid-host bridges for displays/presets that need host data
     #[cfg(not(target_arch = "wasm32"))]

@@ -119,6 +119,8 @@ impl EntropyApp {
             settings_write_queue: SettingsWriteQueueState::default(),
             settings_write_generation: 0,
             #[cfg(not(target_arch = "wasm32"))]
+            unsaved_edits: None,
+            #[cfg(not(target_arch = "wasm32"))]
             qmk_hid_hosts: std::collections::HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             rynk_hosts: std::collections::HashMap::new(),

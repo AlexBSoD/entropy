@@ -1478,6 +1478,7 @@ impl EntropyApp {
                 {
                     if !self.headless {
                         self.restore_entropy_display_preset_after_connect();
+                        self.rewrite_unsaved_edits(r.keyboard_id);
                         self.sync_qmk_hid_host_bridges();
                         // USB reconnect can restore the same logical profile while
                         // firmware has lost its volatile host-side layout. Publish

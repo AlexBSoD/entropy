@@ -292,10 +292,10 @@ impl SettingsWriteTarget {
 }
 
 #[derive(Clone, Debug)]
-struct SettingsWriteRequest {
+pub(super) struct SettingsWriteRequest {
     id: u64,
     generation: u64,
-    qsid: u16,
+    pub(super) qsid: u16,
     width: u8,
     old_value: u16,
     requested: u16,
@@ -358,6 +358,10 @@ impl SettingsWriteQueueState {
 
     fn pop_front(&mut self) -> Option<SettingsWriteRequest> {
         self.pending.pop_front()
+    }
+
+    pub(super) fn pending_requests(&self) -> Vec<SettingsWriteRequest> {
+        self.pending.iter().cloned().collect()
     }
 
     fn status(&self, qsid: u16) -> Option<&SettingsWriteStatus> {
@@ -964,6 +968,7 @@ impl EntropyApp {
             return;
         }
         self.hid_device = hid_device;
+        let failed = result.is_err();
         let context = request.target.log_context();
         let newer_debounced_value = request
             .target
@@ -1063,6 +1068,12 @@ impl EntropyApp {
         self.sync_firmware_managed_layout_options();
 
         if disconnected {
+            // The board never confirmed these; they go again once it is back.
+            let mut unsaved = failed.then_some(request).into_iter().collect::<Vec<_>>();
+            unsaved.extend(self.settings_write_queue.pending_requests());
+            if let Some(edits) = self.unsaved_edits_mut() {
+                edits.keep_settings(unsaved);
+            }
             let error = crate::i18n::tr_catalog(
                 self.app_settings.language,
                 "settings_write.device_disconnected",
@@ -1085,6 +1096,18 @@ impl EntropyApp {
             "settings_write.device_disconnected",
         );
         self.settings_write_queue.fail_pending(error);
+    }
+
+    /// Queues writes the board never confirmed again, as new ones.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn rewrite_unsaved_settings_writes(&mut self, requests: Vec<SettingsWriteRequest>) {
+        for request in requests {
+            self.queue_settings_write(SettingsWriteRequest {
+                id: 0,
+                generation: self.settings_write_generation,
+                ..request
+            });
+        }
     }
 
     pub(super) fn reset_settings_write_context(&mut self) {
