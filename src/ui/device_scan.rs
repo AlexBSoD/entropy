@@ -790,7 +790,7 @@ mod tests {
             lighting_mode: None,
             firmware: FirmwareProtocol::Vial,
         });
-        app.hid_device = Some(crate::hid::HidDevice::test_device().0);
+        app.hid_device = Some(crate::hid::HidDevice::test_device().0.into());
     }
 
     #[test]
