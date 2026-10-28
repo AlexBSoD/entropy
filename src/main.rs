@@ -23,6 +23,8 @@ mod layouts;
 mod linux_ble;
 #[cfg(target_os = "linux")]
 mod linux_setup;
+#[cfg(target_os = "linux")]
+mod linux_tray;
 #[cfg(not(target_arch = "wasm32"))]
 mod pdf;
 mod popup_state;
@@ -483,7 +485,8 @@ fn main() -> eframe::Result<()> {
             } else {
                 app
             };
-            #[cfg(not(target_os = "windows"))]
+            // Linux decides on the first pass: to the tray, or minimized.
+            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
             if launch_minimized {
                 cc.egui_ctx
                     .send_viewport_cmd(egui::ViewportCommand::Minimized(true));

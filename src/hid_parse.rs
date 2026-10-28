@@ -21,9 +21,21 @@ pub(crate) fn parse_macro_buffer(buf: &[u8], count: u8) -> Vec<Vec<u8>> {
     macros
 }
 
-pub(crate) fn encode_macro_buffer(macros: &[Vec<u8>], buf_size: u16) -> Vec<u8> {
-    let max_len = buf_size as usize;
-    let mut buf = Vec::new();
+/// Bytes the macros take in Vial's macro buffer: each macro plus its NUL
+/// separator, and the lone NUL of an empty buffer. The firmware keeps all
+/// macros in that one buffer, so its size limits this sum, not single steps.
+pub(crate) fn macro_buffer_len(macros: &[Vec<u8>]) -> usize {
+    macros.iter().map(|m| m.len() + 1).sum::<usize>().max(1)
+}
+
+/// Refuses macros that do not fit instead of truncating them: a cut buffer
+/// drops the last macros and can end in the middle of an op.
+pub(crate) fn encode_macro_buffer(macros: &[Vec<u8>], buf_size: u16) -> Result<Vec<u8>> {
+    let len = macro_buffer_len(macros);
+    if len > buf_size as usize {
+        bail!("macros need {len} bytes, but the keyboard's macro memory is {buf_size} bytes");
+    }
+    let mut buf = Vec::with_capacity(len);
     for m in macros {
         buf.extend_from_slice(m);
         buf.push(0);
@@ -31,10 +43,7 @@ pub(crate) fn encode_macro_buffer(macros: &[Vec<u8>], buf_size: u16) -> Vec<u8> 
     if buf.is_empty() {
         buf.push(0);
     }
-    if buf.len() > max_len {
-        buf.truncate(max_len);
-    }
-    buf
+    Ok(buf)
 }
 
 pub(crate) fn parse_keymap_u16_be(keymap: &[u8]) -> Vec<u16> {
@@ -174,20 +183,38 @@ mod tests {
 
     #[test]
     fn encodes_macro_buffer_with_null_separators() {
-        let encoded = encode_macro_buffer(&[b"a".to_vec(), b"bc".to_vec()], 6);
+        let encoded = encode_macro_buffer(&[b"a".to_vec(), b"bc".to_vec()], 6).unwrap();
         assert_eq!(encoded, b"a\0bc\0".to_vec());
     }
 
     #[test]
     fn encodes_empty_macro_buffer_as_terminator() {
-        let encoded = encode_macro_buffer(&[], 6);
+        let encoded = encode_macro_buffer(&[], 6).unwrap();
         assert_eq!(encoded, b"\0".to_vec());
     }
 
     #[test]
-    fn truncates_macro_buffer_to_firmware_size() {
-        let encoded = encode_macro_buffer(&[b"abcd".to_vec(), b"ef".to_vec()], 5);
-        assert_eq!(encoded, b"abcd\0".to_vec());
+    fn macro_buffer_len_counts_every_macro_with_its_terminator() {
+        assert_eq!(macro_buffer_len(&[]), 1);
+        assert_eq!(macro_buffer_len(&[Vec::new(), Vec::new(), Vec::new()]), 3);
+        assert_eq!(macro_buffer_len(&[b"a".to_vec(), b"bc".to_vec()]), 5);
+    }
+
+    #[test]
+    fn encodes_macros_that_exactly_fill_firmware_size() {
+        let macros = [b"abcd".to_vec(), b"ef".to_vec()];
+        let encoded = encode_macro_buffer(&macros, 8).unwrap();
+        assert_eq!(encoded, b"abcd\0ef\0".to_vec());
+        assert_eq!(encoded.len(), macro_buffer_len(&macros));
+    }
+
+    #[test]
+    fn rejects_macros_over_firmware_size_instead_of_truncating() {
+        let error = encode_macro_buffer(&[b"abcd".to_vec(), b"ef".to_vec()], 7).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "macros need 8 bytes, but the keyboard's macro memory is 7 bytes"
+        );
     }
 
     #[test]

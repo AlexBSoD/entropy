@@ -1,6 +1,17 @@
 use super::*;
 
 impl EntropyApp {
+    /// `(used, capacity)` in bytes of the keyboard's macro memory, which all
+    /// macros share; `None` when the board did not report its size. The editor
+    /// counter and the write guard both read this, so they cannot disagree.
+    pub(super) fn macro_memory_use(&self) -> Option<(usize, usize)> {
+        let capacity = self.device_about_info.as_ref()?.macro_memory_bytes?;
+        Some((
+            crate::hid::macro_buffer_len(&self.keycode_picker.macro_texts),
+            usize::from(capacity),
+        ))
+    }
+
     pub(super) fn draw_macro_settings_page(&mut self, ui: &mut egui::Ui, content_rect: egui::Rect) {
         let lang = self.app_settings.language;
         self.keycode_picker.language = lang;
@@ -12,10 +23,12 @@ impl EntropyApp {
             crate::i18n::tr_catalog(lang, "macro_editor.description"),
             |app, ui| {
                 let selected = app.keycode_picker.macro_inline_selected.unwrap_or(0);
+                let memory_use = app.macro_memory_use();
                 let selected = app.keycode_picker.show_macro_settings_editor(
                     ui,
                     selected,
                     "macro_grid_settings",
+                    memory_use,
                 );
                 app.keycode_picker.macro_inline_selected = Some(selected);
             },

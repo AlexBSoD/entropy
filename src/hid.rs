@@ -174,6 +174,7 @@ fn is_unsafe_bluetooth_report_map(error: &anyhow::Error) -> bool {
 
 #[path = "hid_parse.rs"]
 mod hid_parse;
+pub(crate) use hid_parse::macro_buffer_len;
 
 #[path = "hid_dynamic.rs"]
 mod hid_dynamic;
