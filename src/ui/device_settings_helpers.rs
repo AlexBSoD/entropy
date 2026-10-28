@@ -1127,6 +1127,26 @@ impl EntropyApp {
             .collect()
     }
 
+    /// A Layer LED color as the board holds it, 0 when the read fails.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_layer_led_color(
+        dev_conn: &impl crate::device_session::QmkSettingsSource,
+        qsid: u16,
+        label: &str,
+        loaded: &mut std::collections::BTreeSet<u16>,
+    ) -> u8 {
+        match dev_conn.get_qmk_setting_u8(qsid) {
+            Ok(value) => {
+                loaded.insert(qsid);
+                value
+            }
+            Err(e) => {
+                log::warn!("get_qmk_setting_u8({label} qsid {qsid}): {e}");
+                0
+            }
+        }
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     fn read_layer_led_numeric_setting(
         dev_conn: &impl crate::device_session::QmkSettingsSource,
@@ -1135,16 +1155,23 @@ impl EntropyApp {
         max: u16,
         variants: Vec<String>,
         label: &str,
+        loaded: &mut std::collections::BTreeSet<u16>,
     ) -> LayerLedNumericSetting {
-        let value = if width > 1 {
+        let read = if width > 1 {
             dev_conn.get_qmk_setting_u16(qsid)
         } else {
             dev_conn.get_qmk_setting_u8(qsid).map(|value| value as u16)
+        };
+        let value = match read {
+            Ok(value) => {
+                loaded.insert(qsid);
+                value
+            }
+            Err(e) => {
+                log::warn!("get_qmk_setting({label} qsid {qsid}): {e}");
+                0
+            }
         }
-        .unwrap_or_else(|e| {
-            log::warn!("get_qmk_setting({label} qsid {qsid}): {e}");
-            0
-        })
         .min(max);
 
         LayerLedNumericSetting {
@@ -1209,6 +1236,7 @@ impl EntropyApp {
         let mut brightness = None;
         let mut timeout = None;
         let mut timeout_unit = LayerLedTimeoutUnit::Minutes;
+        let mut loaded = std::collections::BTreeSet::new();
         let mut bt_profiles = Vec::<(usize, u16)>::new();
         let mut layers = Vec::<(usize, u16)>::new();
 
@@ -1250,6 +1278,7 @@ impl EntropyApp {
                         max.min(255),
                         Vec::new(),
                         "layer_led brightness",
+                        &mut loaded,
                     ));
                 } else if lower_title.contains("led timeout") {
                     let lower_unit = field
@@ -1275,6 +1304,7 @@ impl EntropyApp {
                         max,
                         Self::layer_led_field_variants(field),
                         "layer_led timeout",
+                        &mut loaded,
                     ));
                 } else if lower_title.contains("bt profile") && lower_title.contains("color") {
                     if let Some(profile) =
@@ -1308,10 +1338,8 @@ impl EntropyApp {
             .into_iter()
             .filter(|(profile, _)| *profile <= 4)
             .map(|(_, qsid)| {
-                let value = dev_conn.get_qmk_setting_u8(qsid).unwrap_or_else(|e| {
-                    log::warn!("get_qmk_setting_u8(layer_led bt profile qsid {qsid}): {e}");
-                    0
-                });
+                let value =
+                    Self::read_layer_led_color(dev_conn, qsid, "layer_led bt profile", &mut loaded);
                 LayerLedColorSetting::new(qsid, value)
             })
             .collect::<Vec<_>>();
@@ -1320,10 +1348,8 @@ impl EntropyApp {
             .into_iter()
             .filter_map(|(_, qsids)| {
                 let (&qsid, linked_qsids) = qsids.split_first()?;
-                let value = dev_conn.get_qmk_setting_u8(qsid).unwrap_or_else(|e| {
-                    log::warn!("get_qmk_setting_u8(layer_led layer qsid {qsid}): {e}");
-                    0
-                });
+                let value =
+                    Self::read_layer_led_color(dev_conn, qsid, "layer_led layer", &mut loaded);
                 Some(LayerLedColorSetting::with_linked_qsids(
                     qsid,
                     linked_qsids.to_vec(),
@@ -1343,6 +1369,7 @@ impl EntropyApp {
             timeout,
             timeout_unit,
             supported,
+            loaded_qsids: loaded,
         }
     }
 
@@ -1367,10 +1394,8 @@ impl EntropyApp {
             if !has_qmk_setting(qsid) {
                 break;
             }
-            let value = dev_conn.get_qmk_setting_u8(qsid).unwrap_or_else(|e| {
-                log::warn!("get_qmk_setting_u8(layer_led qsid {qsid}): {e}");
-                0
-            });
+            let value =
+                Self::read_layer_led_color(dev_conn, qsid, "layer_led", &mut leds.loaded_qsids);
             leds.layer_colors
                 .push(LayerLedColorSetting::new(qsid, value));
         }
@@ -1384,6 +1409,7 @@ impl EntropyApp {
                     255,
                     Vec::new(),
                     "layer_led brightness",
+                    &mut leds.loaded_qsids,
                 ));
             }
             if has_qmk_setting(317) {
@@ -1394,6 +1420,7 @@ impl EntropyApp {
                     255,
                     Vec::new(),
                     "layer_led timeout",
+                    &mut leds.loaded_qsids,
                 ));
             }
         }

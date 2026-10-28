@@ -156,6 +156,7 @@ impl EntropyApp {
                     value,
                     variants: Vec::new(),
                     module: Some(fields),
+                    layer_led: None,
                 };
                 module_setting_valid(&setting).then_some(setting)
             })

@@ -2363,6 +2363,9 @@ pub(crate) struct LayerLedSettingsState {
     pub(crate) timeout_unit: LayerLedTimeoutUnit,
     /// Whether any Ergohaven LED QMK setting was readable (firmware support flag)
     pub(crate) supported: bool,
+    /// QSIDs whose value the board reported or confirmed; a failed read
+    /// leaves 0 in the setting, which a backup must not take for a value.
+    pub(crate) loaded_qsids: std::collections::BTreeSet<u16>,
 }
 
 impl LayerLedSettingsState {
@@ -2373,10 +2376,12 @@ impl LayerLedSettingsState {
             .filter(|setting| setting.qsid == qsid)
         {
             setting.value = value.min(setting.max);
+            self.loaded_qsids.insert(qsid);
             return true;
         }
         if let Some(setting) = self.timeout.as_mut().filter(|setting| setting.qsid == qsid) {
             setting.value = value.min(setting.max);
+            self.loaded_qsids.insert(qsid);
             return true;
         }
 
@@ -2388,6 +2393,7 @@ impl LayerLedSettingsState {
         {
             if setting.qsid == qsid || setting.linked_qsids.contains(&qsid) {
                 setting.value = color;
+                self.loaded_qsids.insert(setting.qsid);
                 return true;
             }
         }
@@ -2404,6 +2410,7 @@ impl Default for LayerLedSettingsState {
             timeout: None,
             timeout_unit: LayerLedTimeoutUnit::Minutes,
             supported: false,
+            loaded_qsids: std::collections::BTreeSet::new(),
         }
     }
 }
