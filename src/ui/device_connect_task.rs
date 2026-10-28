@@ -1588,6 +1588,7 @@ impl EntropyApp {
                     caps_word: vial_features.caps_word,
                     layer_lock: vial_features.layer_lock,
                     qmk_settings: !supported_qmk_settings.is_empty(),
+                    rynk: None,
                 };
 
                 progress("Applying keyboard layout…")?;

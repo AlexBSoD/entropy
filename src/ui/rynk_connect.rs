@@ -307,6 +307,10 @@ impl EntropyApp {
             caps_word: vial_features.caps_word,
             layer_lock: vial_features.layer_lock,
             qmk_settings: !supported_qmk_settings.is_empty(),
+            rynk: Some(RynkAboutInfo {
+                revision: info.revision,
+                caps: info.caps,
+            }),
             ..Default::default()
         };
         let vial_unlock_status = match session.unlock_status() {
@@ -527,6 +531,14 @@ mod tests {
             u64::from_le_bytes([1, 2, 3, 4, 5, 6, 7, 8])
         );
         assert_eq!(result.about_info.keyboard_id, result.keyboard_id);
+        assert_eq!(
+            result.about_info.rynk,
+            Some(RynkAboutInfo {
+                revision: rmk_types_rynk::protocol::rynk::ergohaven::ERGOHAVEN_RYNK_REVISION,
+                caps: caps::BATTERY_HALVES | caps::UNIVERSAL_SYMBOLS,
+            }),
+            "About Device shows the board's revision and caps"
+        );
         let battery = result.about_info.battery_halves.unwrap();
         assert_eq!((battery.left, battery.right), (Some(77), None));
         assert!(result
