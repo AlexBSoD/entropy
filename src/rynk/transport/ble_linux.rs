@@ -8,7 +8,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::mpsc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -346,13 +346,47 @@ pub(crate) fn open(id: &PhysicalId) -> io::Result<BleTransport> {
         )
     })?;
     let (sender, events) = mpsc::channel();
-    let listener = Listener::spawn(&device.path, &endpoints.input, sender).map_err(io_error)?;
+    let on_gone = Arc::new(OnGone::default());
+    let listener = Listener::spawn(&device.path, &endpoints.input, sender, on_gone.clone())
+        .map_err(io_error)?;
     Ok(BleTransport {
         connection,
         endpoints,
         inbox: Inbox::new(events),
+        on_gone,
         _listener: listener,
     })
+}
+
+/// What to call once the board goes away. The link sets it after the
+/// listener started, so whichever comes second, the disconnect or the
+/// setting, makes the call.
+#[derive(Default)]
+struct OnGone(Mutex<(bool, Option<GoneCall>)>);
+
+type GoneCall = Box<dyn FnOnce() + Send>;
+
+impl OnGone {
+    fn set(&self, call: GoneCall) {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if state.0 {
+            drop(state);
+            call();
+        } else {
+            state.1 = Some(call);
+        }
+    }
+
+    fn fire(&self) {
+        let call = {
+            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            state.0 = true;
+            state.1.take()
+        };
+        if let Some(call) = call {
+            call();
+        }
+    }
 }
 
 enum Event {
@@ -416,7 +450,12 @@ struct Listener {
 }
 
 impl Listener {
-    fn spawn(device: &str, input: &str, events: mpsc::Sender<Event>) -> anyhow::Result<Self> {
+    fn spawn(
+        device: &str,
+        input: &str,
+        events: mpsc::Sender<Event>,
+        on_gone: Arc<OnGone>,
+    ) -> anyhow::Result<Self> {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (stop, stopped) = async_channel::bounded(1);
         let (device_path, input_path) = (device.to_owned(), input.to_owned());
@@ -440,7 +479,7 @@ impl Listener {
                     let mut values = changes(input_path.clone())
                         .await
                         .context("Failed to listen for Rynk notifications")?;
-                    let mut device_changes = changes(device_path)
+                    let mut device_changes = changes(device_path.clone())
                         .await
                         .context("Failed to watch the Bluetooth connection")?;
                     zbus::Proxy::new(
@@ -472,7 +511,10 @@ impl Listener {
                         let changed = args.changed_properties();
                         let event = if from_device {
                             match changed.get("Connected").map(bool::try_from) {
-                                Some(Ok(false)) => Event::Gone,
+                                Some(Ok(false)) => {
+                                    log::info!("Rynk board at {device_path} went away");
+                                    Event::Gone
+                                }
                                 _ => continue,
                             }
                         } else {
@@ -482,7 +524,11 @@ impl Listener {
                             }
                         };
                         let gone = matches!(event, Event::Gone);
-                        if events.send(event).is_err() || gone {
+                        if events.send(event).is_err() {
+                            return anyhow::Ok(());
+                        }
+                        if gone {
+                            on_gone.fire();
                             return anyhow::Ok(());
                         }
                     }
@@ -490,6 +536,7 @@ impl Listener {
                 if let Err(error) = listened {
                     let _ = ready_tx.send(Err(format!("{error:#}")));
                     let _ = events.send(Event::Gone);
+                    on_gone.fire();
                     log::debug!("Rynk BLE listener stopped: {error:#}");
                 }
             })
@@ -525,10 +572,15 @@ pub(crate) struct BleTransport {
     connection: Connection,
     endpoints: Endpoints,
     inbox: Inbox,
+    on_gone: Arc<OnGone>,
     _listener: Listener,
 }
 
 impl RynkTransport for BleTransport {
+    fn on_gone(&mut self, gone: Box<dyn FnOnce() + Send>) {
+        self.on_gone.set(gone);
+    }
+
     fn send(&mut self, frame: &[u8]) -> io::Result<()> {
         self.write(frame)
     }
@@ -735,5 +787,28 @@ mod tests {
         assert_eq!(buf[0], 9);
         let error = inbox.recv(&mut buf, Duration::ZERO).unwrap_err();
         assert!(crate::hid::is_disconnect_error_message(&error.to_string()));
+    }
+
+    #[test]
+    fn the_board_going_away_is_told_once_whether_or_not_the_link_listens_yet() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let call = || {
+            let calls = calls.clone();
+            Box::new(move || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }) as Box<dyn FnOnce() + Send>
+        };
+
+        let listening = OnGone::default();
+        listening.set(call());
+        listening.fire();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        listening.fire();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let late = OnGone::default();
+        late.fire();
+        late.set(call());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

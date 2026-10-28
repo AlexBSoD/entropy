@@ -62,6 +62,9 @@ pub(crate) trait RynkTransport {
     fn send_all(&mut self, frames: &[Vec<u8>]) -> io::Result<()> {
         frames.iter().try_for_each(|frame| self.send(frame))
     }
+    /// Calls `gone` once the board goes away, for a medium that hears of it
+    /// while nothing is sent. Elsewhere the next request finds out.
+    fn on_gone(&mut self, _gone: Box<dyn FnOnce() + Send>) {}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -910,6 +913,8 @@ pub(crate) mod testing {
         unplug_on: Option<Cmd>,
         /// Bumped by an unplug: transports opened before it are dead.
         plugged: u32,
+        /// What the transports plugged in now call once the board goes away.
+        gone: Vec<Box<dyn FnOnce() + Send>>,
     }
 
     /// A board in a box: decodes each frame a transport sends and queues the
@@ -934,6 +939,7 @@ pub(crate) mod testing {
                     dropped: 0,
                     unplug_on: None,
                     plugged: 0,
+                    gone: Vec::new(),
                 }),
                 Condvar::new(),
             )))
@@ -983,6 +989,19 @@ pub(crate) mod testing {
         /// sends it breaks, and a transport opened afterwards finds the board.
         pub(crate) fn unplug_on(&self, cmd: Cmd) {
             self.state().unplug_on = Some(cmd);
+        }
+
+        /// Takes the board away while nothing is sent, as a Bluetooth board
+        /// that resets: its transports hear of it at once.
+        pub(crate) fn go_away(&self) {
+            let gone = {
+                let mut state = self.state();
+                state.plugged += 1;
+                std::mem::take(&mut state.gone)
+            };
+            for gone in gone {
+                gone();
+            }
         }
 
         /// Transports dropped so far.
@@ -1055,6 +1074,16 @@ pub(crate) mod testing {
                 *slot = byte;
             }
             Ok(n)
+        }
+
+        fn on_gone(&mut self, gone: Box<dyn FnOnce() + Send>) {
+            let mut state = self.0.state();
+            if state.plugged == self.1 {
+                state.gone.push(gone);
+            } else {
+                drop(state);
+                gone();
+            }
         }
     }
 
