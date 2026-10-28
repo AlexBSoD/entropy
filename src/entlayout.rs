@@ -360,7 +360,10 @@ fn plan_entlayout_portable_settings_import(
     let mut seen = std::collections::BTreeSet::new();
 
     for setting in settings {
-        if setting.module.is_none() && !ent_portable_setting_is_known(setting.qsid) {
+        if setting.module.is_none()
+            && setting.layer_led.is_none()
+            && !ent_portable_setting_is_known(setting.qsid)
+        {
             report.record_incompatible();
             continue;
         }
@@ -3231,7 +3234,19 @@ impl EntropyApp {
         }
 
         for setting in portable_settings {
-            let result = write_entlayout_portable_setting(hid, &setting);
+            // A layer color goes to every QSID the board keeps it under.
+            let linked = self.entlayout_layer_led_linked_qsids(&setting);
+            let result = write_entlayout_portable_setting(hid, &setting).and_then(|()| {
+                linked.into_iter().try_for_each(|qsid| {
+                    write_entlayout_portable_setting(
+                        hid,
+                        &EntPortableSetting {
+                            qsid,
+                            ..setting.clone()
+                        },
+                    )
+                })
+            });
             match result {
                 Ok(()) => {
                     portable_settings_report.record_imported();
@@ -4912,6 +4927,168 @@ mod tests {
         );
     }
 
+    /// A K:04 with `layers` layer colors, LED brightness and a timeout in
+    /// seconds, every value read from the board.
+    fn layer_led_app(layers: u16) -> EntropyApp {
+        let mut app = module_app();
+        let qsids = (300..300 + layers).chain([316, 317]);
+        app.supported_qmk_settings.extend(qsids.clone());
+        app.layer_led_settings = LayerLedSettingsState {
+            layer_colors: (300..300 + layers)
+                .map(|qsid| LayerLedColorSetting::new(qsid, 0))
+                .collect(),
+            brightness: Some(LayerLedNumericSetting {
+                qsid: 316,
+                width: 2,
+                value: 0,
+                max: 255,
+                variants: Vec::new(),
+            }),
+            timeout: Some(LayerLedNumericSetting {
+                qsid: 317,
+                width: 1,
+                value: 0,
+                max: 255,
+                variants: Vec::new(),
+            }),
+            timeout_unit: LayerLedTimeoutUnit::Seconds,
+            supported: true,
+            loaded_qsids: qsids.collect(),
+            ..LayerLedSettingsState::default()
+        };
+        app
+    }
+
+    fn layer_led_bundle(source: &mut EntropyApp, colors: &[u8]) -> EntLayoutFile {
+        for (setting, color) in source
+            .layer_led_settings
+            .layer_colors
+            .iter_mut()
+            .zip(colors)
+        {
+            setting.value = *color;
+        }
+        source.layer_led_settings.brightness.as_mut().unwrap().value = 120;
+        source.layer_led_settings.timeout.as_mut().unwrap().value = 30;
+        let json = serde_json::to_string(&source.entlayout_snapshot().unwrap()).unwrap();
+        serde_json::from_str(&json).unwrap()
+    }
+
+    /// The Layer LED SETs a device received, as (qsid, value), and how many
+    /// GETs read them back.
+    fn layer_led_writes(recorder: &crate::hid::TestHidRecorder) -> (Vec<(u16, u16)>, usize) {
+        let requests = recorder.requests();
+        let is_led = |r: &[u8]| (300..=340).contains(&u16::from_le_bytes([r[2], r[3]]));
+        let sets = requests
+            .iter()
+            .filter(|r| r[..2] == [0xfe, 0x0b] && is_led(&r[..]))
+            .map(|r| {
+                (
+                    u16::from_le_bytes([r[2], r[3]]),
+                    u16::from_le_bytes([r[4], r[5]]),
+                )
+            })
+            .collect();
+        let gets = requests
+            .iter()
+            .filter(|r| r[..2] == [0xfe, 0x0a] && is_led(&r[..]))
+            .count();
+        (sets, gets)
+    }
+
+    #[test]
+    fn entlayout_layer_leds_roundtrip_with_readback_over_usb() {
+        let mut source = layer_led_app(2);
+        let bundle = layer_led_bundle(&mut source, &[3, 7]);
+        let mut target = layer_led_app(2);
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        target.hid_device = Some(hid.into());
+
+        let (_, _, report) = target.apply_entlayout(&bundle).unwrap();
+        assert_eq!(
+            (report.unsupported, report.incompatible, report.failed),
+            (0, 0, 0)
+        );
+        let (sets, gets) = layer_led_writes(&recorder);
+        assert_eq!(sets, [(300, 3), (301, 7), (316, 120), (317, 30)]);
+        assert_eq!(
+            gets, 4,
+            "each write is read back, as the LED page does over USB"
+        );
+    }
+
+    #[test]
+    fn entlayout_layer_led_colors_land_only_on_layers_the_board_has() {
+        let mut source = layer_led_app(4);
+        let bundle = layer_led_bundle(&mut source, &[1, 2, 3, 4]);
+        let mut target = layer_led_app(2);
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        target.hid_device = Some(hid.into());
+
+        let (_, _, report) = target.apply_entlayout(&bundle).unwrap();
+        assert_eq!(report.unsupported, 2, "layers 2 and 3");
+        let (sets, _) = layer_led_writes(&recorder);
+        assert_eq!(sets, [(300, 1), (301, 2), (316, 120), (317, 30)]);
+    }
+
+    #[test]
+    fn entlayout_layer_led_timeout_in_another_unit_is_not_written() {
+        let mut source = layer_led_app(1);
+        let bundle = layer_led_bundle(&mut source, &[5]);
+        let mut target = layer_led_app(1);
+        target.layer_led_settings.timeout_unit = LayerLedTimeoutUnit::Minutes;
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        target.hid_device = Some(hid.into());
+
+        let (_, _, report) = target.apply_entlayout(&bundle).unwrap();
+        assert_eq!(report.incompatible, 1, "30 seconds are not 30 minutes");
+        let (sets, _) = layer_led_writes(&recorder);
+        assert_eq!(sets, [(300, 5), (316, 120)]);
+    }
+
+    #[test]
+    fn entlayout_layer_led_color_goes_to_every_qsid_of_its_layer() {
+        let mut source = layer_led_app(1);
+        let bundle = layer_led_bundle(&mut source, &[6]);
+        let mut target = layer_led_app(1);
+        target.layer_led_settings.layer_colors[0] =
+            LayerLedColorSetting::with_linked_qsids(300, vec![330], 0);
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        target.hid_device = Some(hid.into());
+
+        target.apply_entlayout(&bundle).unwrap();
+        let (sets, _) = layer_led_writes(&recorder);
+        assert_eq!(&sets[..2], [(300, 6), (330, 6)]);
+    }
+
+    #[test]
+    fn entlayout_layer_led_failed_get_is_not_exported() {
+        let definition: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/k04-vial-b4709ab9.json")).unwrap();
+        let supported = (300..=317).collect::<Vec<u16>>();
+        let (hid, recorder) = crate::hid::HidDevice::test_device();
+        recorder.respond_by(|request| {
+            (request[..4] == [0xfe, 0x0a, 0x2d, 0x01])
+                .then(|| Err("scripted GET failure".to_owned()))
+        });
+        let leds = EntropyApp::read_layer_led_settings(&definition, &supported, 2, &hid);
+        let mut app = module_app();
+        app.supported_qmk_settings.extend(&supported);
+        app.layer_led_settings = leds;
+
+        let qsids = app
+            .entlayout_portable_settings_snapshot()
+            .into_iter()
+            .filter(|setting| setting.layer_led.is_some())
+            .map(|setting| setting.qsid)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            qsids,
+            [300, 316, 317],
+            "the color of layer 1 failed to read"
+        );
+    }
+
     #[test]
     fn entlayout_module_failed_get_is_not_exported() {
         let definition: serde_json::Value =
@@ -4990,6 +5167,7 @@ mod tests {
             value,
             variants: Vec::new(),
             module: None,
+            layer_led: None,
         }
     }
 
@@ -5459,6 +5637,7 @@ mod tests {
             value: 1,
             variants: vec!["Layer 1".to_owned(), "Layer 2".to_owned()],
             module: None,
+            layer_led: None,
         };
         let mut compatible_target = source.clone();
         compatible_target.value = 0;

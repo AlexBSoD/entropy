@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 #[path = "portable_settings/module_contract.rs"]
 mod module_contract;
 use module_contract::{module_setting_import_value, module_setting_valid, EntModuleField};
+#[path = "portable_settings/layer_led_contract.rs"]
+mod layer_led_contract;
+use layer_led_contract::{layer_led_setting_valid, EntLayerLedField};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -31,6 +34,8 @@ pub(super) struct EntPortableSetting {
     pub(super) variants: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) module: Option<Vec<EntModuleField>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) layer_led: Option<EntLayerLedField>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -115,6 +120,9 @@ pub(super) fn ent_portable_setting_is_valid(setting: &EntPortableSetting) -> boo
     if setting.module.is_some() {
         return module_setting_valid(setting);
     }
+    if setting.layer_led.is_some() {
+        return layer_led_setting_valid(setting);
+    }
     if let Some(spec) = ent_portable_setting_spec(setting.qsid) {
         return spec.matches(setting);
     }
@@ -156,6 +164,7 @@ pub(super) fn ent_portable_setting_contracts_match(
         && source.width == target.width
         && source.variants == target.variants
         && source.module == target.module
+        && source.layer_led == target.layer_led
         && ent_portable_setting_is_valid(source)
         && ent_portable_setting_is_valid(target)
 }
@@ -165,7 +174,14 @@ pub(super) fn write_entlayout_portable_setting(
     hid: &crate::device_session::DeviceSession,
     setting: &EntPortableSetting,
 ) -> anyhow::Result<()> {
-    let policy = settings_write_queue::qmk_setting_write_policy(setting.qsid);
+    // As the LED page writes them: some firmware acknowledges a Layer LED
+    // SET without applying it, and over Bluetooth a GET right after the SET
+    // collides with the flash write.
+    let policy = if setting.layer_led.is_some() && !hid.is_bluetooth_transport() {
+        settings_write_queue::QmkSettingWritePolicy::VerifiedReadback
+    } else {
+        settings_write_queue::qmk_setting_write_policy(setting.qsid)
+    };
     let (result, _) = settings_write_queue::write_qmk_setting_value(
         hid,
         setting.qsid,
@@ -194,6 +210,7 @@ impl EntropyApp {
                         value,
                         variants: Vec::new(),
                         module: None,
+                        layer_led: None,
                     })
             })
             .collect::<Vec<_>>();
@@ -214,6 +231,7 @@ impl EntropyApp {
                 value: self.touchpad_settings.dpi,
                 variants,
                 module: None,
+                layer_led: None,
             };
             if ent_portable_setting_is_valid(&setting) {
                 settings.push(setting);
@@ -231,6 +249,7 @@ impl EntropyApp {
                 value: self.touchpad_settings.auto_layer as u16,
                 variants: self.touchpad_settings.auto_layer_variants.clone(),
                 module: None,
+                layer_led: None,
             };
             if ent_portable_setting_is_valid(&setting) {
                 settings.push(setting);
@@ -246,6 +265,7 @@ impl EntropyApp {
                 .any(|field| field.qsid == setting.qsid)
         });
         settings.extend(modules);
+        settings.extend(self.entlayout_layer_led_settings_snapshot());
         settings.sort_by_key(|setting| setting.qsid);
         settings
     }
@@ -339,6 +359,10 @@ impl EntropyApp {
         if setting.module.is_some() {
             self.module_settings.values.insert(setting.qsid, value);
             self.sync_firmware_managed_layout_options();
+            return;
+        }
+        if setting.layer_led.is_some() {
+            self.layer_led_settings.set_value(setting.qsid, value);
             return;
         }
         match setting.qsid {
@@ -438,6 +462,7 @@ mod tests {
             value,
             variants: Vec::new(),
             module: None,
+            layer_led: None,
         }
     }
 
