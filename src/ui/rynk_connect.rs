@@ -851,6 +851,51 @@ mod tests {
     }
 
     #[test]
+    fn a_rynk_board_gone_over_bluetooth_is_reconnected_with_its_layout_kept() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (board, _) = board(stored());
+        // Reached over Bluetooth on every platform that has Rynk.
+        let path = "hid:link-gone";
+        let first = link(path, &board);
+        let mut app = EntropyApp::new_inert_for_test();
+        app.device_manager.replace_devices(vec![Device {
+            bus_type: "Bluetooth".into(),
+            ..rynk_device(path)
+        }]);
+        app.start_connect(0);
+        finish_connect(&mut app);
+        assert!(app.hid_device.is_some());
+
+        board.go_away();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while first.is_open() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the link never closed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        drop(first);
+        app.maybe_begin_bluetooth_reconnect();
+        assert!(
+            matches!(app.connect_state, ConnectState::Reconnecting(_)),
+            "nothing was asked of the board, yet the app reconnects"
+        );
+        assert!(app.layout.is_some(), "the layout stays on screen");
+
+        let second = link(path, &board);
+        let devices = app.device_manager.devices().to_vec();
+        app.apply_device_scan_result(devices);
+        finish_connect(&mut app);
+        let session = app
+            .hid_device
+            .as_ref()
+            .and_then(crate::device_session::DeviceSession::as_rynk)
+            .expect("the board is connected again");
+        assert!(std::sync::Arc::ptr_eq(session.link(), &second));
+    }
+
+    #[test]
     fn a_locked_rynk_board_locks_its_matrix_but_not_its_edits() {
         let mut stored = stored();
         stored.lock = Some(rmk_types_rynk::protocol::rynk::LockStatus {
