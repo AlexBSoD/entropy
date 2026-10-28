@@ -167,6 +167,12 @@ impl EntropyApp {
         self.fallback_entropy_display_presets_before_exit();
 
         if self.deferred_exit_has_pending_hid_writes() {
+            // Nothing writes it while the window is hidden: the edit waits for
+            // the window (an open picker, an unlock), so bring it back.
+            #[cfg(target_os = "linux")]
+            if self.linux_hidden_to_tray {
+                self.restore_from_tray(ctx);
+            }
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
             return;
         }
