@@ -1091,6 +1091,14 @@ impl EntropyApp {
             return;
         }
 
+        // Queued behind a write the board went away under: they go once it
+        // is back.
+        let unsaved = self.settings_write_queue.pending_requests();
+        if !unsaved.is_empty() {
+            if let Some(edits) = self.unsaved_edits_mut() {
+                edits.keep_settings(unsaved);
+            }
+        }
         let error = crate::i18n::tr_catalog(
             self.app_settings.language,
             "settings_write.device_disconnected",

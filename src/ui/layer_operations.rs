@@ -1047,6 +1047,8 @@ impl EntropyApp {
             }
             return;
         }
+        // The layer as a whole is set anew: kept keys of an earlier edit are not.
+        self.forget_unsaved_layer(layer);
 
         let Some(layout) = self.layout.as_ref() else {
             self.report_layer_operation_error(LayerOperationError::MissingLayer);
@@ -1329,6 +1331,7 @@ impl EntropyApp {
         if self.hid_device.is_none()
             || !matches!(self.connect_state, ConnectState::Idle)
             || self.pending_layer_write.is_some()
+            || !self.pending_middle_click_assignments.is_empty()
             || self.vial_hid_background_layer_active()
             || self.hid_write_task_active()
         {

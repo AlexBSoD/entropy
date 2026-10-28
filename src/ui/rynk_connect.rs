@@ -1089,7 +1089,6 @@ mod tests {
         let path = "hid:unsaved-overrides";
         let _held = link(path, &board);
         let mut app = connected_over_bluetooth(path);
-        let keyboard_id = app.current_keyboard_id.unwrap();
         let board_tap_dance = app.keycode_picker.tap_dance_entries.clone();
         let board_overrides = app.key_override_entries.clone();
         app.keycode_picker.tap_dance_entries[0].on_tap = KeyBinding::Vial(0x07);
@@ -1104,7 +1103,7 @@ mod tests {
         app.keycode_picker.tap_dance_dirty = false;
         app.key_override_entries = board_overrides;
         app.key_override_dirty = false;
-        app.rewrite_unsaved_edits(keyboard_id);
+        app.rewrite_unsaved_edits();
         assert_eq!(app.keycode_picker.tap_dance_entries, tap_dance);
         assert!(app.keycode_picker.tap_dance_dirty);
         assert_eq!(app.key_override_entries, overrides);
@@ -1151,14 +1150,71 @@ mod tests {
         let path = "hid:unsaved-other";
         let _held = link(path, &board);
         let mut app = connected_over_bluetooth(path);
-        app.current_keyboard_id = Some(1);
         app.pending_tap_hold_numeric_writes.insert(6, 190);
         app.keep_unsaved_edits();
+        assert!(app.unsaved_edits.is_some());
 
-        app.rewrite_unsaved_edits(2);
+        // Another board of the same model: one keyboard id, another address.
+        let mut other = app.device_manager.devices()[0].clone();
+        other.serial_number = "another board".into();
+        app.device_manager.replace_devices(vec![other]);
+        app.rewrite_unsaved_edits();
         settle_writes(&mut app);
         assert!(app.unsaved_edits.is_none(), "another board drops them");
         assert!(!state.lock().unwrap().settings.contains_key(&6));
+    }
+
+    #[test]
+    fn a_key_set_again_after_the_board_is_back_wins_over_the_kept_one() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let (board, state) = board(stored());
+        let path = "hid:unsaved-superseded";
+        let first = link(path, &board);
+        let mut app = connected_over_bluetooth(path);
+        let ctx = egui::Context::default();
+
+        board.go_away();
+        assert!(app.assign_key_binding(&ctx, 0, 0, KeyBinding::Vial(0x06)));
+        settle_writes(&mut app);
+        drop(first);
+        let _second = reconnect(&mut app, path, &board);
+        // Set again before the kept key's turn comes.
+        assert!(app.assign_key_binding(&ctx, 0, 0, KeyBinding::Vial(0x07)));
+        settle_writes(&mut app);
+        assert_eq!(state.lock().unwrap().keymap[0], key(HidKeyCode::D));
+        assert!(app.unsaved_edits.is_none());
+    }
+
+    #[test]
+    fn settings_queued_behind_a_layer_write_the_board_left_are_kept() {
+        let _storage = crate::app::app_storage::ScopedTempConfig::new();
+        let mut stored = stored();
+        stored.settings.insert(7, 200u16.to_le_bytes().to_vec());
+        let (board, state) = board(stored);
+        let path = "hid:unsaved-behind-layer";
+        let first = link(path, &board);
+        let mut app = connected_over_bluetooth(path);
+
+        board.go_away();
+        app.apply_layer_snapshot(
+            1,
+            crate::app::layer_operations::LayerSnapshot {
+                keycodes: vec![KeyBinding::Vial(0x06), KeyBinding::Vial(0x07)],
+                encoder_keycodes: Vec::new(),
+            },
+            "layer_actions.paste",
+        );
+        // Queued while the layer write holds the board.
+        app.queue_tap_hold_setting_write("Tapping term".into(), 7, 2, 200, 250);
+        settle_writes(&mut app);
+        drop(first);
+
+        let _second = reconnect(&mut app, path, &board);
+        settle_writes(&mut app);
+        let stored = state.lock().unwrap();
+        assert_eq!(stored.settings[&7], 250u16.to_le_bytes());
+        assert_eq!(stored.keymap[2], key(HidKeyCode::C));
+        assert!(app.unsaved_edits.is_none());
     }
 
     #[test]

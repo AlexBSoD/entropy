@@ -10,8 +10,9 @@ type KeptMacros = (Vec<Vec<u8>>, Vec<Vec<crate::keycode_picker::MacroAction>>);
 /// that failed and the ones queued behind it. They wait while no other board
 /// connects, and are written again once the same board is back.
 pub(super) struct UnsavedEdits {
-    /// The board they were made on.
-    keyboard_id: u64,
+    /// The board they were made on: the keyboard id names its model only,
+    /// the device tells two boards of one model apart.
+    owner: UnsavedEditsOwner,
     /// The latest of each setting.
     settings: Vec<SettingsWriteRequest>,
     touchpad: Vec<QmkSettingWriteRequest>,
@@ -42,10 +43,12 @@ pub(super) struct LayerEdits {
     pub(super) encoders: std::collections::BTreeMap<usize, u16>,
 }
 
+type UnsavedEditsOwner = (u64, crate::device::DeviceIdentity);
+
 impl UnsavedEdits {
-    fn new(keyboard_id: u64) -> Self {
+    fn new(owner: UnsavedEditsOwner) -> Self {
         Self {
-            keyboard_id,
+            owner,
             settings: Vec::new(),
             touchpad: Vec::new(),
             tap_hold_numeric: std::collections::BTreeMap::new(),
@@ -114,21 +117,61 @@ impl UnsavedEdits {
 }
 
 impl EntropyApp {
-    /// The unsaved edits of the board connected now. Another board's are
+    /// The board selected now, as unsaved edits name it.
+    fn unsaved_edits_owner(&self) -> Option<UnsavedEditsOwner> {
+        let device = self
+            .selected_device
+            .and_then(|index| self.device_manager.devices().get(index))?;
+        Some((self.current_keyboard_id?, device.stable_identity()))
+    }
+
+    /// The unsaved edits of the board selected now. Another board's are
     /// dropped: they wait for their own board only.
     pub(super) fn unsaved_edits_mut(&mut self) -> Option<&mut UnsavedEdits> {
-        let keyboard_id = self.current_keyboard_id?;
+        let owner = self.unsaved_edits_owner()?;
         if self
             .unsaved_edits
             .as_ref()
-            .is_some_and(|edits| edits.keyboard_id != keyboard_id)
+            .is_some_and(|edits| edits.owner != owner)
         {
             self.unsaved_edits = None;
         }
         Some(
             self.unsaved_edits
-                .get_or_insert_with(|| UnsavedEdits::new(keyboard_id)),
+                .get_or_insert_with(|| UnsavedEdits::new(owner)),
         )
+    }
+
+    /// The unsaved edits of the board selected now, if it has any.
+    fn own_unsaved_edits_mut(&mut self) -> Option<&mut UnsavedEdits> {
+        let owner = self.unsaved_edits_owner()?;
+        self.unsaved_edits
+            .as_mut()
+            .filter(|edits| edits.owner == owner)
+    }
+
+    /// Forgets a kept key the user set again: the newer edit is written.
+    pub(super) fn forget_unsaved_key(&mut self, layer: usize, key_index: usize) {
+        if let Some(edits) = self.own_unsaved_edits_mut() {
+            if let Some(kept) = edits.layers.get_mut(&layer) {
+                kept.keys.remove(&key_index);
+            }
+        }
+    }
+
+    pub(super) fn forget_unsaved_encoder(&mut self, layer: usize, encoder_index: usize) {
+        if let Some(edits) = self.own_unsaved_edits_mut() {
+            if let Some(kept) = edits.layers.get_mut(&layer) {
+                kept.encoders.remove(&encoder_index);
+            }
+        }
+    }
+
+    /// Forgets the kept keys and encoders of a layer the user set as a whole.
+    pub(super) fn forget_unsaved_layer(&mut self, layer: usize) {
+        if let Some(edits) = self.own_unsaved_edits_mut() {
+            edits.layers.remove(&layer);
+        }
     }
 
     /// Keeps a write that failed as the board went away, to make again once
@@ -166,10 +209,13 @@ impl EntropyApp {
             app.layer_names[layer] = name.clone();
             app.keycode_picker.layer_names = app.layer_names.clone();
             save_layer_names(&app.layer_names, &app.current_device_name);
-            if let Some(dev) = &app.hid_device {
-                if let Err(error) = dev.set_qmk_setting_string(200 + layer as u16, &name) {
-                    log::warn!("Layer {layer} name not written again: {error}");
-                }
+            let written = app
+                .hid_device
+                .as_ref()
+                .map(|dev| dev.set_qmk_setting_string(200 + layer as u16, &name));
+            if let Some(Err(error)) = written {
+                log::warn!("Layer {layer} name not written again: {error}");
+                app.keep_unsaved_layer_name(&error, layer, name);
             }
         });
     }
@@ -177,6 +223,10 @@ impl EntropyApp {
     /// Keeps what is still queued for the board as its connection drops,
     /// which would otherwise be dropped with it.
     pub(super) fn keep_unsaved_edits(&mut self) {
+        // Without a board to keep them for, the reconnect drops them as before.
+        if self.unsaved_edits_owner().is_none() {
+            return;
+        }
         self.keep_unsaved_layer_write();
         let settings = self.settings_write_queue.pending_requests();
         let touchpad = self.qmk_settings_write_queue.take_all();
@@ -220,12 +270,13 @@ impl EntropyApp {
         }
     }
 
-    /// Writes the edits kept for `keyboard_id` again, now that it connected.
-    /// Another board connecting drops them.
-    pub(super) fn rewrite_unsaved_edits(&mut self, keyboard_id: u64) {
+    /// Writes the edits kept for the board just connected again. Another
+    /// board connecting drops them.
+    pub(super) fn rewrite_unsaved_edits(&mut self) {
+        let owner = self.unsaved_edits_owner();
         if let Some(edits) = self
             .unsaved_edits
-            .take_if(|edits| edits.keyboard_id != keyboard_id)
+            .take_if(|edits| Some(&edits.owner) != owner.as_ref())
         {
             log::info!(
                 "Dropping {} unsaved edit(s) of another keyboard",
@@ -287,6 +338,14 @@ impl EntropyApp {
             picker.tap_dance_dirty = true;
         }
         if let Some(entries) = combos.filter(|entries| entries.len() == self.combo_entries.len()) {
+            // The list shows as many combos as the board's use; an edited
+            // one further down stays in view.
+            let edited = entries
+                .iter()
+                .zip(&self.combo_synced_entries)
+                .rposition(|(edited, held)| edited != held)
+                .map_or(0, |index| index + 1);
+            self.combo_visible_count = self.combo_visible_count.max(edited);
             self.combo_entries = entries;
             self.mark_combo_dirty();
         }
@@ -316,11 +375,7 @@ impl EntropyApp {
 
     /// The next layer whose edits wait for the board connected now.
     pub(super) fn take_unsaved_layer(&mut self) -> Option<(usize, LayerEdits)> {
-        let keyboard_id = self.current_keyboard_id?;
-        let edits = self
-            .unsaved_edits
-            .as_mut()
-            .filter(|edits| edits.keyboard_id == keyboard_id)?;
+        let edits = self.own_unsaved_edits_mut()?;
         let layer = edits.layers.pop_first();
         if edits.len() == 0 {
             self.unsaved_edits = None;

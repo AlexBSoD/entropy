@@ -1478,13 +1478,14 @@ impl EntropyApp {
                 {
                     if !self.headless {
                         self.restore_entropy_display_preset_after_connect();
-                        self.rewrite_unsaved_edits(r.keyboard_id);
                         self.sync_qmk_hid_host_bridges();
                         // USB reconnect can restore the same logical profile while
                         // firmware has lost its volatile host-side layout. Publish
                         // the current snapshot and explicitly request a full resend.
                         self.update_application_layout_runtime();
                         self.force_current_application_layout_resend();
+                        // Last: a queued write takes the board from the bridges.
+                        self.rewrite_unsaved_edits();
                     }
                 }
 
