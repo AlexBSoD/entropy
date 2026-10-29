@@ -165,7 +165,7 @@ key_legends_russian = "Английская + русская"
 close_to_tray_label = "Закрывать в трей"
 close_to_tray_tooltip = "Прятать Entropy в системный трей вместо выхода при закрытии окна"
 run_in_background_label = "Работать в фоне"
-run_in_background_tooltip = "Оставлять Entropy работать в фоне вместо выхода при закрытии окна"
+run_in_background_tooltip = "Оставлять Entropy работать в фоне вместо выхода при закрытии окна. Если панель показывает значок в трее, окно прячется туда и значок возвращает его"
 launch_at_startup_label = "Запускать при входе"
 launch_at_startup_tooltip = "Автоматически запускать Entropy при входе в систему"
 launch_minimized_label = "Запускать свёрнутой"
@@ -411,6 +411,10 @@ media = "Медиа"
 default = "По умолчанию"
 unknown = "Неизвестно"
 
+[tray]
+open = "Открыть Entropy"
+quit = "Выйти из Entropy"
+
 [status_messages]
 macros_saved = "Макросы сохранены"
 macros_saving = "Сохранение макросов…"
@@ -430,6 +434,7 @@ app_settings_import_report_title = "Отчёт импорта настроек �
 app_settings_import_failed_title = "Импорт настроек приложения не выполнен"
 import_app_settings_failed = "Импорт настроек приложения не удался: {error}"
 macro_write_error = "Ошибка записи макросов: {error}"
+macro_memory_full = "Макросы не сохранены: нужно {used} байт, а в клавиатуре только {capacity}"
 combo_write_error = "Ошибка записи combo: {error}"
 combo_timeout_write_error = "Ошибка записи combo timeout: {error}"
 tap_dance_write_error = "Ошибка записи Tap Dance: {error}"
@@ -985,6 +990,8 @@ plus_up = "+ Up"
 release_a_key = "Отпустить клавишу"
 plus_delay = "+ Задержка"
 pause_in_milliseconds = "Пауза в миллисекундах"
+memory_use = "Память макросов: {used} из {capacity} байт"
+memory_use_shared_by_all_macros = "Эту память делят все макросы клавиатуры"
 
 [tap_dance_editor]
 title = "Tap Dance"

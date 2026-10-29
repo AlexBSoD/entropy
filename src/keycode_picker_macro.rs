@@ -418,11 +418,14 @@ impl KeycodePicker {
         picked
     }
 
+    /// `memory_use` is `(used, capacity)` of the keyboard's macro memory, when
+    /// the board reported it.
     pub(crate) fn show_macro_settings_editor(
         &mut self,
         ui: &mut egui::Ui,
         raw_n: u8,
         grid_id: &'static str,
+        memory_use: Option<(usize, usize)>,
     ) -> u8 {
         let slot_count = self.macro_count.min(u8::MAX as usize + 1);
         if slot_count == 0 {
@@ -471,6 +474,30 @@ impl KeycodePicker {
 
         if let Some(notice) = self.macro_ext_keycodes_notice(language) {
             crate::ui_style::modal_hint(ui, notice);
+            ui.add_space(metrics.value(4.0));
+        }
+        if let Some((used, capacity)) = memory_use {
+            let color = if used > capacity {
+                Color32::from_rgb(220, 92, 76)
+            } else {
+                crate::ui_style::muted_text(ui.visuals().dark_mode)
+            };
+            ui.label(
+                RichText::new(crate::i18n::tr_catalog_format(
+                    language,
+                    "macro_editor.memory_use",
+                    &[
+                        ("used", &used.to_string()),
+                        ("capacity", &capacity.to_string()),
+                    ],
+                ))
+                .size(11.0)
+                .color(color),
+            )
+            .on_hover_text(crate::i18n::tr_catalog(
+                language,
+                "macro_editor.memory_use_shared_by_all_macros",
+            ));
             ui.add_space(metrics.value(4.0));
         }
         if self
@@ -850,7 +877,9 @@ impl KeycodePicker {
                                                             language,
                                                             "macro_editor.type_text_here",
                                                         ),
-                                                        256,
+                                                        // The keyboard's shared macro memory
+                                                        // is the only limit; see the memory line.
+                                                        usize::MAX,
                                                         egui::Align::Min,
                                                     )
                                                     .on_hover_text(crate::i18n::tr_catalog(
@@ -1514,7 +1543,7 @@ mod tests {
             ..Default::default()
         };
         ctx.run_ui(input, |ui| {
-            picker.show_macro_settings_editor(ui, 0, "macro_settings_test");
+            picker.show_macro_settings_editor(ui, 0, "macro_settings_test", None);
         })
     }
 

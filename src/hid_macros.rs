@@ -80,8 +80,9 @@ impl HidDevice {
         parse_macro_buffer(buf, count)
     }
 
-    /// Encode macro bytecode entries into buffer (null-separated).
-    pub fn encode_macros(macros: &[Vec<u8>], buf_size: u16) -> Vec<u8> {
+    /// Encode macro bytecode entries into buffer (null-separated); fails when
+    /// they do not fit in `buf_size`.
+    pub fn encode_macros(macros: &[Vec<u8>], buf_size: u16) -> Result<Vec<u8>> {
         encode_macro_buffer(macros, buf_size)
     }
 }
