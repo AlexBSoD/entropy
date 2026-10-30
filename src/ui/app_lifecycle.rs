@@ -758,14 +758,14 @@ impl EntropyApp {
             crate::i18n::tr_catalog(lang, "entlayout.rynk_losses_hint")
         );
         let screen_rect = ctx.content_rect();
-        egui::Area::new("entlayout_losses_backdrop".into())
+        egui::Area::new(egui::Id::unique("entlayout_losses_backdrop"))
             .order(egui::Order::Foreground)
             .fixed_pos(screen_rect.min)
             .show(ctx, |ui| {
                 let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, screen_rect.size());
                 ui.interact(
                     rect,
-                    egui::Id::new("entlayout_losses_backdrop_blocker"),
+                    egui::Id::unique("entlayout_losses_backdrop_blocker"),
                     egui::Sense::click_and_drag(),
                 );
                 ui.painter().rect_filled(
@@ -783,7 +783,7 @@ impl EntropyApp {
         crate::ui_style::centered_modal_window(
             ctx,
             crate::i18n::tr_catalog(lang, "entlayout.rynk_losses_title"),
-            egui::Id::new("entlayout_losses_window"),
+            egui::Id::unique("entlayout_losses_window"),
             &mut open,
             Vec2::new(680.0, 620.0),
         )

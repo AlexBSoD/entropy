@@ -599,7 +599,7 @@ impl EntropyApp {
         crate::ui_style::centered_modal_window(
             ctx,
             crate::i18n::tr_catalog(lang, title),
-            egui::Id::new("text_expander_ibus_modal"),
+            egui::Id::unique("text_expander_ibus_modal"),
             &mut open,
             size,
         )
@@ -1264,7 +1264,7 @@ mod setup_state_tests {
                 Some(TextExpanderIbusModal::UseGnomeSources),
             ] {
                 app.text_expander_ibus_modal = modal;
-                let _ = ctx.run_ui(
+                ctx.run_ui(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(
                             egui::Pos2::ZERO,
@@ -1281,7 +1281,8 @@ mod setup_state_tests {
                         }
                         app.draw_text_expander_ibus_modal(ui.ctx(), metrics);
                     },
-                );
+                )
+                .drop_without_applying_deltas();
                 assert_eq!(
                     app.text_expander_ibus_modal, modal,
                     "drawing alone keeps it open"

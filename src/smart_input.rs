@@ -1447,7 +1447,7 @@ mod ibus_reload_tests {
                 refuse_exit: self.refuse_exit,
             };
             let server = std::thread::spawn(move || {
-                zbus::blocking::connection::Builder::unix_stream(server)
+                zbus::blocking::connection::Builder::async_io_unix_stream(server)
                     .server(guid)
                     .expect("server guid")
                     .p2p()
@@ -1456,7 +1456,7 @@ mod ibus_reload_tests {
                     .build()
                     .expect("server connection")
             });
-            let client = zbus::blocking::connection::Builder::unix_stream(client)
+            let client = zbus::blocking::connection::Builder::async_io_unix_stream(client)
                 .p2p()
                 .build()
                 .expect("client connection");
