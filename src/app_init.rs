@@ -256,6 +256,7 @@ impl EntropyApp {
             close_to_tray_prompt_open: false,
             close_to_tray_prompt_remember: false,
             force_close_requested: false,
+            ime_composing: false,
             #[cfg(not(target_arch = "wasm32"))]
             exit_after_hid_write: false,
             main_menu_tab: MainMenuTab::Keyboard,

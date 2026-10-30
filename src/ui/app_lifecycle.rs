@@ -1883,9 +1883,51 @@ mod tests {
     }
 }
 
+/// Turns an IME commit that ends no composition into plain text input.
+///
+/// egui 0.34 inserts an `ImeEvent::Commit` only at the cursor a pre-edit left
+/// behind, so an input method that commits every key without pre-editing gets
+/// the first character into a field and loses the rest. IBus does that as
+/// KWin's Wayland input method unless "Use system keyboard layout" is on
+/// (emilk/egui#7485, fixed by emilk/egui#7983 in egui 0.35). A composition,
+/// a non-empty pre-edit up to its commit, is left to egui.
+///
+/// Remove with egui 0.35 or later.
+fn ime_commits_as_text(composing: &mut bool, events: &mut [egui::Event]) {
+    let mut rest = events;
+    while let Some((event, later)) = rest.split_first_mut() {
+        match event {
+            egui::Event::Ime(egui::ImeEvent::Preedit(text)) => *composing = !text.is_empty(),
+            egui::Event::Ime(egui::ImeEvent::Commit(text)) if !*composing => {
+                *event = egui::Event::Text(std::mem::take(text));
+            }
+            egui::Event::Ime(egui::ImeEvent::Commit(_)) => *composing = false,
+            // On Linux egui-winit reports the cleared pre-edit only as
+            // `Disabled`. Followed by a pre-edit or a commit it is a step of
+            // the composition; alone it is a composition given up (Escape).
+            egui::Event::Ime(egui::ImeEvent::Disabled)
+                if !later.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Ime(egui::ImeEvent::Preedit(_) | egui::ImeEvent::Commit(_))
+                    )
+                }) =>
+            {
+                *composing = false;
+            }
+            _ => {}
+        }
+        rest = later;
+    }
+}
+
 impl eframe::App for EntropyApp {
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         app_panel_fill(visuals.dark_mode).to_normalized_gamma_f32()
+    }
+
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        ime_commits_as_text(&mut self.ime_composing, &mut raw_input.events);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -2565,3 +2607,123 @@ impl eframe::App for EntropyApp {
 
 #[cfg(all(test, any(target_os="linux",target_os="windows",target_os="macos")))]
 include!("usb_hotplug_tests.rs");
+
+#[cfg(test)]
+mod ime_commit_tests {
+    use super::*;
+    use egui::{Event, ImeEvent};
+
+    /// Each key IBus commits under KWin, as egui-winit 0.34 hands it over on
+    /// Linux: the emptied pre-edit and the commit each end in `Disabled`.
+    fn ibus_key(text: &str) -> Vec<Event> {
+        vec![
+            Event::Ime(ImeEvent::Disabled),
+            Event::Ime(ImeEvent::Commit(text.to_owned())),
+            Event::Ime(ImeEvent::Disabled),
+        ]
+    }
+
+    /// Pinyin "ni" composed into 你, as an IBus engine with a pre-edit sends it.
+    fn composed_ni() -> Vec<Vec<Event>> {
+        vec![
+            vec![
+                Event::Ime(ImeEvent::Enabled),
+                Event::Ime(ImeEvent::Preedit("n".to_owned())),
+            ],
+            vec![
+                Event::Ime(ImeEvent::Disabled),
+                Event::Ime(ImeEvent::Enabled),
+                Event::Ime(ImeEvent::Preedit("ni".to_owned())),
+            ],
+            ibus_key("你"),
+        ]
+    }
+
+    /// Types into a focused single-line field, one frame per batch.
+    fn typed(batches: &[Vec<Event>], hook: bool) -> String {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("ime_commit_field");
+        let mut text = String::new();
+        let mut composing = false;
+        for events in std::iter::once(Vec::new()).chain(batches.iter().cloned()) {
+            let mut input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            if hook {
+                ime_commits_as_text(&mut composing, &mut input.events);
+            }
+            let _ = ctx.run_ui(input, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut text).id(id))
+                    .request_focus();
+            });
+        }
+        text
+    }
+
+    #[test]
+    fn keys_committed_without_a_composition_all_reach_the_field() {
+        let keys = [ibus_key("a"), ibus_key("b"), ibus_key("c")];
+        // egui 0.34 itself keeps only the first; once it keeps all three,
+        // egui has the fix and the hook can go.
+        assert_eq!(typed(&keys, false), "a");
+        assert_eq!(typed(&keys, true), "abc");
+    }
+
+    #[test]
+    fn a_composition_is_left_to_egui() {
+        let mut batches = composed_ni();
+        let mut hooked = batches.clone();
+        let mut composing = false;
+        for events in &mut hooked {
+            ime_commits_as_text(&mut composing, events);
+        }
+        assert_eq!(hooked, batches, "the composition's events stay as they are");
+        assert!(!composing);
+
+        assert_eq!(typed(&batches, true), "你");
+        batches.push(ibus_key("a"));
+        assert_eq!(typed(&batches, true), "你a");
+    }
+
+    #[test]
+    fn an_emptied_pre_edit_ends_the_composition() {
+        let mut composing = false;
+        let mut events = vec![
+            Event::Ime(ImeEvent::Preedit("n".to_owned())),
+            Event::Ime(ImeEvent::Preedit(String::new())),
+            Event::Ime(ImeEvent::Commit("a".to_owned())),
+        ];
+        ime_commits_as_text(&mut composing, &mut events);
+        assert_eq!(events[2], Event::Text("a".to_owned()));
+    }
+
+    #[test]
+    fn a_composition_given_up_lets_the_next_keys_through() {
+        let key = |key| {
+            vec![Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]
+        };
+        // "xy", then a pre-edit started after "x", given up with Escape (a lone
+        // `Disabled`), its leftover removed, the cursor back at the end.
+        let batches = [
+            ibus_key("x"),
+            ibus_key("y"),
+            key(egui::Key::ArrowLeft),
+            vec![
+                Event::Ime(ImeEvent::Enabled),
+                Event::Ime(ImeEvent::Preedit("n".to_owned())),
+            ],
+            vec![Event::Ime(ImeEvent::Disabled)],
+            key(egui::Key::Backspace),
+            key(egui::Key::ArrowRight),
+            ibus_key("a"),
+        ];
+        assert_eq!(typed(&batches, true), "xya");
+    }
+}
