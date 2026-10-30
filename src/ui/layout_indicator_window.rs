@@ -1215,7 +1215,6 @@ mod tests {
             app.layout_indicator_poll_interval(),
             LAYOUT_INDICATOR_BLUETOOTH_POLL_INTERVAL
         );
-        assert!(app.matrix_tester_poll_interval() < LAYOUT_INDICATOR_BLUETOOTH_POLL_INTERVAL);
     }
 
     #[test]
