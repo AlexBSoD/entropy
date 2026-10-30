@@ -1542,7 +1542,7 @@ mod repeat_lifecycle_tests {
         ctx: &egui::Context,
         events: Vec<egui::Event>,
     ) -> egui::FullOutput {
-        ctx.run_ui(
+        crate::app::discard_texture_deltas(ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -1552,7 +1552,7 @@ mod repeat_lifecycle_tests {
                 ..Default::default()
             },
             |ui| app.draw_display_settings_page(ui, ui.max_rect()),
-        )
+        ))
     }
 
     fn text_position(output: &egui::FullOutput, label: &str) -> egui::Pos2 {

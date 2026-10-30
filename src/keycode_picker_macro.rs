@@ -1245,13 +1245,13 @@ mod tests {
             events,
             ..Default::default()
         };
-        ctx.run_ui(input, |_ui| {
+        crate::app::discard_texture_deltas(ctx.run_ui(input, |_ui| {
             picker.show(
                 ctx,
                 DeferredPickerDataState::Ready,
                 DeferredPickerDataState::Ready,
             );
-        })
+        }))
     }
 
     fn macro_picker_text_position(output: &egui::FullOutput, label: &str) -> Option<egui::Pos2> {
@@ -1341,6 +1341,7 @@ mod tests {
                             delta: egui::vec2(0.0, -180.0),
                             modifiers: egui::Modifiers::NONE,
                             phase: egui::TouchPhase::Move,
+                            source: egui::MouseWheelSource::Unknown,
                         },
                     ],
                 );
