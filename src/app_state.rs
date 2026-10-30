@@ -5553,6 +5553,9 @@ pub struct EntropyApp {
     /// Serialized live Vial read/control operation. Owns the HID handle while active.
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) vial_hid_task: Option<VialHidTask>,
+    /// This pass carries a click, key or text, which may start device work.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) user_input_pass: bool,
     /// Undo intent captured while a low-priority Bluetooth layer read owns the
     /// HID handle. It is started before another automatic layer read.
     #[cfg(not(target_arch = "wasm32"))]

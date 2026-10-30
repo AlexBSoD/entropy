@@ -96,6 +96,24 @@ fn hid_lifecycle_writes_available(hid_write_task_active: bool) -> bool {
     !hid_write_task_active
 }
 
+/// Input that can start device work in this pass: a click, a key or text.
+#[cfg(not(target_arch = "wasm32"))]
+fn pass_has_user_input(ctx: &egui::Context) -> bool {
+    ctx.input(|input| {
+        input.events.iter().any(|event| {
+            matches!(
+                event,
+                egui::Event::PointerButton { .. }
+                    | egui::Event::Key { .. }
+                    | egui::Event::Text(_)
+                    | egui::Event::Paste(_)
+                    | egui::Event::Cut
+                    | egui::Event::Ime(_)
+            )
+        })
+    })
+}
+
 fn should_disable_layout_background(
     bluetooth_reconnecting: bool,
     unlock_open: bool,
@@ -1909,6 +1927,7 @@ impl eframe::App for EntropyApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         #[cfg(not(target_arch = "wasm32"))]
         {
+            self.user_input_pass = pass_has_user_input(ctx);
             #[cfg(target_os = "windows")]
             self.cache_windows_hwnd(frame);
             #[cfg(target_os = "windows")]

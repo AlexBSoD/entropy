@@ -115,6 +115,8 @@ impl EntropyApp {
             #[cfg(not(target_arch = "wasm32"))]
             vial_hid_task: None,
             #[cfg(not(target_arch = "wasm32"))]
+            user_input_pass: false,
+            #[cfg(not(target_arch = "wasm32"))]
             pending_layout_undo: false,
             #[cfg(not(target_arch = "wasm32"))]
             deferred_device_load: DeferredDeviceLoadState::default(),

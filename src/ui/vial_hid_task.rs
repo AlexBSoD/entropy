@@ -125,6 +125,10 @@ impl EntropyApp {
 const BATTERY_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 #[cfg(not(target_arch = "wasm32"))]
 const BATTERY_REFRESH_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// A matrix read takes one round trip: a couple of milliseconds over USB, tens
+/// over Bluetooth. Longer, the link is stalling and the pass goes on without it.
+#[cfg(not(target_arch = "wasm32"))]
+const MATRIX_READ_RECLAIM_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 #[cfg(not(target_arch = "wasm32"))]
 const BATTERY_INCOMPLETE_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 #[cfg(not(target_arch = "wasm32"))]
@@ -279,6 +283,8 @@ struct VialHidTaskResult {
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) struct VialHidTask {
     receiver: std::sync::mpsc::Receiver<VialHidTaskResult>,
+    /// The result `await_vial_hid_task` took off the channel, for the next poll.
+    finished: Option<VialHidTaskResult>,
     operation: VialHidOperation,
     generation: u64,
     progress: std::sync::Arc<std::sync::atomic::AtomicU32>,
@@ -518,8 +524,22 @@ impl EntropyApp {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn vial_hid_matrix_read_active(&self) -> bool {
+        self.vial_hid_task
+            .as_ref()
+            .is_some_and(|task| matches!(task.operation, VialHidOperation::Matrix { .. }))
+    }
+
+    /// A matrix read lends the board for one round trip, again and again while
+    /// the layout indicator or the matrix tester is open. Frames drawn while it
+    /// is out must not show the board busy, or menus flicker with every read; a
+    /// pass with the user's input has taken the board back already (see
+    /// `poll_vial_hid_task`) unless the read outlasted the wait.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn vial_hid_task_blocks_user_action(&self) -> bool {
-        self.vial_hid_task.is_some() && !self.vial_hid_background_layer_active()
+        self.vial_hid_task.is_some()
+            && !self.vial_hid_background_layer_active()
+            && (!self.vial_hid_matrix_read_active() || self.user_input_pass)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -682,6 +702,7 @@ impl EntropyApp {
         });
         self.vial_hid_task = Some(VialHidTask {
             receiver,
+            finished: None,
             operation: task_operation,
             generation,
             progress,
@@ -790,8 +811,24 @@ impl EntropyApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn poll_vial_hid_task(&mut self, ctx: &egui::Context) {
+        // Whatever the user's input starts in this pass finds the board here
+        // rather than out on a matrix read.
+        if self.user_input_pass && self.vial_hid_matrix_read_active() {
+            self.await_vial_hid_task(MATRIX_READ_RECLAIM_TIMEOUT);
+        }
         self.poll_vial_hid_task_with_settings_save(ctx, save_app_settings);
         self.maybe_start_layer_name_write(ctx);
+    }
+
+    /// Waits up to `timeout` for the running task to finish; the next poll
+    /// applies its result.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn await_vial_hid_task(&mut self, timeout: std::time::Duration) {
+        if let Some(task) = self.vial_hid_task.as_mut() {
+            if task.finished.is_none() {
+                task.finished = task.receiver.recv_timeout(timeout).ok();
+            }
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -800,8 +837,11 @@ impl EntropyApp {
         ctx: &egui::Context,
         save_settings: impl FnOnce(&AppSettings),
     ) {
-        let received = match self.vial_hid_task.as_ref() {
-            Some(task) => task.receiver.try_recv(),
+        let received = match self.vial_hid_task.as_mut() {
+            Some(task) => task
+                .finished
+                .take()
+                .map_or_else(|| task.receiver.try_recv(), Ok),
             None => return,
         };
 
@@ -1889,6 +1929,79 @@ mod repeat_lifecycle_tests {
             assert!(!app.vial_hid_task_blocks_user_action());
         }
     }
+
+    fn start_gated_matrix_read(
+        app: &mut EntropyApp,
+        ctx: &egui::Context,
+    ) -> std::sync::mpsc::Sender<()> {
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        assert_eq!(
+            app.start_vial_hid_operation_with_runner(
+                ctx,
+                VialHidOperation::Matrix {
+                    rows: 1,
+                    cols: 2,
+                    remember_ever_pressed: false,
+                },
+                move |_, _, _, _| {
+                    gate.recv().unwrap();
+                    Ok(VialHidOutcome::Matrix(vec![true, false]))
+                },
+            ),
+            VialHidTaskStart::Started
+        );
+        release
+    }
+
+    #[test]
+    fn frames_drawn_during_a_matrix_read_see_the_board_connected_and_idle() {
+        let (mut app, ctx, _recorder) = app();
+        let release = start_gated_matrix_read(&mut app, &ctx);
+
+        assert!(app.hid_device.is_none(), "the read holds the board");
+        assert!(!app.hid_user_action_busy());
+        assert!(app.qmk_setting_transport_available());
+
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.vial_hid_task_active() {
+            assert!(Instant::now() < deadline, "matrix read did not finish");
+            app.poll_vial_hid_task(&ctx);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.hid_device.is_some());
+        assert_eq!(app.matrix_tester_pressed, vec![true, false]);
+    }
+
+    #[test]
+    fn a_pass_with_user_input_takes_the_board_back_from_a_matrix_read() {
+        let (mut app, ctx, _recorder) = app();
+        let release = start_gated_matrix_read(&mut app, &ctx);
+        app.user_input_pass = true;
+        assert!(
+            app.vial_hid_task_blocks_user_action(),
+            "until the read is back, input must not find the board missing"
+        );
+
+        let finish = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            release.send(()).unwrap();
+        });
+        app.poll_vial_hid_task(&ctx);
+        finish.join().unwrap();
+
+        assert!(!app.vial_hid_task_active());
+        assert!(app.hid_device.is_some());
+        assert_eq!(app.matrix_tester_pressed, vec![true, false]);
+
+        // Nor does the same pass lend the board to the next read.
+        app.matrix_tester_last_poll = Instant::now() - MATRIX_TESTER_POLL_INTERVAL;
+        app.poll_switch_matrix_state(&ctx, 1, 2, false);
+        assert!(!app.vial_hid_task_active());
+        app.user_input_pass = false;
+        app.poll_switch_matrix_state(&ctx, 1, 2, false);
+        assert!(app.vial_hid_matrix_read_active());
+    }
 }
 
 #[cfg(test)]
@@ -2039,6 +2152,7 @@ mod tests {
             let (sender, receiver) = std::sync::mpsc::channel();
             app.vial_hid_task = Some(VialHidTask {
                 receiver,
+                finished: None,
                 operation: operation.clone(),
                 generation: app.connection_generation,
                 progress: Default::default(),

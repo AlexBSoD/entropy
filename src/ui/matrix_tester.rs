@@ -87,7 +87,9 @@ impl EntropyApp {
         let now = std::time::Instant::now();
         let poll_interval = self.matrix_tester_poll_interval();
 
-        if now.duration_since(self.matrix_tester_last_poll) >= poll_interval {
+        // A pass with the user's input keeps the board for what the input starts.
+        if now.duration_since(self.matrix_tester_last_poll) >= poll_interval && !self.user_input_pass
+        {
             match self.start_vial_matrix_poll(ctx, rows, cols, remember_ever_pressed) {
                 VialHidTaskStart::Started => {
                     self.matrix_tester_last_poll = now;

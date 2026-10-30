@@ -7,7 +7,7 @@ impl EntropyApp {
         let hid_ready = {
             #[cfg(not(target_arch = "wasm32"))]
             {
-                self.hid_device.is_some()
+                self.qmk_setting_transport_available()
             }
             #[cfg(target_arch = "wasm32")]
             {
