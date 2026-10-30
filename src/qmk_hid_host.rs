@@ -3282,9 +3282,9 @@ impl IbusLayoutTracker {
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct IbusEngineState {
-    entropy: bool,
-    layout: Option<u8>,
+pub(crate) struct IbusEngineState {
+    pub(crate) entropy: bool,
+    pub(crate) layout: Option<u8>,
 }
 
 #[cfg(target_os = "linux")]
@@ -3294,7 +3294,7 @@ fn ibus_engine_field(engine: &zbus::zvariant::OwnedValue, index: usize) -> Optio
 }
 
 #[cfg(target_os = "linux")]
-fn ibus_engine_state(engine: &zbus::zvariant::OwnedValue) -> Option<IbusEngineState> {
+pub(crate) fn ibus_engine_state(engine: &zbus::zvariant::OwnedValue) -> Option<IbusEngineState> {
     const ENTROPY_ENGINE_PREFIX: &str = "entropy-universal-symbols";
 
     let name = ibus_engine_field(engine, 2)?;
@@ -3315,7 +3315,7 @@ fn ibus_engine_state(engine: &zbus::zvariant::OwnedValue) -> Option<IbusEngineSt
 }
 
 #[cfg(target_os = "linux")]
-fn gnome_desktop_session() -> bool {
+pub(crate) fn gnome_desktop_session() -> bool {
     ["XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP"]
         .into_iter()
         .filter_map(std::env::var_os)
@@ -3334,7 +3334,7 @@ fn desktop_list_has_gnome(value: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn kde_desktop_session() -> bool {
+pub(crate) fn kde_desktop_session() -> bool {
     ["XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP"]
         .into_iter()
         .filter_map(std::env::var_os)
