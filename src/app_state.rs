@@ -5720,9 +5720,6 @@ pub struct EntropyApp {
     pub(crate) close_to_tray_prompt_open: bool,
     pub(crate) close_to_tray_prompt_remember: bool,
     pub(crate) force_close_requested: bool,
-    /// Whether an IME composition is under way, as far as the input seen so
-    /// far tells; see `ime_commits_as_text`.
-    pub(crate) ime_composing: bool,
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) exit_after_hid_write: bool,
     pub(crate) main_menu_tab: MainMenuTab,
