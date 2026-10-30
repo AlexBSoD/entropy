@@ -929,12 +929,9 @@ impl EntropyApp {
                     } => *remember_ever_pressed,
                     _ => false,
                 };
+                // The layout indicator repaints when what it shows changes:
+                // `draw_sticky_layout_window` compares on the next pass.
                 self.finish_matrix_tester_poll(pressed, remember_ever_pressed);
-                if self.app_settings.sticky_layout_window {
-                    ctx.request_repaint_of(
-                        super::layout_indicator_window::sticky_layout_viewport_id(),
-                    );
-                }
             }
             Ok(VialHidOutcome::Battery(battery)) => {
                 if let Some(info) = self.device_about_info.as_mut() {
@@ -1996,10 +1993,10 @@ mod repeat_lifecycle_tests {
 
         // Nor does the same pass lend the board to the next read.
         app.matrix_tester_last_poll = Instant::now() - MATRIX_TESTER_POLL_INTERVAL;
-        app.poll_switch_matrix_state(&ctx, 1, 2, false);
+        app.poll_switch_matrix_state(&ctx, 1, 2, false, MATRIX_TESTER_POLL_INTERVAL);
         assert!(!app.vial_hid_task_active());
         app.user_input_pass = false;
-        app.poll_switch_matrix_state(&ctx, 1, 2, false);
+        app.poll_switch_matrix_state(&ctx, 1, 2, false, MATRIX_TESTER_POLL_INTERVAL);
         assert!(app.vial_hid_matrix_read_active());
     }
 }

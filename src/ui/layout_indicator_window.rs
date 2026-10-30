@@ -154,6 +154,29 @@ pub(crate) struct StickyLayoutViewportEventQueue(
     std::sync::Arc<std::sync::Mutex<Vec<StickyLayoutViewportEvent>>>,
 );
 
+/// What the indicator was last asked to show. It repaints when this changes,
+/// not on every matrix read: a read that finds the same keys changes nothing.
+#[derive(PartialEq)]
+pub(crate) struct StickyLayoutShown {
+    title: String,
+    layout_name: Option<String>,
+    layers: Vec<Vec<crate::keyboard::KeyBinding>>,
+    encoder_layers: Vec<Vec<u16>>,
+    layer: usize,
+    layer_names: Vec<String>,
+    macro_names: Vec<String>,
+    tap_dance_names: Vec<String>,
+    key_legend_layout: crate::keycode::KeyLegendLayout,
+    show_shifted_number_symbols: bool,
+    layout_options_value: Option<u32>,
+    encoder_visibility: Vec<bool>,
+    module_values: std::collections::BTreeMap<u16, u16>,
+    pressed: Vec<bool>,
+    pressed_key_layers: Vec<Option<usize>>,
+    controls: StickyLayoutViewportControls,
+    opacity_held: bool,
+}
+
 fn push_sticky_layout_viewport_event(
     events: &StickyLayoutViewportEventQueue,
     event: StickyLayoutViewportEvent,
@@ -455,7 +478,8 @@ impl EntropyApp {
             .as_ref()
             .map(|layout| (layout.rows, layout.cols))
         {
-            self.poll_switch_matrix_state(ctx, rows, cols, false);
+            let poll_interval = self.layout_indicator_poll_interval();
+            self.poll_switch_matrix_state(ctx, rows, cols, false, poll_interval);
         }
     }
 
@@ -564,6 +588,7 @@ impl EntropyApp {
             let _ = drain_sticky_layout_viewport_events(&self.sticky_layout_viewport_events);
             self.sticky_layout_last_size = None;
             self.sticky_layout_resize_opacity_hold_frames = 0;
+            self.sticky_layout_shown = None;
             return;
         }
 
@@ -646,6 +671,36 @@ impl EntropyApp {
         let sticky_layout_last_size = self.sticky_layout_last_size;
         let resize_opacity_hold_frames = self.sticky_layout_resize_opacity_hold_frames;
         let viewport_events = self.sticky_layout_viewport_events.clone();
+
+        let shown = StickyLayoutShown {
+            title: window_title.clone(),
+            layout_name: layout.as_ref().map(|layout| layout.name.clone()),
+            layers: layout
+                .as_ref()
+                .map(|layout| layout.layers.clone())
+                .unwrap_or_default(),
+            encoder_layers: layout
+                .as_ref()
+                .map(|layout| layout.encoder_layers.clone())
+                .unwrap_or_default(),
+            layer: sticky_layer,
+            layer_names: layer_names.clone(),
+            macro_names: macro_names.clone(),
+            tap_dance_names: tap_dance_names.clone(),
+            key_legend_layout,
+            show_shifted_number_symbols,
+            layout_options_value,
+            encoder_visibility: encoder_visibility.clone(),
+            module_values: module_settings.values.clone(),
+            pressed: matrix_pressed.clone(),
+            pressed_key_layers: pressed_key_layers.clone(),
+            controls,
+            opacity_held: resize_opacity_hold_frames > 0,
+        };
+        if self.sticky_layout_shown.as_ref() != Some(&shown) {
+            self.sticky_layout_shown = Some(shown);
+            ctx.request_repaint_of(viewport_id);
+        }
 
         let mut viewport_builder =
             sticky_layout_viewport_builder(window_title.clone(), controls.always_on_top);
@@ -1119,6 +1174,109 @@ mod tests {
             assert_eq!(viewport.builder.window_level, Some(expected_level));
             assert_eq!(viewport.builder.resizable, Some(expected_resizable));
         }
+    }
+
+    fn indicator_app(ctx: &egui::Context) -> EntropyApp {
+        ctx.set_embed_viewports(false);
+        let creation_context = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = EntropyApp::new(&creation_context);
+        app.app_settings.sticky_layout_window = true;
+        app.vial_unlocked = Some(true);
+        app
+    }
+
+    #[test]
+    fn the_indicator_reads_the_matrix_at_its_own_cadence() {
+        let ctx = egui::Context::default();
+        let mut app = indicator_app(&ctx);
+        assert_eq!(
+            app.layout_indicator_poll_interval(),
+            LAYOUT_INDICATOR_POLL_INTERVAL
+        );
+        assert_eq!(
+            app.matrix_tester_poll_interval(),
+            MATRIX_TESTER_POLL_INTERVAL
+        );
+
+        app.device_manager
+            .replace_devices(vec![crate::device::Device {
+                name: "K:04 Mini".to_owned(),
+                vendor_id: 0xE126,
+                product_id: 0x0074,
+                manufacturer: "Ergohaven".to_owned(),
+                serial_number: "mini".to_owned(),
+                bus_type: "Bluetooth".to_owned(),
+                path: "/nonexistent/entropy-test-mini".to_owned(),
+                instance_token: "mini".to_owned(),
+                firmware: FirmwareProtocol::Vial,
+            }]);
+        app.selected_device = Some(0);
+        assert_eq!(
+            app.layout_indicator_poll_interval(),
+            LAYOUT_INDICATOR_BLUETOOTH_POLL_INTERVAL
+        );
+        assert!(app.matrix_tester_poll_interval() < LAYOUT_INDICATOR_BLUETOOTH_POLL_INTERVAL);
+    }
+
+    #[test]
+    fn the_indicator_repaints_when_what_it_shows_changes_not_on_every_read() {
+        let ctx = egui::Context::default();
+        let mut app = indicator_app(&ctx);
+        let id = sticky_layout_viewport_id();
+        let root_pass = |app: &mut EntropyApp| {
+            crate::app::discard_texture_deltas(ctx.run_ui(egui::RawInput::default(), |ui| {
+                app.draw_sticky_layout_window(ui.ctx());
+            }))
+            .viewport_output
+            .get(&id)
+            .and_then(|viewport| viewport.viewport_ui_cb.clone())
+            .expect("layout indicator viewport should be submitted")
+        };
+        // The indicator's own passes, as eframe runs them on a repaint request.
+        let settle = |show: std::sync::Arc<egui::DeferredViewportUiCallback>| {
+            for _ in 0..4 {
+                if !ctx.has_requested_repaint_for(&id) {
+                    return;
+                }
+                let _ = crate::app::discard_texture_deltas(ctx.run_ui(
+                    egui::RawInput {
+                        viewport_id: id,
+                        viewports: std::iter::once((id, egui::ViewportInfo::default())).collect(),
+                        ..Default::default()
+                    },
+                    |ui| show(ui),
+                ));
+            }
+            panic!("the indicator keeps asking for repaints");
+        };
+
+        app.matrix_tester_pressed = vec![false, false];
+        let show = root_pass(&mut app);
+        assert!(
+            ctx.has_requested_repaint_for(&id),
+            "the opened indicator paints"
+        );
+        settle(show);
+
+        // Reads that find the same keys: nothing to repaint.
+        for _ in 0..3 {
+            app.finish_matrix_tester_poll(vec![false, false], false);
+            root_pass(&mut app);
+            assert!(!ctx.has_requested_repaint_for(&id));
+        }
+
+        app.finish_matrix_tester_poll(vec![true, false], false);
+        let show = root_pass(&mut app);
+        assert!(ctx.has_requested_repaint_for(&id), "a pressed key repaints");
+        settle(show);
+
+        app.app_settings.show_shifted_number_symbols =
+            !app.app_settings.show_shifted_number_symbols;
+        root_pass(&mut app);
+        assert!(
+            ctx.has_requested_repaint_for(&id),
+            "a changed legend repaints"
+        );
     }
 
     #[test]

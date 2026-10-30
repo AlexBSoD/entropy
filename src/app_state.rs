@@ -9,6 +9,12 @@ pub(crate) const MATRIX_TESTER_POLL_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(16);
 pub(crate) const MATRIX_TESTER_BLUETOOTH_POLL_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(80);
+/// The layout indicator reads the matrix less often than the tester: it
+/// follows held keys and layers, not every tap.
+pub(crate) const LAYOUT_INDICATOR_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(33);
+pub(crate) const LAYOUT_INDICATOR_BLUETOOTH_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(150);
 pub(crate) const MATRIX_TESTER_LOCK_CHECK_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(750);
 pub(crate) const UI_SCALE_MIN: f32 = 0.5;
@@ -5798,6 +5804,7 @@ pub struct EntropyApp {
     pub(crate) sticky_layout_last_size: Option<Vec2>,
     pub(crate) sticky_layout_resize_opacity_hold_frames: u8,
     pub(crate) sticky_layout_viewport_events: StickyLayoutViewportEventQueue,
+    pub(crate) sticky_layout_shown: Option<StickyLayoutShown>,
     pub(crate) pending_layout_indicator_open_after_unlock: bool,
     pub(crate) matrix_tester_last_poll: std::time::Instant,
     pub(crate) matrix_tester_last_lock_check: std::time::Instant,

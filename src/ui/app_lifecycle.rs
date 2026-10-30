@@ -1979,7 +1979,7 @@ impl eframe::App for EntropyApp {
             let layout_indicator_interval = self
                 .app_settings
                 .sticky_layout_window
-                .then(|| self.matrix_tester_poll_interval());
+                .then(|| self.layout_indicator_poll_interval());
             #[cfg(target_os = "linux")]
             self.track_linux_background_window(ctx);
             ctx.request_repaint_after(native_repaint_interval(

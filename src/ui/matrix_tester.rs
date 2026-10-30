@@ -17,6 +17,14 @@ impl EntropyApp {
         )
     }
 
+    pub(super) fn layout_indicator_poll_interval(&self) -> std::time::Duration {
+        if self.matrix_tester_uses_bluetooth_transport() {
+            LAYOUT_INDICATOR_BLUETOOTH_POLL_INTERVAL
+        } else {
+            LAYOUT_INDICATOR_POLL_INTERVAL
+        }
+    }
+
     pub(super) fn reset_matrix_tester_state(&mut self) {
         self.matrix_tester_pressed.clear();
         self.matrix_tester_ever_pressed.clear();
@@ -74,6 +82,7 @@ impl EntropyApp {
         rows: usize,
         cols: usize,
         remember_ever_pressed: bool,
+        poll_interval: std::time::Duration,
     ) {
         if !self.has_keyboard_lock() {
             return;
@@ -85,10 +94,9 @@ impl EntropyApp {
             return;
         }
         let now = std::time::Instant::now();
-        let poll_interval = self.matrix_tester_poll_interval();
-
         // A pass with the user's input keeps the board for what the input starts.
-        if now.duration_since(self.matrix_tester_last_poll) >= poll_interval && !self.user_input_pass
+        if now.duration_since(self.matrix_tester_last_poll) >= poll_interval
+            && !self.user_input_pass
         {
             match self.start_vial_matrix_poll(ctx, rows, cols, remember_ever_pressed) {
                 VialHidTaskStart::Started => {
@@ -134,7 +142,8 @@ impl EntropyApp {
         if self.main_menu_tab != MainMenuTab::Settings || self.top_dropdown_open(ctx) {
             return;
         }
-        self.poll_switch_matrix_state(ctx, layout.rows, layout.cols, true);
+        let poll_interval = self.matrix_tester_poll_interval();
+        self.poll_switch_matrix_state(ctx, layout.rows, layout.cols, true, poll_interval);
     }
 
     pub(super) fn draw_matrix_tester_settings(
