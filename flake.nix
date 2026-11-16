@@ -97,6 +97,7 @@
             cargoLock = {
               lockFile = ./Cargo.lock;
               outputHashes = {
+                "rmk-config-0.6.1" = "sha256-hTmYQ5aPdrSOBok4AbzLzW/qCX17gjVC80wMsvZlT88=";
                 "rmk-config-0.8.0" = "sha256-ol9vgzH2tmKquYrrOYF2DIC4zvzEkI7Ue92k4K+GjRk=";
               };
             };
